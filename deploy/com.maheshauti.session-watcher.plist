@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example LaunchAgent for session-watcher watch (milestone 1).
+
+  Install (on the Mac), after placing the binary:
+    1. Copy binary to e.g. ~/bin/session-watcher
+    2. Edit ProgramArguments path below
+    3. cp deploy/com.maheshauti.session-watcher.plist ~/Library/LaunchAgents/
+    4. launchctl load ~/Library/LaunchAgents/com.maheshauti.session-watcher.plist
+
+  Unload:
+    launchctl unload ~/Library/LaunchAgents/com.maheshauti.session-watcher.plist
+
+  Logs: ~/Library/Logs/session-watcher/events.jsonl
+  State (tray): ~/Library/Application Support/session-watcher/state.json
+  Stderr capture optional via StandardErrorPath below.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.maheshauti.session-watcher</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<!-- EDIT: absolute path to the darwin/arm64 binary -->
+		<string>/Users/maheshauti/bin/session-watcher</string>
+		<string>watch</string>
+		<string>-interval</string>
+		<string>5s</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<!-- Optional: uncomment to capture stderr -->
+	<!--
+	<key>StandardErrorPath</key>
+	<string>/Users/maheshauti/Library/Logs/session-watcher/stderr.log</string>
+	-->
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Optional overrides -->
+		<!-- <key>SESSION_WATCHER_LOG</key> -->
+		<!-- <string>/Users/maheshauti/Library/Logs/session-watcher/events.jsonl</string> -->
+		<!-- <key>SESSION_WATCHER_STATE</key> -->
+		<!-- <string>/Users/maheshauti/Library/Application Support/session-watcher/state.json</string> -->
+	</dict>
+</dict>
+</plist>

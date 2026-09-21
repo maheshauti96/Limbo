@@ -1,0 +1,2 @@
+/Applications/Cursor.app/Contents/MacOS/Cursor
+/Users/maheshauti/.cursor/bin/cursor-agent worker start --name my-session --worker-dir /tmp/w1 --api-key sk-secret

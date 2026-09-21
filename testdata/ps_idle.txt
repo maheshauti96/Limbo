@@ -1,0 +1,3 @@
+/usr/libexec/logd
+/Applications/Cursor.app/Contents/MacOS/Cursor
+/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper
