@@ -95,7 +95,7 @@ func readFile(_ path: String, limit: Int) -> Data? {
 }
 
 /// One line of plain text: markdown marks removed, whitespace collapsed, clipped.
-func plainLine(_ s: String?, max: Int) -> String? {
+func plainLine(_ s: String?, max: Int, sentence: Bool = false) -> String? {
     guard let s else { return nil }
     let unmarked = s.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
     var t = unmarked.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" || $0 == "\r" })
@@ -103,7 +103,8 @@ func plainLine(_ s: String?, max: Int) -> String? {
     t = String(t.drop(while: { $0 == "#" || $0 == "*" || $0 == ">" || $0 == " " }))
     guard !t.isEmpty else { return nil }
     if t.count > max { t = String(t.prefix(max - 1)).trimmingCharacters(in: .whitespaces) + "…" }
-    if let first = t.first, first.isLowercase { t = first.uppercased() + t.dropFirst() }
+    // Sentence case for questions and summaries; titles are shown as written.
+    if sentence, let first = t.first, first.isLowercase { t = first.uppercased() + t.dropFirst() }
     return t
 }
 
@@ -152,6 +153,8 @@ struct DeskRecord: Equatable {
     let wrapUp: String?
     let lastReport: String?
     let parentId: String?
+    let errorAt: Date?          // set when the session stopped with an error
+    let errorText: String?
 }
 
 // Lenient decoding: a field with an unexpected type is dropped, not fatal.
@@ -203,11 +206,14 @@ private struct RawDesk: Decodable {
     var wrapUp: RawWrapUp?
     var lastTurnReport: String?
     var parent: RawParent?
+    var error: String?
+    var errorAt: Double?
+    var errorCategory: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionId, title, cwd, lastActivityAt, lastTurnEdgeAt, isArchived, lastAssistantUuid
         case summary = "postTurnSummary", summaryFor = "postTurnSummaryFor", wrapUp = "turnWrapUp"
-        case lastTurnReport, parent = "spawnedFrom"
+        case lastTurnReport, parent = "spawnedFrom", error, errorAt, errorCategory
     }
 
     init(from decoder: Decoder) throws {
@@ -224,6 +230,9 @@ private struct RawDesk: Decodable {
         wrapUp = try? c.decodeIfPresent(RawWrapUp.self, forKey: .wrapUp)
         lastTurnReport = try? c.decodeIfPresent(String.self, forKey: .lastTurnReport)
         parent = try? c.decodeIfPresent(RawParent.self, forKey: .parent)
+        error = try? c.decodeIfPresent(String.self, forKey: .error)
+        errorAt = try? c.decodeIfPresent(Double.self, forKey: .errorAt)
+        errorCategory = try? c.decodeIfPresent(String.self, forKey: .errorCategory)
     }
 }
 
@@ -247,12 +256,35 @@ func parseDeskRecord(path: String, stamp: FileStamp) -> DeskRecord? {
         isArchived: raw.isArchived ?? false,
         lastAssistantUuid: raw.lastAssistantUuid,
         category: s?.category,
-        statusDetail: plainLine(s?.detail, max: 240),
-        needsAction: plainLine(s?.needs, max: 600),
+        statusDetail: plainLine(s?.detail, max: 240, sentence: true),
+        needsAction: plainLine(s?.needs, max: 600, sentence: true),
         summaryFor: raw.summaryFor,
-        wrapUp: plainLine(raw.wrapUp?.text, max: 240),
-        lastReport: plainLine(raw.lastTurnReport, max: 200),
-        parentId: raw.parent?.sessionId)
+        wrapUp: plainLine(raw.wrapUp?.text, max: 240, sentence: true),
+        lastReport: plainLine(raw.lastTurnReport, max: 200, sentence: true),
+        parentId: raw.parent?.sessionId,
+        errorAt: raw.error == nil ? nil : dateFromMillis(raw.errorAt),
+        errorText: raw.error == nil ? nil
+            : plainLine(raw.errorCategory?.replacingOccurrences(of: "_", with: " ") ?? raw.error, max: 120))
+}
+
+/// Kernel start time of a running process, nil if there is none.
+func processStartTime(_ pid: Int32) -> TimeInterval? {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+    let start = info.kp_proc.p_starttime
+    return TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1_000_000
+}
+
+/// True if `pid` is running and is the process that wrote the record. A record
+/// left behind by a crashed process must not come back to life when its pid is
+/// reused: the process writes startedAt a second or so after it starts, so a
+/// process that started later than that is a different one.
+func isSameProcess(pid: Int32, recordStartedMs: Double) -> Bool {
+    guard let start = processStartTime(pid) else { return false }
+    guard recordStartedMs > 0 else { return true }
+    return start <= recordStartedMs / 1000 + 2
 }
 
 /// Live records for processes that are still running. `exited` holds the keys
@@ -266,7 +298,7 @@ func readLiveRecords(exited: Set<String>) -> (records: [Int32: LiveRecord], pres
         guard let st = fileStamp(path), st.size > 0, st.size <= 64 * 1024,
               let data = readFile(path, limit: 64 * 1024),
               let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let pidValue = o["pid"] as? Int, pidValue > 0, pidValue <= Int(Int32.max)
+              let pidValue = o["pid"] as? Int, pidValue > 1, pidValue <= Int(Int32.max)
         else { continue }
         if (o["spare"] as? Bool) == true { continue }
         if let kind = o["kind"] as? String, kind != "interactive" { continue }
@@ -275,7 +307,7 @@ func readLiveRecords(exited: Set<String>) -> (records: [Int32: LiveRecord], pres
         let key = "\(pid)@\(Int64(startedMs))"
         present.insert(key)
         if exited.contains(key) { continue }
-        if kill(pid, 0) != 0 && errno == ESRCH { continue }
+        if !isSameProcess(pid: pid, recordStartedMs: startedMs) { continue }
         let cwd = o["cwd"] as? String ?? ""
         var title = plainLine(o["name"] as? String, max: 160) ?? ""
         if title.isEmpty { title = (cwd as NSString).lastPathComponent }
@@ -285,7 +317,7 @@ func readLiveRecords(exited: Set<String>) -> (records: [Int32: LiveRecord], pres
         records[pid] = LiveRecord(
             pid: pid, key: key, name: title,
             status: (o["status"] as? String) ?? "idle",
-            waitingFor: plainLine(o["waitingFor"] as? String, max: 300),
+            waitingFor: plainLine(o["waitingFor"] as? String, max: 300, sentence: true),
             started: Date(timeIntervalSince1970: startedMs / 1000),
             statusSince: Date(timeIntervalSince1970: statusMs / 1000),
             hostId: host, cwd: cwd)
@@ -327,11 +359,14 @@ let dataWindow: TimeInterval = 8 * 86400
 ///  1. live process busy (or shell)                    -> Running
 ///  2. live process waiting (not seen in practice yet) -> Your turn
 ///  3. archived in the Claude app                      -> hidden
-///  4. turn ended but the app has not written its summary yet -> Just finished
-///  5. fresh summary: blocked, need_input or failed    -> Your turn
+///  4. stopped with an error in the last 7 days        -> Your turn
+///  5. turn ended but the app has not written its summary yet -> Just finished
+///  6. summary: blocked, need_input or failed          -> Your turn
 ///     review_ready                                    -> Ready for review
-///     anything else, or no usable summary             -> Done
-///  6. terminal session (no desktop id), idle          -> Terminal
+///     anything else, or no summary                    -> Done
+///  These follow the Claude app's own sidebar rules (blocked/need_input = needs
+///  input; failed or an error in the last 7 days = failed).
+///  7. terminal session (no desktop id), idle          -> Terminal
 func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date) -> [Row] {
     var bySession: [String: DeskRecord] = [:]
     for d in desk {
@@ -369,6 +404,12 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date) -> [Row]
         if d.isArchived { continue }
         let anchor = d.lastTurnEdge ?? d.lastActivity ?? d.fileTime
         if l == nil && now.timeIntervalSince(anchor) > dataWindow { continue }
+        if let errorAt = d.errorAt, now.timeIntervalSince(errorAt) < 7 * 86400 {
+            rows.append(Row(id: d.sessionId, group: .yourTurn, title: d.title,
+                            ask: "Stopped with an error" + (d.errorText.map { ": \($0)" } ?? ""),
+                            context: context, since: errorAt, link: link))
+            continue
+        }
 
         let fresh = d.category != nil && d.summaryFor != nil && d.summaryFor == d.lastAssistantUuid
         // The process went idle after the record's last turn edge: the turn has
@@ -383,11 +424,8 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date) -> [Row]
                             since: lagging ? (l?.statusSince ?? anchor) : anchor, link: link))
             continue
         }
-        guard fresh else {
-            rows.append(Row(id: d.sessionId, group: .done, title: d.title, detail: d.wrapUp ?? d.lastReport,
-                            context: context, since: anchor, link: link))
-            continue
-        }
+        // After the first minutes, an older summary is used as it stands; the
+        // Claude app's sidebar does the same.
         switch d.category {
         case "blocked", "need_input", "failed":
             let ask = d.needsAction ?? d.statusDetail ?? "Waiting for your answer"
