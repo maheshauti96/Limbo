@@ -76,14 +76,17 @@ Dedup: emits only when `(tool, label)` state changes; disappeared → `finished`
 A separate, small menu bar app in [tasks/main.swift](tasks/main.swift). It does not need the Go watcher.
 
 ```bash
-make tasks
-./bin/limbo-tasks
+make install-tasks     # build, install ~/Applications/Limbo Tasks.app, start at login, start now
+make uninstall-tasks   # remove the app and the login item
+make tasks             # build only -> bin/limbo-tasks
 ```
 
-- **Menu bar:** `▶ N  ● M` = N sessions running, M idle and waiting for you.
-- **Menu:** each live session with how long it has been running or idle. Clicking one opens it in the Claude app (`claude://claude.ai/epitaxy/<id>`). Terminal sessions are listed but have no link.
+- **Menu bar:** a play symbol with the number of running sessions and a pause symbol with the number waiting for you. One template image, so it follows light and dark menu bars.
+- **Panel:** click the item for a panel with two groups, Running and Your turn. Each row has a status dot (green = running, orange = finished in the last 30 minutes, grey ring = idle longer), the session title, its folder and how long it has been working or finished. Clicking a row opens that session in the Claude app (`claude://claude.ai/epitaxy/<id>`). Sessions started in a terminal are listed but can't be opened.
+- **Start at login:** a checkbox in the panel. It writes or removes `~/Library/LaunchAgents/com.maheshauti.limbo-tasks.plist`, which has no KeepAlive, so Quit really quits.
 - **Source:** only `~/.claude/sessions/<pid>.json`. It never reads the `*.key` files or any transcript.
-- **Cost:** no timers and no polling. An FSEvents stream wakes it when a session file changes, and the menu is built only when opened. Measured 0.0% CPU and 12 MB with six live sessions (2026-11-13).
+- **Cost:** no polling. An FSEvents stream wakes it when a session file changes. The panel's views are built when it opens and released when it closes; the only timer is a 30-second tick for the time labels while the panel is open. Measured 13 MB and about 0% CPU with seven live sessions (2026-11-13).
+- **Checking the design without the screen:** `limbo-tasks --snapshot out.png [--dark] [--sample]` renders the panel to a PNG.
 - **Not yet:** sessions whose process has exited, progress text, and "your next step". Transcripts here run to 176 MB and the end-of-turn recap is often not in the last 400 KB, so reading them needs a proper design first.
 
 ## Signals
