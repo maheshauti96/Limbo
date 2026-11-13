@@ -71,6 +71,21 @@ The tray app should read `state.json` (not scrape processes itself).
 
 Dedup: emits only when `(tool, label)` state changes; disappeared → `finished` in the event log.
 
+## Limbo Tasks (live Claude sessions)
+
+A separate, small menu bar app in [tasks/main.swift](tasks/main.swift). It does not need the Go watcher.
+
+```bash
+make tasks
+./bin/limbo-tasks
+```
+
+- **Menu bar:** `▶ N  ● M` = N sessions running, M idle and waiting for you.
+- **Menu:** each live session with how long it has been running or idle. Clicking one opens it in the Claude app (`claude://claude.ai/epitaxy/<id>`). Terminal sessions are listed but have no link.
+- **Source:** only `~/.claude/sessions/<pid>.json`. It never reads the `*.key` files or any transcript.
+- **Cost:** no timers and no polling. An FSEvents stream wakes it when a session file changes, and the menu is built only when opened. Measured 0.0% CPU and 12 MB with six live sessions (2026-11-13).
+- **Not yet:** sessions whose process has exited, progress text, and "your next step". Transcripts here run to 176 MB and the end-of-turn recap is often not in the last 400 KB, so reading them needs a proper design first.
+
 ## Signals
 
 See [docs/signals.md](docs/signals.md) and [VERIFIED_SIGNALS.md](VERIFIED_SIGNALS.md).

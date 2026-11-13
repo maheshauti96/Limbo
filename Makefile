@@ -1,4 +1,9 @@
-.PHONY: build test clean
+.PHONY: build tasks test clean
+
+# Limbo Tasks: Swift menu bar list of live Claude sessions. Needs only swiftc, not Go.
+tasks:
+	mkdir -p bin
+	swiftc -O -o bin/limbo-tasks tasks/main.swift -framework AppKit
 
 # Cross-compile for Mahesh's Mac (Apple Silicon).
 build:
