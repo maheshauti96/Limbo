@@ -71,7 +71,7 @@ The tray app should read `state.json` (not scrape processes itself).
 
 Dedup: emits only when `(tool, label)` state changes; disappeared → `finished` in the event log.
 
-## Limbo Tasks (live Claude sessions)
+## Limbo Tasks (Claude sessions, grouped by what they need from you)
 
 A separate, small menu bar app in [tasks/main.swift](tasks/main.swift). It does not need the Go watcher.
 
@@ -81,13 +81,35 @@ make uninstall-tasks   # remove the app and the login item
 make tasks             # build only -> bin/limbo-tasks
 ```
 
-- **Menu bar:** a play symbol with the number of running sessions and a pause symbol with the number waiting for you. One template image, so it follows light and dark menu bars.
-- **Panel:** click the item for a panel with two groups, Running and Your turn. Each row has a status dot (green = running, orange = finished in the last 30 minutes, grey ring = idle longer), the session title, its folder and how long it has been working or finished. Clicking a row opens that session in the Claude app (`claude://claude.ai/epitaxy/<id>`). Sessions started in a terminal are listed but can't be opened.
-- **Start at login:** a checkbox in the panel. It writes or removes `~/Library/LaunchAgents/com.maheshauti.limbo-tasks.plist`, which has no KeepAlive, so Quit really quits.
-- **Source:** only `~/.claude/sessions/<pid>.json`. It never reads the `*.key` files or any transcript.
-- **Cost:** no polling. An FSEvents stream wakes it when a session file changes. The panel's views are built when it opens and released when it closes; the only timer is a 30-second tick for the time labels while the panel is open. Measured 13 MB and about 0% CPU with seven live sessions (2026-11-13).
-- **Checking the design without the screen:** `limbo-tasks --snapshot out.png [--dark] [--sample]` renders the panel to a PNG.
-- **Not yet:** sessions whose process has exited, progress text, and "your next step". Transcripts here run to 176 MB and the end-of-turn recap is often not in the last 400 KB, so reading them needs a proper design first.
+**Menu bar:** a speech bubble with the number of sessions waiting for you (last 3 days) and a play symbol with the number running. A check mark when neither. One template image, so it follows light and dark menu bars.
+
+**Panel groups**, first rule that matches wins:
+
+| Group | Rule |
+|---|---|
+| Running | The session's live process says `busy` (`~/.claude/sessions/<pid>.json`). |
+| Your turn | The Claude app's own end-of-turn summary (`postTurnSummary` in the session's `local_<id>.json`) is current and says `blocked`, `need_input` or `failed`. The row shows what it needs from you. Questions older than 3 days fold under "older"; older than 7 days drop off. |
+| Just finished | The turn has ended but the app has not written its summary yet (usually seconds). |
+| Ready for review | The summary says `review_ready`. |
+| Done | Anything else from the last 7 days, collapsed. |
+| In a terminal | Idle sessions started in a terminal. They have no summary, so they never count as your turn. Collapsed. |
+
+Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude://claude.ai/epitaxy/<id>`); terminal sessions can't be opened from here.
+
+**Not detectable:** a permission prompt in the middle of a turn. No file on disk records it, so that session shows as Running.
+
+**Sources:** only `~/.claude/sessions/<pid>.json` and `~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_<id>.json`, the latter decoded into a few named fields. It never opens the `*.key` files, transcripts, or other files in those folders (`waiting-input/` holds queued input under the same file names and is skipped by path).
+
+**Cost:** no polling. One FSEvents stream wakes it when a session file changes and only changed files are re-read, on a utility-priority queue. Measured on 2026-11-13 with 55 session records: 0.2 s of CPU at launch, 18 MB before the panel is first opened, 28-31 MB after (one panel is kept and reused; building a new panel per open leaked about 8 MB each time). The first open briefly peaks near 85 MB for about a second. The clock for "3 min ago" labels runs only while the panel is open.
+
+**Checks without the screen:**
+
+```bash
+limbo-tasks --dump                                  # group, age and title per row, plus counts
+limbo-tasks --snapshot out.png [--dark] [--sample] [--expand] [--rows N]
+limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
+kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json
+```
 
 ## Signals
 
