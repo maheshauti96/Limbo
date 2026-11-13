@@ -703,15 +703,15 @@ func isOnlyInstance() -> Bool {
 // MARK: - Menu bar item
 
 /// One template image, so the system tints it for light and dark menu bars:
-/// a speech bubble with the number of sessions waiting for you, and a play
-/// symbol with the number running. A check mark when neither.
+/// a play symbol with the number of sessions running, then a speech bubble
+/// with the number waiting for you. A check mark when neither.
 func statusImage(needYou: Int, running: Int) -> NSImage {
     let font = NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .medium)
     let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
     let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
     var parts: [(symbol: String, text: String?)] = []
-    if needYou > 0 { parts.append(("bubble.left.fill", "\(needYou)")) }
     if running > 0 { parts.append(("play.fill", "\(running)")) }
+    if needYou > 0 { parts.append(("bubble.left.fill", "\(needYou)")) }
     if parts.isEmpty { parts.append(("checkmark.circle", nil)) }
 
     let items: [(NSImage?, NSAttributedString?)] = parts.map { part in
@@ -1045,8 +1045,8 @@ struct PanelView: View {
 
     private func summary(_ b: Board) -> String {
         var parts: [String] = []
-        if !b.yourTurn.isEmpty { parts.append(b.yourTurn.count == 1 ? "1 needs you" : "\(b.yourTurn.count) need you") }
         if !b.running.isEmpty { parts.append("\(b.running.count) running") }
+        if !b.yourTurn.isEmpty { parts.append(b.yourTurn.count == 1 ? "1 needs you" : "\(b.yourTurn.count) need you") }
         return parts.isEmpty ? "All caught up" : parts.joined(separator: " · ")
     }
 
@@ -1056,6 +1056,10 @@ struct PanelView: View {
             EmptyBoard()
         } else {
             VStack(alignment: .leading, spacing: 1) {
+                if !b.running.isEmpty {
+                    SectionTitle(title: "Running", count: b.running.count)
+                    ForEach(b.running) { SessionRow(row: $0, now: now, open: open) }
+                }
                 SectionTitle(title: "Your turn", count: b.yourTurn.count)
                 if b.yourTurn.isEmpty { CaughtUpRow() }
                 ForEach(b.yourTurn) { SessionRow(row: $0, now: now, open: open) }
@@ -1064,10 +1068,6 @@ struct PanelView: View {
                     if showOlder || expandAll {
                         ForEach(b.older) { SessionRow(row: $0, now: now, open: open, dimmed: true) }
                     }
-                }
-                if !b.running.isEmpty {
-                    SectionTitle(title: "Running", count: b.running.count)
-                    ForEach(b.running) { SessionRow(row: $0, now: now, open: open) }
                 }
                 if !b.justFinished.isEmpty {
                     SectionTitle(title: "Just finished", count: b.justFinished.count)
