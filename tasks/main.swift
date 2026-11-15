@@ -2017,8 +2017,10 @@ struct FloatingView: View {
                     .padding(.bottom, 10)
             } else if fixedHeight {
                 ScrollView { rowStack(shown) }
+                    .background { scrim }
             } else {
                 rowStack(shown)
+                    .background { scrim }
             }
             if active != nil {
                 HStack(spacing: 6) {
@@ -2054,13 +2056,17 @@ struct FloatingView: View {
         }
         .padding(.horizontal, 4)
         .padding(.bottom, 6)
-        // A soft band behind the text while a running glow moves under it.
-        .background {
-            if status.mode == .running && !contrast {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(scheme == .dark ? Color.black.opacity(0.28) : Color.white.opacity(0.5))
-                    .blur(radius: 8)
-            }
+    }
+
+    /// A soft band behind the text while a running glow moves under it. Outside
+    /// the scroll view, so its blurred edge is never cut off.
+    @ViewBuilder private var scrim: some View {
+        if status.mode == .running && !contrast {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(scheme == .dark ? Color.black.opacity(0.2) : Color.white.opacity(0.4))
+                .padding(.horizontal, 18)
+                .padding(.vertical, 6)
+                .blur(radius: 18)
         }
     }
 
@@ -2094,7 +2100,7 @@ struct FloatingView: View {
             // The empty middle: double-click it for the pill, or drag the window.
             // (On the empty part only, so double-clicking a chip stays a chip click.)
             Color.clear
-                .frame(minWidth: 4, maxWidth: .infinity, minHeight: 18)
+                .frame(minWidth: 4, maxWidth: .infinity, minHeight: 18, maxHeight: 18)   // never taller
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2) { setMini(true) }
                 .gesture(WindowDragGesture())
