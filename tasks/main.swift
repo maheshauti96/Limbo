@@ -1716,9 +1716,6 @@ struct FloatingView: View {
         let review = board.review.filter { model.now.timeIntervalSince($0.since) <= limit }
         let hiddenRows = (allWaiting + board.review).filter { model.now.timeIntervalSince($0.since) > limit }
         let hidden = hiddenRows.count
-        // The shortest choice that shows every hidden session.
-        let oldest = hiddenRows.map { model.now.timeIntervalSince($0.since) }.max() ?? 0
-        let showAll = WaitingWindow.allCases.first { $0.hours * 3600 >= oldest } ?? .week
         let recentlyDone = board.done.filter { model.now.timeIntervalSince($0.since) <= Self.doneShownFor }
         let rows = board.running + waiting + review + board.justFinished + recentlyDone
         let shown = Array(rows.prefix(Self.maxRows))
@@ -1730,38 +1727,20 @@ struct FloatingView: View {
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
-                    .padding(.bottom, hidden > 0 ? 2 : 10)
+                    .padding(.bottom, 10)
             } else {
                 VStack(spacing: 0) {
                     ForEach(shown) { CompactRow(row: $0, now: model.now, open: open) }
                 }
                 .padding(.horizontal, 4)
-                .padding(.bottom, rows.count > shown.count || hidden > 0 ? 2 : 6)
+                .padding(.bottom, rows.count > shown.count ? 2 : 6)
             }
             if rows.count > shown.count {
                 Text("\(rows.count - shown.count) more in the menu bar panel")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .padding(.leading, rows.isEmpty ? 12 : 36)
-                    .padding(.bottom, hidden > 0 ? 2 : 8)
-            }
-            if hidden > 0 {
-                // "5 older sessions hidden, waiting on you over 1 hr. Show": a click
-                // widens the filter just enough to show them.
-                Button { waitingHours = showAll.rawValue } label: {
-                    Text("\(hidden == 1 ? "1 older session waiting on you. " : "\(hidden) older sessions waiting on you. ")\(Text("Show").foregroundColor(.accentColor))")
-                        .foregroundColor(.secondary)
-                        .font(.system(size: 10))
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Hidden because they have waited over \(window.short). Show sessions from the \(showAll.menuTitle.lowercased()).")
-                .padding(.leading, rows.isEmpty ? 12 : 36)
-                .padding(.trailing, 12)
-                .padding(.bottom, 8)
+                    .padding(.bottom, 8)
             }
         }
         .frame(width: 300)
