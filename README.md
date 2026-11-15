@@ -94,7 +94,7 @@ make tasks             # build only -> bin/limbo-tasks
 | Done | Anything else from the last 7 days, collapsed. |
 | In a terminal | Idle sessions started in a terminal. They have no summary, so they never count as your turn. Collapsed. |
 
-**Keep on top:** the pin button in the panel header opens a small window with the running sessions and the ones waiting for you, one line each. It stays above other windows, including full-screen videos and games, on every Space, and never takes keyboard focus. Drag it by its header; the position and whether it was showing are remembered across launches. Close it with its x or the pin again. Measured while showing: about 30 MB and 0.16 s of CPU per minute (vs 14 MB hidden). Games that take over the display in exclusive full-screen mode can still cover it.
+**Keep on top:** the pin button in the panel header opens a small window with the running sessions and the ones waiting for you, one line each. It stays above other windows, including full-screen videos and games, on every Space, and never takes keyboard focus. Drag it by its header; the position and whether it was showing are remembered across launches. A menu in its header sets how far back it shows sessions waiting for you: last hour, 4 hours, 24 hours (default), 3 days or 7 days; running sessions always show, and a footer counts the ones hidden as older. Close it with its x or the pin again. Measured while showing: about 30 MB and 0.16 s of CPU per minute (vs 14 MB hidden). Games that take over the display in exclusive full-screen mode can still cover it.
 
 Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude://claude.ai/epitaxy/<id>`); terminal sessions can't be opened from here.
 

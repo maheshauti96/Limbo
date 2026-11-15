@@ -1344,55 +1344,121 @@ struct CompactRow: View {
     }
 }
 
+/// How far back the keep-on-top window looks for sessions waiting for you.
+enum WaitingWindow: Int, CaseIterable, Identifiable {
+    case hour = 1, fourHours = 4, day = 24, threeDays = 72, week = 168
+    var id: Int { rawValue }
+    var hours: Double { Double(rawValue) }
+    var menuTitle: String {
+        switch self {
+        case .hour: return "Last hour"
+        case .fourHours: return "Last 4 hours"
+        case .day: return "Last 24 hours"
+        case .threeDays: return "Last 3 days"
+        case .week: return "Last 7 days"
+        }
+    }
+    var short: String {
+        switch self {
+        case .hour: return "1 hr"
+        case .fourHours: return "4 hr"
+        case .day: return "24 hr"
+        case .threeDays: return "3 days"
+        case .week: return "7 days"
+        }
+    }
+}
+
 /// The small window that stays on top: running sessions and the ones waiting
-/// for you, one line each.
+/// for you, one line each. How far back "waiting" goes is set from its header.
 struct FloatingView: View {
     @ObservedObject var model: SessionModel
     let open: (Row) -> Void
     let unpin: () -> Void
+    var refit: () -> Void = {}
+    @AppStorage("keepOnTopWaitingHours") private var waitingHours = WaitingWindow.day.rawValue
     static let maxRows = 8
+
+    private var window: WaitingWindow { WaitingWindow(rawValue: waitingHours) ?? .day }
 
     var body: some View {
         let board = Board(rows: model.rows, now: model.now)
-        let rows = board.running + board.yourTurn + board.justFinished
+        let limit = window.hours * 3600
+        let allWaiting = board.yourTurn + board.older
+        let waiting = allWaiting.filter { model.now.timeIntervalSince($0.since) <= limit }
+        let hidden = allWaiting.count - waiting.count
+        let rows = board.running + waiting + board.justFinished
         let shown = Array(rows.prefix(Self.maxRows))
         VStack(alignment: .leading, spacing: 0) {
-            header(board)
+            header(running: board.running.count, waiting: waiting.count)
             if rows.isEmpty {
-                Text("Nothing running and nothing needs you")
+                Text(hidden > 0 ? "Nothing running or waiting in the \(window.menuTitle.lowercased())"
+                                : "Nothing running and nothing needs you")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
+                    .padding(.bottom, hidden > 0 ? 2 : 10)
             } else {
                 VStack(spacing: 0) {
                     ForEach(shown) { CompactRow(row: $0, now: model.now, open: open) }
                 }
                 .padding(.horizontal, 4)
-                .padding(.bottom, rows.count > shown.count ? 2 : 6)
-                if rows.count > shown.count {
-                    Text("\(rows.count - shown.count) more in the menu bar panel")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 36)
-                        .padding(.bottom, 8)
-                }
+                .padding(.bottom, rows.count > shown.count || hidden > 0 ? 2 : 6)
+            }
+            if rows.count > shown.count || hidden > 0 {
+                Text(footer(more: rows.count - shown.count, hidden: hidden))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, rows.isEmpty ? 12 : 36)
+                    .padding(.bottom, 8)
             }
         }
         .frame(width: 300)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
+        .onChange(of: waitingHours) { refit() }
     }
 
-    private func header(_ b: Board) -> some View {
+    private func footer(more: Int, hidden: Int) -> String {
+        var parts: [String] = []
+        if more > 0 { parts.append("\(more) more in the menu bar panel") }
+        if hidden > 0 { parts.append("\(hidden) waiting longer than \(window.short)") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func header(running: Int, waiting: Int) -> some View {
         HStack(spacing: 6) {
             Image(nsImage: claudeMark)
                 .renderingMode(.template)
                 .resizable()
                 .frame(width: 15, height: 15)
                 .foregroundStyle(.secondary)
-            Text(summary(b)).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-            Spacer()
+            Text(summary(running: running, waiting: waiting))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Menu {
+                Picker("Show sessions waiting for you from", selection: $waitingHours) {
+                    ForEach(WaitingWindow.allCases) { Text($0.menuTitle).tag($0.rawValue) }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                HStack(spacing: 2) {
+                    Text(window.short).font(.system(size: 10, weight: .medium).monospacedDigit())
+                    Image(systemName: "chevron.down").font(.system(size: 7, weight: .bold))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color.primary.opacity(0.08)))
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("How far back to show sessions waiting for you. Running sessions always show.")
+            .accessibilityLabel("Show sessions waiting for you from the \(window.menuTitle.lowercased())")
             Button(action: unpin) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
@@ -1411,10 +1477,10 @@ struct FloatingView: View {
         .gesture(WindowDragGesture())   // drag the window by its header
     }
 
-    private func summary(_ b: Board) -> String {
+    private func summary(running: Int, waiting: Int) -> String {
         var parts: [String] = []
-        if !b.running.isEmpty { parts.append("\(b.running.count) running") }
-        if !b.yourTurn.isEmpty { parts.append(b.yourTurn.count == 1 ? "1 needs you" : "\(b.yourTurn.count) need you") }
+        if running > 0 { parts.append("\(running) running") }
+        if waiting > 0 { parts.append(waiting == 1 ? "1 needs you" : "\(waiting) need you") }
         return parts.isEmpty ? "All caught up" : parts.joined(separator: " · ")
     }
 }
@@ -1495,7 +1561,8 @@ final class FloatingController {
                                           let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
                                     NSWorkspace.shared.open(url)
                                 },
-                                unpin: { [weak self] in self?.hide() })
+                                unpin: { [weak self] in self?.hide() },
+                                refit: { [weak self] in self?.fitToContent() })
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
         let panel = KeepOnTopPanel(contentRect: NSRect(origin: .zero, size: size),
