@@ -693,8 +693,10 @@ final class SessionEngine {
 
 final class SessionModel: ObservableObject {
     @Published var rows: [Row] = []
-    /// Drives the "3 min ago" labels. Ticks only while the panel is open.
+    /// Drives the "3 min ago" labels. Ticks only while a panel is showing.
     @Published var now = Date()
+    /// True while the keep-on-top window is showing.
+    @Published var pinned = false
 }
 
 // MARK: - Start at login
@@ -1111,6 +1113,7 @@ struct PanelView: View {
     @ObservedObject var model: SessionModel
     let open: (Row) -> Void
     var expandAll = false
+    var pin: (() -> Void)? = nil
     @AppStorage("showDone") private var showDone = false
     @AppStorage("showTerminal") private var showTerminal = false
     @AppStorage("showOlder") private var showOlder = false
@@ -1133,10 +1136,22 @@ struct PanelView: View {
     }
 
     private func header(_ b: Board) -> some View {
-        HStack(alignment: .firstTextBaseline) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text("Claude sessions").font(.system(size: 13, weight: .semibold))
             Spacer()
             Text(summary(b)).font(.system(size: 11)).foregroundStyle(.secondary)
+            if let pin {
+                Button(action: pin) {
+                    Image(systemName: model.pinned ? "pin.fill" : "pin")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(model.pinned ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(model.pinned ? "Stop keeping on top" : "Keep on top of other windows, even full-screen videos and games")
+                .accessibilityLabel(model.pinned ? "Stop keeping on top" : "Keep on top")
+            }
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
@@ -1222,14 +1237,17 @@ final class PanelController: NSObject, NSPopoverDelegate {
     private let reuse: Bool
     private let animates: Bool
     private let willOpen: () -> Void
+    private let pin: (() -> Void)?
     private var popover: NSPopover?
 
     private var clock: Timer?
 
-    init(model: SessionModel, reuse: Bool = true, animates: Bool = true, willOpen: @escaping () -> Void) {
+    init(model: SessionModel, reuse: Bool = true, animates: Bool = true, pin: (() -> Void)? = nil,
+         willOpen: @escaping () -> Void) {
         self.model = model
         self.reuse = reuse
         self.animates = animates
+        self.pin = pin
         self.willOpen = willOpen
     }
 
@@ -1249,7 +1267,9 @@ final class PanelController: NSObject, NSPopoverDelegate {
     func close() { popover?.performClose(nil) }
 
     private func makePopover() -> NSPopover {
-        let host = NSHostingController(rootView: PanelView(model: model) { [weak self] row in self?.open(row) })
+        let pinAction: (() -> Void)? = pin.map { action in { [weak self] in self?.close(); action() } }
+        let host = NSHostingController(rootView: PanelView(
+            model: model, open: { [weak self] row in self?.open(row) }, pin: pinAction))
         host.sizingOptions = [.preferredContentSize]
         let p = NSPopover()
         p.behavior = .transient
@@ -1286,6 +1306,218 @@ final class PanelController: NSObject, NSPopoverDelegate {
     }
 }
 
+// MARK: - Keep on top
+
+struct CompactRow: View {
+    let row: Row
+    let now: Date
+    let open: (Row) -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button { if row.link != nil { open(row) } } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Indicator(group: row.group)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(row.title).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.tail)
+                        Spacer(minLength: 4)
+                        Text(elapsed(since: row.since, now: now) ?? "now")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                    if row.group == .yourTurn, let ask = row.ask {
+                        Text(ask).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(hovering && row.link != nil ? 0.08 : 0)))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help([row.title, row.ask].compactMap { $0 }.joined(separator: "\n\n"))
+    }
+}
+
+/// The small window that stays on top: running sessions and the ones waiting
+/// for you, one line each.
+struct FloatingView: View {
+    @ObservedObject var model: SessionModel
+    let open: (Row) -> Void
+    let unpin: () -> Void
+    static let maxRows = 8
+
+    var body: some View {
+        let board = Board(rows: model.rows, now: model.now)
+        let rows = board.running + board.yourTurn + board.justFinished
+        let shown = Array(rows.prefix(Self.maxRows))
+        VStack(alignment: .leading, spacing: 0) {
+            header(board)
+            if rows.isEmpty {
+                Text("Nothing running and nothing needs you")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(shown) { CompactRow(row: $0, now: model.now, open: open) }
+                }
+                .padding(.horizontal, 4)
+                .padding(.bottom, rows.count > shown.count ? 2 : 6)
+                if rows.count > shown.count {
+                    Text("\(rows.count - shown.count) more in the menu bar panel")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 36)
+                        .padding(.bottom, 8)
+                }
+            }
+        }
+        .frame(width: 300)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
+    }
+
+    private func header(_ b: Board) -> some View {
+        HStack(spacing: 6) {
+            Image(nsImage: claudeMark)
+                .renderingMode(.template)
+                .resizable()
+                .frame(width: 15, height: 15)
+                .foregroundStyle(.secondary)
+            Text(summary(b)).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            Spacer()
+            Button(action: unpin) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Stop keeping on top")
+            .accessibilityLabel("Stop keeping on top")
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 9)
+        .padding(.bottom, 4)
+        .contentShape(Rectangle())
+        .gesture(WindowDragGesture())   // drag the window by its header
+    }
+
+    private func summary(_ b: Board) -> String {
+        var parts: [String] = []
+        if !b.running.isEmpty { parts.append("\(b.running.count) running") }
+        if !b.yourTurn.isEmpty { parts.append(b.yourTurn.count == 1 ? "1 needs you" : "\(b.yourTurn.count) need you") }
+        return parts.isEmpty ? "All caught up" : parts.joined(separator: " · ")
+    }
+}
+
+/// Takes the first click, so a row opens without first focusing the window.
+final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// A borderless panel that never takes keyboard focus from a game or video.
+final class KeepOnTopPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// The keep-on-top window: above other windows, full-screen videos and games
+/// included, on every Space, without taking focus. Its position is remembered,
+/// and so is whether it was showing, across launches.
+final class FloatingController {
+    private let model: SessionModel
+    private var panel: KeepOnTopPanel?
+    private var host: FirstClickHostingView<FloatingView>?
+    private var clock: Timer?
+    private static let shownKey = "keepOnTop"
+    private static let frameName = "LimboTasksKeepOnTop"
+
+    init(model: SessionModel) { self.model = model }
+
+    var wasShown: Bool { UserDefaults.standard.bool(forKey: Self.shownKey) }
+
+    func toggle() { model.pinned ? hide() : show() }
+
+    func show() {
+        let panel = self.panel ?? makePanel()
+        self.panel = panel
+        model.pinned = true
+        UserDefaults.standard.set(true, forKey: Self.shownKey)
+        model.now = Date()
+        clock?.invalidate()
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            self?.model.now = Date()
+            self?.fitToContent()
+        }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        clock = timer
+        fitToContent()
+        panel.orderFrontRegardless()
+    }
+
+    func hide() {
+        panel?.orderOut(nil)
+        model.pinned = false
+        UserDefaults.standard.set(false, forKey: Self.shownKey)
+        clock?.invalidate()
+        clock = nil
+    }
+
+    /// Resizes to the content, keeping the top edge where it is.
+    func fitToContent() {
+        guard model.pinned else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let panel = self.panel, let host = self.host else { return }
+            let size = host.fittingSize
+            var frame = panel.frame
+            guard frame.size != size else { return }
+            let top = frame.maxY
+            frame.size = size
+            frame.origin.y = top - size.height
+            panel.setFrame(frame, display: true)
+        }
+    }
+
+    private func makePanel() -> KeepOnTopPanel {
+        let view = FloatingView(model: model,
+                                open: { row in
+                                    guard let id = row.link, isSessionId(id),
+                                          let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
+                                    NSWorkspace.shared.open(url)
+                                },
+                                unpin: { [weak self] in self?.hide() })
+        let host = FirstClickHostingView(rootView: view)
+        let size = host.fittingSize
+        let panel = KeepOnTopPanel(contentRect: NSRect(origin: .zero, size: size),
+                                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        panel.contentView = host
+        panel.isFloatingPanel = true
+        panel.level = .statusBar                      // above full-screen windows
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.hidesOnDeactivate = false
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.isReleasedWhenClosed = false
+        if !panel.setFrameUsingName(Self.frameName), let screen = NSScreen.main?.visibleFrame {
+            panel.setFrameTopLeftPoint(NSPoint(x: screen.maxX - size.width - 16, y: screen.maxY - 12))
+        }
+        panel.setFrameAutosaveName(Self.frameName)
+        self.host = host
+        return panel
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1293,6 +1525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = SessionModel()
     private let engine = SessionEngine()
     private var panel: PanelController!
+    private var floating: FloatingController!
     private var expiry: DispatchSourceTimer?
     private var shownCounts: (Int, Int)?
     // The Claude mark turns while sessions run, once every 3 s. It is its own
@@ -1325,12 +1558,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signalSource.setEventHandler { [weak self] in self?.writeButtonSnapshot() }
         signalSource.resume()
         snapshotSignal = signalSource
-        panel = PanelController(model: model) { [weak self] in self?.engine.refresh() }
+        floating = FloatingController(model: model)
+        panel = PanelController(model: model, pin: { [weak self] in self?.floating.toggle() }) { [weak self] in
+            self?.engine.refresh()
+        }
         updateStatusItem()
         engine.onRows = { [weak self] rows in
             self?.model.rows = rows
             self?.updateStatusItem()
+            self?.floating.fitToContent()
         }
+        if floating.wasShown { floating.show() }
         engine.enableStatsSignal()
         engine.start()
         let workspace = NSWorkspace.shared.notificationCenter
@@ -1509,8 +1747,11 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     let rows = sample ? sampleRows(now: Date()) : SessionEngine.scanOnce()
     model.rows = limit.map { Array(rows.prefix($0)) } ?? rows
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-    let host = NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand)
-        .background(Color(nsColor: .windowBackgroundColor)))
+    let host: NSView = arguments.contains("--floating")
+        ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {})
+            .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
+        : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
+            .background(Color(nsColor: .windowBackgroundColor)))
     host.appearance = appearance
     host.frame = NSRect(origin: .zero, size: host.fittingSize)
     let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
