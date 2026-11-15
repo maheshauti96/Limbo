@@ -1396,6 +1396,7 @@ struct SessionRow: View {
                     .fill(Color.primary.opacity(hovering && canOpen ? 0.07 : 0)))
         }
         .buttonStyle(.plain)
+        .background { if canOpen { PointingHandArea() } }
         .onHover { hovering = $0 }
         .opacity(dimmed ? 0.72 : 1)
         .help(tooltip)
@@ -1469,6 +1470,7 @@ struct DisclosureTitle: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .background { PointingHandArea() }
         .accessibilityLabel("\(title), \(count)")
         .accessibilityValue(expanded ? "expanded" : "collapsed")
         .accessibilityAddTraits(.isHeader)
@@ -1496,6 +1498,7 @@ struct OlderToggle: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .background { PointingHandArea() }
     }
 }
 
@@ -1775,6 +1778,7 @@ struct CompactRow: View {
                     .fill(Color.primary.opacity(hovering && row.link != nil ? 0.08 : 0)))
         }
         .buttonStyle(.plain)
+        .background { if row.link != nil { PointingHandArea() } }
         .onHover { hovering = $0 }
         .help([row.title, row.ask ?? row.detail,
                quiet.map { quietPhrase($0) + ": it may be stuck, or in one long command" }]
@@ -1817,6 +1821,7 @@ struct FloatingView: View {
     var glowChanged: (GlowPreview) -> Void = { _ in }
     /// Drawn between the window's material and the rows, so text stays crisp.
     var glow: RunningGlowView?
+    @ObservedObject var layout = FloatingLayout()
     @AppStorage("keepOnTopWaitingHours") private var waitingHours = WaitingWindow.day.rawValue
     @AppStorage(GlowStyle.key) private var glowStyle = GlowStyle.aurora.rawValue
     @AppStorage(GlowColor.key) private var glowColor = GlowColor.red.rawValue
@@ -1838,7 +1843,9 @@ struct FloatingView: View {
         let hidden = hiddenRows.count
         let recentlyDone = board.done.filter { model.now.timeIntervalSince($0.since) <= Self.doneShownFor }
         let rows = board.running + waiting + review + board.justFinished + recentlyDone
-        let shown = Array(rows.prefix(Self.maxRows))
+        // With a height you set, every row shows and the list scrolls.
+        let fixedHeight = layout.height != nil
+        let shown = fixedHeight ? rows : Array(rows.prefix(Self.maxRows))
         VStack(alignment: .leading, spacing: 0) {
             header(running: board.running.count, waiting: waiting.count, review: review.count)
             if rows.isEmpty {
@@ -1848,6 +1855,14 @@ struct FloatingView: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 10)
+            } else if fixedHeight {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(shown) { CompactRow(row: $0, now: model.now, open: open) }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.bottom, 6)
+                }
             } else {
                 VStack(spacing: 0) {
                     ForEach(shown) { CompactRow(row: $0, now: model.now, open: open) }
@@ -1863,11 +1878,13 @@ struct FloatingView: View {
                     .padding(.bottom, 8)
             }
         }
-        .frame(width: 300)
+        .frame(width: layout.width, height: layout.height, alignment: .top)
         .background { if let glow { GlowBackdrop(view: glow) } }
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
         .onChange(of: waitingHours) { refit() }
+        .onChange(of: layout.width) { refit() }
+        .onChange(of: layout.height) { refit() }
         .onChange(of: glowStyle) { glowChanged(.running) }
         .onChange(of: glowColor) { glowChanged(.running) }
         .onChange(of: needsYouGlow) { glowChanged(needsYouGlow ? .needsYou : .none) }
@@ -1925,6 +1942,12 @@ struct FloatingView: View {
         .padding(.bottom, 4)
         .contentShape(Rectangle())
         .gesture(WindowDragGesture())   // drag the window by its header
+        .contextMenu {
+            Button("Fit to Content") { layout.height = nil; layout.save() }
+                .disabled(layout.height == nil)
+            Button("Default Size") { layout.width = FloatingLayout.defaultWidth; layout.height = nil; layout.save() }
+                .disabled(layout.height == nil && layout.width == FloatingLayout.defaultWidth)
+        }
     }
 
     /// Picks how the window glows while a session runs, and in what colour.
@@ -2126,6 +2149,7 @@ final class RunningGlowView: NSView {
     private var builtScale: CGFloat = 0
     private var laidOut: CGSize = .zero
     private var shuffle: Timer?
+    private var restart: DispatchWorkItem?
     /// Snapshots draw the effect moving even with Reduce Motion on.
     var forceMotion = false
 
@@ -2227,10 +2251,20 @@ final class RunningGlowView: NSView {
         flashClip.frame = bounds
         effect.layout(bounds)
         CATransaction.commit()
-        if bounds.size != laidOut {
-            laidOut = bounds.size
-            if mode != .off { stopAnimations(clip); effect.start(bounds, still) }   // sizes are baked into them
+        // Some animations have the size baked in: restart them once a resize
+        // settles, not on every step of the drag.
+        guard bounds.size != laidOut else { return }
+        let first = laidOut == .zero
+        laidOut = bounds.size
+        guard mode != .off else { return }
+        restart?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.mode != .off else { return }
+            self.stopAnimations(self.clip)
+            self.effect.start(self.bounds, self.still)
         }
+        restart = work
+        if first { work.perform() } else { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work) }
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -2519,6 +2553,199 @@ final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+/// The keep-on-top window's size as you left it: any width, and a height
+/// only after you drag its top or bottom edge (until then it fits the rows).
+final class FloatingLayout: ObservableObject {
+    static let defaultWidth: CGFloat = 300
+    static let minSize = NSSize(width: 220, height: 64)
+    private static let widthKey = "keepOnTopWidth", heightKey = "keepOnTopHeight"
+    @Published var width: CGFloat
+    @Published var height: CGFloat?
+
+    init(width: CGFloat = FloatingLayout.defaultWidth, height: CGFloat? = nil) {
+        self.width = width
+        self.height = height
+    }
+
+    static func saved() -> FloatingLayout {
+        let d = UserDefaults.standard
+        let w = d.double(forKey: widthKey), h = d.double(forKey: heightKey)
+        return FloatingLayout(width: w >= minSize.width ? w : defaultWidth, height: h >= minSize.height ? h : nil)
+    }
+
+    func save() {
+        UserDefaults.standard.set(Double(width), forKey: Self.widthKey)
+        UserDefaults.standard.set(Double(height ?? 0), forKey: Self.heightKey)
+    }
+}
+
+/// Which edges of the keep-on-top window a drag resizes.
+struct ResizeEdges: OptionSet {
+    let rawValue: Int
+    init(rawValue: Int) { self.rawValue = rawValue }
+    static let left = ResizeEdges(rawValue: 1)
+    static let right = ResizeEdges(rawValue: 2)
+    static let top = ResizeEdges(rawValue: 4)
+    static let bottom = ResizeEdges(rawValue: 8)
+
+    /// The edges a point (y up) is on: within 5 pt of an edge, or within 14 pt
+    /// of a corner along either side, so corners are easy to grab.
+    init(at p: NSPoint, in size: NSSize, band: CGFloat = 5, corner: CGFloat = 14) {
+        let nearLeft = p.x <= band, nearRight = p.x >= size.width - band
+        let nearBottom = p.y <= band, nearTop = p.y >= size.height - band
+        let alongSide = nearLeft || nearRight, alongEnd = nearTop || nearBottom
+        var edges: ResizeEdges = []
+        if nearLeft || (alongEnd && p.x <= corner) { edges.insert(.left) }
+        if nearRight || (alongEnd && p.x >= size.width - corner) { edges.insert(.right) }
+        if nearBottom || (alongSide && p.y <= corner) { edges.insert(.bottom) }
+        if nearTop || (alongSide && p.y >= size.height - corner) { edges.insert(.top) }
+        self.init(rawValue: edges.rawValue)
+    }
+
+    var cursor: NSCursor {
+        let position: NSCursor.FrameResizePosition
+        switch self {
+        case [.top, .left]: position = .topLeft
+        case [.top, .right]: position = .topRight
+        case [.bottom, .left]: position = .bottomLeft
+        case [.bottom, .right]: position = .bottomRight
+        case .left: position = .left
+        case .right: position = .right
+        case .top: position = .top
+        default: position = .bottom
+        }
+        return NSCursor.frameResize(position: position, directions: .all)
+    }
+}
+
+/// The frame after dragging `edges` by `delta` (screen points, y up): the
+/// opposite edges stay put, and the size stays at least `minSize` and inside `limit`.
+func resizedFrame(_ start: NSRect, edges: ResizeEdges, delta: NSPoint, minSize: NSSize, limit: NSRect) -> NSRect {
+    var f = start
+    if edges.contains(.right) {
+        f.size.width = max(minSize.width, min(start.width + delta.x, limit.maxX - start.minX))
+    }
+    if edges.contains(.left) {
+        let width = max(minSize.width, min(start.width - delta.x, start.maxX - limit.minX))
+        f.origin.x = start.maxX - width
+        f.size.width = width
+    }
+    if edges.contains(.top) {
+        f.size.height = max(minSize.height, min(start.height + delta.y, limit.maxY - start.minY))
+    }
+    if edges.contains(.bottom) {
+        let height = max(minSize.height, min(start.height - delta.y, start.maxY - limit.minY))
+        f.origin.y = start.maxY - height
+        f.size.height = height
+    }
+    return f
+}
+
+/// Resizing for the borderless keep-on-top window: a thin band inside each
+/// edge takes the drag and shows the resize cursor; anywhere else clicks fall
+/// through to the rows. It tracks the mouse itself, because the window never
+/// becomes key, so the usual cursor handling does not reach it.
+final class ResizeEdgesView: NSView {
+    var minSize = FloatingLayout.minSize
+    var onResize: (NSRect, ResizeEdges) -> Void = { _, _ in }
+    var onResizeEnd: () -> Void = {}
+    private var drag: (edges: ResizeEdges, frame: NSRect, mouse: NSPoint)?
+    private var showingResizeCursor = false
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        ResizeEdges(at: convert(point, from: superview), in: bounds.size).isEmpty ? nil : self
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways,
+                                                              .inVisibleRect], owner: self))
+    }
+
+    private func edges(_ event: NSEvent) -> ResizeEdges {
+        ResizeEdges(at: convert(event.locationInWindow, from: nil), in: bounds.size)
+    }
+
+    override func mouseEntered(with event: NSEvent) { updateCursor(event) }
+    override func mouseMoved(with event: NSEvent) { updateCursor(event) }
+
+    override func mouseExited(with event: NSEvent) {
+        guard drag == nil, showingResizeCursor else { return }
+        showingResizeCursor = false
+        NSCursor.arrow.set()
+    }
+
+    private func updateCursor(_ event: NSEvent) {
+        guard drag == nil else { return }
+        let edges = edges(event)
+        if !edges.isEmpty {
+            edges.cursor.set()
+            showingResizeCursor = true
+        } else if showingResizeCursor {
+            showingResizeCursor = false
+            NSCursor.arrow.set()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let edges = edges(event)
+        guard let window, !edges.isEmpty else { return }
+        drag = (edges, window.frame, NSEvent.mouseLocation)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let drag, let window else { return }
+        let mouse = NSEvent.mouseLocation
+        let limit = window.screen?.frame ?? NSScreen.main?.frame ?? .infinite
+        let frame = resizedFrame(drag.frame, edges: drag.edges,
+                                 delta: NSPoint(x: mouse.x - drag.mouse.x, y: mouse.y - drag.mouse.y),
+                                 minSize: minSize, limit: limit)
+        drag.edges.cursor.set()
+        onResize(frame, drag.edges)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard drag != nil else { return }
+        drag = nil
+        onResizeEnd()
+    }
+}
+
+/// The pointing hand over a row that opens a session. It tracks the mouse
+/// itself, so it also works in the keep-on-top window, which never becomes
+/// key; clicks pass through to the row.
+final class PointingHandView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways,
+                                                              .inVisibleRect], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { point(event) }
+    override func mouseMoved(with event: NSEvent) { point(event) }
+    override func mouseExited(with event: NSEvent) { NSCursor.arrow.set() }
+
+    private func point(_ event: NSEvent) {
+        // The keep-on-top window's resize band keeps its resize cursor.
+        if window is KeepOnTopPanel, let content = window?.contentView,
+           !ResizeEdges(at: content.convert(event.locationInWindow, from: nil), in: content.bounds.size).isEmpty {
+            return
+        }
+        if NSCursor.current != NSCursor.pointingHand { NSCursor.pointingHand.set() }
+    }
+}
+
+struct PointingHandArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> PointingHandView { PointingHandView() }
+    func updateNSView(_ nsView: PointingHandView, context: Context) {}
+}
+
 /// A borderless panel that never takes keyboard focus from a game or video.
 final class KeepOnTopPanel: NSPanel {
     override var canBecomeKey: Bool { false }
@@ -2538,6 +2765,9 @@ final class FloatingController {
     private var previewing: GlowPreview?
     /// Running sessions at the last update, to catch the moment the last one stops.
     private var wasRunning = 0
+    private let layout = FloatingLayout.saved()
+    /// While an edge is being dragged, the window follows the mouse, not the rows.
+    private var resizing = false
     private static let shownKey = "keepOnTop"
     private static let frameName = "LimboTasksKeepOnTop"
 
@@ -2625,6 +2855,7 @@ final class FloatingController {
         DispatchQueue.main.async { [weak self] in
             guard let self, let panel = self.panel, let host = self.host else { return }
             self.updateGlow()
+            guard !self.resizing else { return }
             let size = host.fittingSize
             var frame = panel.frame
             guard frame.size != size else { return }
@@ -2633,6 +2864,21 @@ final class FloatingController {
             frame.origin.y = top - size.height
             panel.setFrame(frame, display: true)
         }
+    }
+
+    /// Side edges change only the width, so the height keeps fitting the rows;
+    /// the top or bottom edge sets the height too, and the list scrolls in it.
+    private func userResized(to frame: NSRect, edges: ResizeEdges) {
+        resizing = true
+        if !edges.isDisjoint(with: [.top, .bottom]) { layout.height = frame.height }
+        layout.width = frame.width
+        panel?.setFrame(frame, display: true)
+    }
+
+    private func resizeEnded() {
+        resizing = false
+        layout.save()
+        fitToContent()
     }
 
     private func makePanel() -> KeepOnTopPanel {
@@ -2646,12 +2892,24 @@ final class FloatingController {
                                 unpin: { [weak self] in self?.hide() },
                                 refit: { [weak self] in self?.fitToContent() },
                                 glowChanged: { [weak self] in self?.glowChanged($0) },
-                                glow: glow)
+                                glow: glow,
+                                layout: layout)
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
         let panel = KeepOnTopPanel(contentRect: NSRect(origin: .zero, size: size),
                                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
-        panel.contentView = host
+        // The rows, with the resize band on top of them along the edges.
+        let content = NSView(frame: NSRect(origin: .zero, size: size))
+        host.frame = content.bounds
+        host.autoresizingMask = [.width, .height]
+        let edges = ResizeEdgesView(frame: content.bounds)
+        edges.autoresizingMask = [.width, .height]
+        edges.onResize = { [weak self] frame, moved in self?.userResized(to: frame, edges: moved) }
+        edges.onResizeEnd = { [weak self] in self?.resizeEnded() }
+        content.addSubview(host)
+        content.addSubview(edges)
+        panel.contentView = content
+        panel.minSize = FloatingLayout.minSize
         panel.isFloatingPanel = true
         panel.level = .statusBar                      // above full-screen windows
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -2902,6 +3160,14 @@ func sampleRows(now: Date) -> [Row] {
     ])
 }
 
+/// --size 380x260, or 380xauto: the keep-on-top window's size in a snapshot.
+func snapshotLayout() -> FloatingLayout {
+    let parts = (argument(after: "--size") ?? "").split(separator: "x").map(String.init)
+    let width = parts.first.flatMap(Double.init).map { CGFloat($0) } ?? FloatingLayout.defaultWidth
+    let height = parts.count > 1 ? Double(parts[1]).map { CGFloat($0) } : nil
+    return FloatingLayout(width: width, height: height)
+}
+
 /// Renders the panel and the menu bar item to PNG files.
 func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limit: Int?) {
     _ = NSApplication.shared
@@ -2917,7 +3183,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
         || !Board(rows: model.rows, now: Date()).running.isEmpty) ? RunningGlowView(frame: .zero) : nil
     glow?.forceMotion = true
     let host: NSView = floating
-        ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {}, glow: glow)
+        ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {}, glow: glow,
+                                               layout: snapshotLayout())
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
             .background(Color(nsColor: .windowBackgroundColor)))
@@ -3132,6 +3399,24 @@ func runSelfTest() {
     queue.sync { watcher.cancel() }
     check("agent writing alone is picked up by the watcher",
           updated && abs((reports.last?.lastOutput?.timeIntervalSince(now)) ?? 99) < 2)
+
+    let size = NSSize(width: 300, height: 120)
+    check("left edge", ResizeEdges(at: NSPoint(x: 2, y: 60), in: size) == .left)
+    check("bottom edge", ResizeEdges(at: NSPoint(x: 150, y: 3), in: size) == .bottom)
+    check("top-right corner from 12 pt along the top", ResizeEdges(at: NSPoint(x: 288, y: 118), in: size) == [.top, .right])
+    check("inside: no edge", ResizeEdges(at: NSPoint(x: 150, y: 60), in: size).isEmpty)
+    let start = NSRect(x: 100, y: 100, width: 300, height: 120), screen = NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let minimum = FloatingLayout.minSize
+    check("right edge widens", resizedFrame(start, edges: .right, delta: NSPoint(x: 50, y: 0), minSize: minimum,
+                                            limit: screen) == NSRect(x: 100, y: 100, width: 350, height: 120))
+    check("left edge keeps the right side", resizedFrame(start, edges: .left, delta: NSPoint(x: -40, y: 0),
+                                                         minSize: minimum, limit: screen) == NSRect(x: 60, y: 100, width: 340, height: 120))
+    check("bottom edge down keeps the top", resizedFrame(start, edges: .bottom, delta: NSPoint(x: 0, y: -80),
+                                                         minSize: minimum, limit: screen) == NSRect(x: 100, y: 20, width: 300, height: 200))
+    check("never below the minimum", resizedFrame(start, edges: [.top, .left], delta: NSPoint(x: 500, y: -500),
+                                                  minSize: minimum, limit: screen).size == minimum)
+    check("never past the screen", resizedFrame(start, edges: .right, delta: NSPoint(x: 5000, y: 0), minSize: minimum,
+                                                limit: screen).maxX == 1440)
 
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
