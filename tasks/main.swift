@@ -420,24 +420,77 @@ func transcriptActivity(path: String) -> String? {
     return nil
 }
 
+/// What a running session is doing, and when it last wrote anything.
+struct Activity: Equatable {
+    var text: String?
+    var lastOutput: Date?
+
+    init(text: String?, lastOutput: Date?) {
+        self.text = text
+        self.lastOutput = lastOutput
+    }
+
+    /// Reads both from disk.
+    init(transcript path: String) {
+        self.init(text: transcriptActivity(path: path), lastOutput: latestWrite(transcript: path))
+    }
+}
+
+/// When a session last wrote anything: its transcript, its agents'
+/// transcripts (<id>/subagents) or its workflows' state (<id>/workflows),
+/// whichever is newest. A handful of stats.
+func latestWrite(transcript path: String) -> Date? {
+    var newest = fileStamp(path)?.mtime
+    let side = String(path.dropLast(".jsonl".count))
+    for folder in ["subagents", "workflows"] {
+        let dir = side + "/" + folder
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        where name.hasSuffix(".jsonl") || name.hasSuffix(".json") {
+            if let m = fileStamp(dir + "/" + name)?.mtime, m > (newest ?? 0) { newest = m }
+        }
+    }
+    return newest.map { Date(timeIntervalSince1970: $0) }
+}
+
 /// Re-reads a running session's transcript tail when the file changes, at most
-/// once a second, on the engine queue.
+/// once a second, on the engine queue. Every 30 s it also checks the session's
+/// agent and workflow files, which change while the main transcript is quiet.
 final class ActivityWatcher {
     let key: String
     private let path: String
     private let queue: DispatchQueue
-    private let onChange: (String?) -> Void
+    private let onChange: (Activity) -> Void
     private var source: DispatchSourceFileSystemObject?
+    private var sideCheck: DispatchSourceTimer?
+    private var last = Activity(text: nil, lastOutput: nil)
     private var pending = false
     private var cancelled = false
 
-    init(key: String, path: String, queue: DispatchQueue, onChange: @escaping (String?) -> Void) {
+    init(key: String, path: String, queue: DispatchQueue, sideCheckEvery: TimeInterval = 30,
+         onChange: @escaping (Activity) -> Void) {
         self.key = key
         self.path = path
         self.queue = queue
         self.onChange = onChange
         attach()
-        onChange(transcriptActivity(path: path))
+        read()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + sideCheckEvery, repeating: sideCheckEvery,
+                       leeway: .milliseconds(Int(sideCheckEvery * 300)))
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.cancelled else { return }
+            let newest = latestWrite(transcript: self.path)
+            guard newest != self.last.lastOutput else { return }
+            self.last.lastOutput = newest
+            self.onChange(self.last)
+        }
+        timer.resume()
+        sideCheck = timer
+    }
+
+    private func read() {
+        last = Activity(transcript: path)
+        onChange(last)
     }
 
     private func attach() {
@@ -447,7 +500,7 @@ final class ActivityWatcher {
             queue.asyncAfter(deadline: .now() + 5) { [weak self] in
                 guard let self, !self.cancelled, self.source == nil else { return }
                 self.attach()
-                if self.source != nil { self.onChange(transcriptActivity(path: self.path)) }
+                if self.source != nil { self.read() }
             }
             return
         }
@@ -474,7 +527,7 @@ final class ActivityWatcher {
         queue.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, !self.cancelled else { return }
             self.pending = false
-            self.onChange(transcriptActivity(path: self.path))
+            self.read()
         }
     }
 
@@ -482,6 +535,8 @@ final class ActivityWatcher {
         cancelled = true
         source?.cancel()
         source = nil
+        sideCheck?.cancel()
+        sideCheck = nil
     }
 }
 
@@ -503,7 +558,18 @@ struct Row: Identifiable, Equatable {
     var link: String? = nil     // desktop session id, when it can be opened
     var terminal = false
     var activity: String? = nil // what a running session is doing now
+    var lastOutput: Date? = nil // when a running session last wrote anything
+
+    /// How long a running session has written nothing, once that passes
+    /// `quietAfter`: possibly stuck, or in one long command.
+    func quiet(now: Date) -> TimeInterval? {
+        guard group == .running, let lastOutput else { return nil }
+        let gap = now.timeIntervalSince(lastOutput)
+        return gap >= quietAfter ? gap : nil
+    }
 }
+
+let quietAfter: TimeInterval = 10 * 60
 
 func rowsInOrder(_ rows: [Row]) -> [Row] {
     rows.sorted { a, b in
@@ -529,7 +595,7 @@ let dataWindow: TimeInterval = 8 * 86400
 ///  input; failed or an error in the last 7 days = failed).
 ///  7. terminal session (no desktop id), idle          -> Terminal
 func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
-              activities: [Int32: String] = [:]) -> [Row] {
+              activities: [Int32: Activity] = [:]) -> [Row] {
     var bySession: [String: DeskRecord] = [:]
     for d in desk {
         // The same session can sit under several account folders; keep the newest copy.
@@ -554,7 +620,8 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
         let link = isSessionId(d.sessionId) ? d.sessionId : nil
         if let l, l.isBusy {
             rows.append(Row(id: d.sessionId, group: .running, title: d.title, context: context,
-                            since: l.statusSince, link: link, activity: activities[l.pid]))
+                            since: l.statusSince, link: link, activity: activities[l.pid]?.text,
+                            lastOutput: activities[l.pid]?.lastOutput))
             continue
         }
         if let l, l.isWaiting {
@@ -610,7 +677,8 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
         rows.append(Row(id: host, group: group, title: l.name,
                         ask: l.isWaiting ? (l.waitingFor ?? "Waiting for your input") : nil,
                         context: folderLabel(l.cwd), since: l.statusSince, link: host,
-                        activity: l.isBusy ? activities[l.pid] : nil))
+                        activity: l.isBusy ? activities[l.pid]?.text : nil,
+                        lastOutput: l.isBusy ? activities[l.pid]?.lastOutput : nil))
     }
     // Sessions started in a terminal: no summary, so idle ones never count as your turn.
     for l in terminalLive {
@@ -618,7 +686,8 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
         rows.append(Row(id: "pid:\(l.pid)", group: group, title: l.name,
                         ask: l.isWaiting ? (l.waitingFor ?? "Waiting for your input") : nil,
                         context: folderLabel(l.cwd), since: l.statusSince, terminal: true,
-                        activity: l.isBusy ? activities[l.pid] : nil))
+                        activity: l.isBusy ? activities[l.pid]?.text : nil,
+                        lastOutput: l.isBusy ? activities[l.pid]?.lastOutput : nil))
     }
     return rowsInOrder(rows)
 }
@@ -682,7 +751,7 @@ final class SessionEngine {
     /// Transcripts are read only while a panel that shows the live activity is open.
     private var activityWanted = false
     private var activityWatchers: [Int32: ActivityWatcher] = [:]
-    private var activities: [Int32: String] = [:]
+    private var activities: [Int32: Activity] = [:]
     private var eventBatches = 0
     private var fileParses = 0
 
@@ -709,11 +778,10 @@ final class SessionEngine {
         return engine.queue.sync {
             engine.scanAll()
             // One-off checks also read the live activity of running sessions.
-            var activities: [Int32: String] = [:]
+            var activities: [Int32: Activity] = [:]
             for (pid, record) in engine.live where record.isBusy {
-                if let id = record.cliSessionId,
-                   let text = transcriptActivity(path: transcriptPath(cwd: record.cwd, cliSessionId: id)) {
-                    activities[pid] = text
+                if let id = record.cliSessionId {
+                    activities[pid] = Activity(transcript: transcriptPath(cwd: record.cwd, cliSessionId: id))
                 }
             }
             return classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
@@ -765,10 +833,13 @@ final class SessionEngine {
         for (pid, record) in busy where activityWatchers[pid] == nil {
             guard let id = record.cliSessionId else { continue }
             let path = transcriptPath(cwd: record.cwd, cliSessionId: id)
-            activityWatchers[pid] = ActivityWatcher(key: record.key, path: path, queue: queue) { [weak self] text in
+            activityWatchers[pid] = ActivityWatcher(key: record.key, path: path, queue: queue) { [weak self] activity in
                 guard let self, self.activityWatchers[pid] != nil || self.activities[pid] == nil else { return }
-                guard self.activities[pid] != text else { return }
-                self.activities[pid] = text
+                // A busy transcript is written every second or so: pass on a new
+                // write time only once a minute, which is all the quiet check needs.
+                if let old = self.activities[pid], old.text == activity.text,
+                   let was = old.lastOutput, let now = activity.lastOutput, now.timeIntervalSince(was) < 60 { return }
+                self.activities[pid] = activity
                 self.publishIfChanged()
             }
         }
@@ -912,6 +983,24 @@ final class SessionModel: ObservableObject {
     }
     /// Live activity is read only while one of the two is showing.
     var onVisibilityChange: (() -> Void)?
+    /// When each session was last opened from here: opening one that needs
+    /// you stops its amber glow.
+    private(set) var openedAt: [String: Date] = [:]
+    var onOpened: (() -> Void)?
+
+    func markOpened(_ row: Row) {
+        openedAt[row.id] = Date()
+        onOpened?()
+    }
+
+    /// Sessions that started waiting for you in the last hour and have not been
+    /// opened from here since.
+    func freshNeedsYou(_ board: Board) -> [Row] {
+        board.yourTurn.filter { row in
+            now.timeIntervalSince(row.since) <= freshFor && (openedAt[row.id].map { $0 < row.since } ?? true)
+        }
+    }
+    let freshFor: TimeInterval = 3600
 }
 
 // MARK: - Start at login
@@ -1174,14 +1263,26 @@ struct PulsingDot: NSViewRepresentable {
     func updateNSView(_ view: PulseView, context: Context) { view.updateAnimation() }
 }
 
+/// Amber: a running session that has written nothing for a while.
+let quietColor = Color(red: 0.96, green: 0.66, blue: 0.10)
+
+/// "No output for 12 min", for a running session gone quiet.
+func quietPhrase(_ gap: TimeInterval) -> String {
+    "No output for " + (elapsed(since: Date(timeIntervalSinceNow: -gap), now: Date()) ?? "a while")
+}
+
 struct Indicator: View {
     let group: Group
+    var quiet = false
 
     var body: some View {
         ZStack {
             switch group {
             case .yourTurn:
                 Circle().fill(Color.orange).frame(width: 8, height: 8)
+            case .running where quiet:
+                // Still running, but nothing written for 10 minutes: no pulse.
+                Image(systemName: "hourglass").font(.system(size: 10, weight: .bold)).foregroundStyle(quietColor)
             case .running:
                 if staticIndicators {
                     Circle().fill(Color.green.opacity(0.22)).frame(width: 16, height: 16)
@@ -1212,11 +1313,15 @@ struct SessionRow: View {
 
     private var canOpen: Bool { row.link != nil }
 
+    private var quiet: TimeInterval? { row.quiet(now: now) }
+
     private var secondLine: String? {
         switch row.group {
         case .yourTurn: return row.ask
         case .review, .done: return row.detail
-        case .running: return row.activity
+        case .running:
+            guard let quiet else { return row.activity }
+            return [quietPhrase(quiet), row.activity].compactMap { $0 }.joined(separator: " · ")
         case .justFinished, .terminal: return nil
         }
     }
@@ -1255,7 +1360,7 @@ struct SessionRow: View {
     var body: some View {
         Button { if canOpen { open(row) } } label: {
             HStack(alignment: .top, spacing: 10) {
-                Indicator(group: row.group).padding(.top, 1)
+                Indicator(group: row.group, quiet: quiet != nil).padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title)
@@ -1268,7 +1373,8 @@ struct SessionRow: View {
                     if let line = secondLine {
                         Text(line)
                             .font(.system(size: 12))
-                            .foregroundStyle(row.group == .yourTurn ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                            .foregroundStyle(row.group == .yourTurn ? AnyShapeStyle(.primary)
+                                             : quiet != nil ? AnyShapeStyle(quietColor) : AnyShapeStyle(.secondary))
                             .lineLimit(row.group == .done ? 1 : 2)
                             .truncationMode(.tail)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1617,6 +1723,7 @@ final class PanelController: NSObject, NSPopoverDelegate {
         guard let id = row.link, isSessionId(id),
               let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
         popover?.performClose(nil)
+        model.markOpened(row)
         NSWorkspace.shared.open(url)
     }
 }
@@ -1630,9 +1737,10 @@ struct CompactRow: View {
     @State private var hovering = false
 
     var body: some View {
+        let quiet = row.quiet(now: now)
         Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
-                Indicator(group: row.group)
+                Indicator(group: row.group, quiet: quiet != nil)
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.tail)
@@ -1650,7 +1758,10 @@ struct CompactRow: View {
                                 .foregroundStyle(.tertiary)
                         }
                     }
-                    if let line = row.group == .yourTurn ? row.ask
+                    if let quiet {
+                        Text([quietPhrase(quiet), row.activity].compactMap { $0 }.joined(separator: " · "))
+                            .font(.system(size: 11)).foregroundStyle(quietColor).lineLimit(1).truncationMode(.tail)
+                    } else if let line = row.group == .yourTurn ? row.ask
                         : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil)) {
                         Text(line).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
                     }
@@ -1665,7 +1776,9 @@ struct CompactRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help([row.title, row.ask ?? row.detail].compactMap { $0 }.joined(separator: "\n\n"))
+        .help([row.title, row.ask ?? row.detail,
+               quiet.map { quietPhrase($0) + ": it may be stuck, or in one long command" }]
+            .compactMap { $0 }.joined(separator: "\n\n"))
     }
 }
 
@@ -1701,12 +1814,14 @@ struct FloatingView: View {
     let open: (Row) -> Void
     let unpin: () -> Void
     var refit: () -> Void = {}
-    var glowChanged: () -> Void = {}
+    var glowChanged: (GlowPreview) -> Void = { _ in }
     /// Drawn between the window's material and the rows, so text stays crisp.
     var glow: RunningGlowView?
     @AppStorage("keepOnTopWaitingHours") private var waitingHours = WaitingWindow.day.rawValue
     @AppStorage(GlowStyle.key) private var glowStyle = GlowStyle.aurora.rawValue
     @AppStorage(GlowColor.key) private var glowColor = GlowColor.red.rawValue
+    @AppStorage(GlowSignal.needsYouKey) private var needsYouGlow = true
+    @AppStorage(GlowSignal.doneFlashKey) private var doneFlash = true
     static let maxRows = 8
     /// Finished sessions stay listed, with a green check, for this long.
     static let doneShownFor: TimeInterval = 30 * 60
@@ -1753,8 +1868,10 @@ struct FloatingView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
         .onChange(of: waitingHours) { refit() }
-        .onChange(of: glowStyle) { glowChanged() }
-        .onChange(of: glowColor) { glowChanged() }
+        .onChange(of: glowStyle) { glowChanged(.running) }
+        .onChange(of: glowColor) { glowChanged(.running) }
+        .onChange(of: needsYouGlow) { glowChanged(needsYouGlow ? .needsYou : .none) }
+        .onChange(of: doneFlash) { glowChanged(doneFlash ? .done : .none) }
     }
 
     private func header(running: Int, waiting: Int, review: Int) -> some View {
@@ -1823,6 +1940,9 @@ struct FloatingView: View {
             }
             .pickerStyle(.inline)
             .disabled(style == .none)
+            Divider()
+            Toggle("Amber glow when a session needs you", isOn: $needsYouGlow)
+            Toggle("Green flash when the last session stops", isOn: $doneFlash)
         } label: {
             Image(systemName: "sparkles")
                 .font(.system(size: 10, weight: .semibold))
@@ -1874,6 +1994,32 @@ enum GlowStyle: String, CaseIterable, Identifiable {
     static var saved: GlowStyle {
         UserDefaults.standard.string(forKey: key).flatMap(GlowStyle.init(rawValue:)) ?? .aurora
     }
+}
+
+/// The two other signals, each on unless turned off in the sparkle menu.
+enum GlowSignal {
+    static let needsYouKey = "needsYouGlow"
+    static let doneFlashKey = "doneFlash"
+    static var needsYou: Bool { UserDefaults.standard.object(forKey: needsYouKey) as? Bool ?? true }
+    static var doneFlash: Bool { UserDefaults.standard.object(forKey: doneFlashKey) as? Bool ?? true }
+}
+
+/// What the glow should show, and whether the green flash plays: amber while a
+/// session newly needs you, else the running effect while any session runs; a
+/// flash when the last running session stops. A choice just made in the
+/// sparkle menu shows for a few seconds.
+func glowDecision(pinned: Bool, running: Int, wasRunning: Int, needsYou: Bool, previewing: GlowPreview?,
+                  needsYouOn: Bool, flashOn: Bool) -> (mode: GlowMode, flash: Bool) {
+    guard pinned else { return (.off, false) }
+    let flash = flashOn && running == 0 && wasRunning > 0
+    if previewing == .needsYou || (previewing != .running && needsYouOn && needsYou) { return (.needsYou, flash) }
+    if previewing == .running || running > 0 { return (.running, flash) }
+    return (.off, flash)
+}
+
+/// What changed in the sparkle menu, so it can be shown straight away.
+enum GlowPreview {
+    case running, needsYou, done, none
 }
 
 enum GlowColor: String, CaseIterable, Identifiable {
@@ -1945,10 +2091,20 @@ func insetGlowImage(color: NSColor, blur: CGFloat, spread: CGFloat, scale: CGFlo
     }
 }
 
-/// While a session runs, colour moves in from the keep-on-top window's edges
-/// in the chosen style. Core Animation runs it at a capped frame rate, so the
-/// app does no work per frame; a steady glow with Reduce Motion on. Random
-/// cross-fades to a different effect every 5 seconds.
+/// What the keep-on-top window's glow shows.
+enum GlowMode: String {
+    case off, running, needsYou
+}
+
+/// Amber, for a session that needs you; yellower than the orange glow colour.
+let needsYouColor = NSColor(srgbRed: 1.0, green: 0.72, blue: 0.16, alpha: 1)
+
+/// The keep-on-top window's light. While a session runs, colour moves in from
+/// its edges in the chosen style; while a session newly needs you, a slow
+/// amber breath takes over; when the last running session stops, a green glow
+/// sweeps across once and fades. Core Animation runs it all at a capped frame
+/// rate, so the app does no work per frame; steady glows with Reduce Motion on.
+/// Random cross-fades to a different running effect every 5 seconds.
 final class RunningGlowView: NSView {
     private struct Effect {
         var layout: (CGRect) -> Void = { _ in }
@@ -1959,13 +2115,16 @@ final class RunningGlowView: NSView {
     }
 
     private let clip = CALayer()
+    /// The done flash has its own layer, so it plays over whatever comes next.
+    private let flashClip = CALayer()
     private var chosen: GlowStyle = .none
     private var tint: GlowColor = .red
+    private var mode: GlowMode = .off
+    /// The running effect; Random changes it every 5 seconds.
     private var showing: GlowStyle = .none
     private var effect = Effect()
     private var builtScale: CGFloat = 0
     private var laidOut: CGSize = .zero
-    private var active = false
     private var shuffle: Timer?
     /// Snapshots draw the effect moving even with Reduce Motion on.
     var forceMotion = false
@@ -1973,11 +2132,13 @@ final class RunningGlowView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        clip.cornerRadius = 12
-        clip.cornerCurve = .continuous
-        clip.masksToBounds = true
+        for layer in [clip, flashClip] {
+            layer.cornerRadius = 12
+            layer.cornerCurve = .continuous
+            layer.masksToBounds = true
+            self.layer?.addSublayer(layer)
+        }
         clip.isHidden = true
-        layer?.addSublayer(clip)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1987,56 +2148,88 @@ final class RunningGlowView: NSView {
 
     private var scale: CGFloat { window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2 }
     private var still: Bool { !forceMotion && NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
-    private var moving: Bool { still || effect.probe?.animationKeys()?.isEmpty == false }
+    /// The effect is as it should be: moving, or meant to be still.
+    private var settled: Bool { still || effect.probe.map { $0.animationKeys()?.isEmpty == false } ?? true }
 
     func configure(style: GlowStyle, color: GlowColor) {
         guard style != chosen || color != tint else { return }
         chosen = style
         tint = color
-        show(style == .random ? GlowStyle.effects.randomElement()! : style, fade: false)
-        if chosen == .none { setActive(false) }
+        showing = style == .random ? GlowStyle.effects.randomElement()! : style
+        if mode == .running { render(fade: false) }
         updateShuffle()
     }
 
-    func setActive(_ on: Bool) {
-        let on = on && chosen != .none
-        guard on != active || (on && !moving) else { return }
-        active = on
-        clip.isHidden = !on
-        stopAnimations(clip)
-        if on { effect.start(bounds, still) }
-        updateShuffle()
+    func setMode(_ new: GlowMode) {
+        guard new != mode || !settled else { return }
+        let fade = mode != .off && new != .off && mode != new
+        mode = new
+        render(fade: fade)
     }
+
+    /// On means running; for the snapshot and the Random check.
+    func setActive(_ on: Bool) { setMode(on ? .running : .off) }
 
     /// Reduce Motion was turned on or off.
-    func motionChanged() {
-        guard active else { return }
-        stopAnimations(clip)
-        effect.start(bounds, still)
-        updateShuffle()
+    func motionChanged() { render(fade: false) }
+
+    /// The last running session stopped: a green glow sweeps across once and
+    /// fades, in about 2 seconds (a plain fade with Reduce Motion on).
+    func celebrate() {
+        let b = bounds
+        let green = GlowColor.green.color
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        flashClip.sublayers = nil
+        let holder = CALayer()
+        holder.frame = b
+        holder.opacity = 0
+        let edge = imageLayer(insetGlowImage(color: green, blur: 26, spread: 3, scale: scale))
+        edge.frame = b
+        let wash = CAGradientLayer()
+        wash.colors = washColors(green)
+        wash.locations = [0, 0.3, 0.5, 0.7, 1]
+        layoutWash(wash, in: b)
+        wash.opacity = still ? 0 : 0.5
+        holder.addSublayer(edge)
+        holder.addSublayer(wash)
+        flashClip.addSublayer(holder)
+        let fade = keyframes("opacity", values: [0, 1, 1, 0], times: [0, 0.12, 0.5, 1], duration: 2.2)
+        fade.repeatCount = 1
+        CATransaction.setCompletionBlock { [weak holder] in holder?.removeFromSuperlayer() }
+        holder.add(fade, forKey: "flash")
+        if !still {
+            let sweep = loop("position.x", from: b.minX - 0.54 * b.width, to: b.minX + 1.54 * b.width,
+                             duration: 1.4, autoreverses: false)
+            sweep.repeatCount = 1
+            wash.add(sweep, forKey: "flash")
+        }
+        CATransaction.commit()
     }
 
     /// For diagnostics: what was picked, what shows, and whether it moves.
     var state: [String: Any] {
-        ["chosen": chosen.rawValue, "showing": showing.rawValue, "color": tint.rawValue, "active": active,
-         "animating": effect.probe?.animationKeys()?.isEmpty == false, "still": still,
+        ["mode": mode.rawValue, "chosen": chosen.rawValue, "showing": showing.rawValue, "color": tint.rawValue,
+         "active": mode != .off, "animating": effect.probe?.animationKeys()?.isEmpty == false, "still": still,
+         "flashing": flashClip.sublayers?.isEmpty == false,
          "width": Int(bounds.width), "height": Int(bounds.height)]
     }
 
     /// Snapshots: stop the clock, then `phase(_:)` picks the moment drawn.
-    func freeze() { clip.speed = 0; clip.timeOffset = 0 }
-    func phase(_ seconds: CFTimeInterval) { clip.timeOffset = seconds }
+    func freeze() { for layer in [clip, flashClip] { layer.speed = 0; layer.timeOffset = 0 } }
+    func phase(_ seconds: CFTimeInterval) { for layer in [clip, flashClip] { layer.timeOffset = seconds } }
 
     override func layout() {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         clip.frame = bounds
+        flashClip.frame = bounds
         effect.layout(bounds)
         CATransaction.commit()
         if bounds.size != laidOut {
             laidOut = bounds.size
-            if active { stopAnimations(clip); effect.start(bounds, still) }   // sizes are baked into them
+            if mode != .off { stopAnimations(clip); effect.start(bounds, still) }   // sizes are baked into them
         }
     }
 
@@ -2047,15 +2240,16 @@ final class RunningGlowView: NSView {
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        if builtScale != scale { show(showing, fade: false) }
+        if builtScale != scale { render(fade: false) }
     }
 
     private func updateShuffle() {
-        guard active, chosen == .random, !still else { stopShuffle(); return }
+        guard mode == .running, chosen == .random, !still else { stopShuffle(); return }
         guard shuffle == nil else { return }
         let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.show(GlowStyle.effects.filter { $0 != self.showing }.randomElement()!, fade: true)
+            self.showing = GlowStyle.effects.filter { $0 != self.showing }.randomElement()!
+            self.render(fade: true)
         }
         timer.tolerance = 0.5
         RunLoop.main.add(timer, forMode: .common)
@@ -2071,8 +2265,8 @@ final class RunningGlowView: NSView {
         layer.sublayers?.forEach { $0.removeAllAnimations(); stopAnimations($0) }
     }
 
-    /// Replaces the layers with those of `style`, cross-fading when asked.
-    private func show(_ style: GlowStyle, fade: Bool) {
+    /// Rebuilds the layers for the current mode, cross-fading when asked.
+    private func render(fade: Bool) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         stopAnimations(clip)
@@ -2083,12 +2277,47 @@ final class RunningGlowView: NSView {
             clip.add(swap, forKey: "swap")
         }
         clip.sublayers = nil
-        showing = style
         builtScale = scale
-        effect = build(style)
+        switch mode {
+        case .off: effect = Effect()
+        case .running: effect = build(showing)
+        case .needsYou: effect = buildNeedsYou()
+        }
         effect.layout(bounds)
-        if active { effect.start(bounds, still) }
+        clip.isHidden = mode == .off
+        if mode != .off { effect.start(bounds, still) }
         CATransaction.commit()
+        updateShuffle()
+    }
+
+    /// A session needs you: a slow amber breath along the edges.
+    private func buildNeedsYou() -> Effect {
+        let edge = imageLayer(insetGlowImage(color: needsYouColor, blur: 30, spread: 3, scale: builtScale))
+        clip.addSublayer(edge)
+        var effect = Effect()
+        effect.layout = { edge.frame = $0 }
+        effect.start = { _, still in
+            edge.opacity = still ? 0.65 : 0.25
+            guard !still else { return }
+            edge.add(loop("opacity", from: 0.25, to: 0.9, duration: 1.6), forKey: "glow")
+        }
+        effect.probe = edge
+        return effect
+    }
+
+    /// A band of colour 2.6 times the window's width, leaning 10°.
+    private func layoutWash(_ wash: CAGradientLayer, in b: CGRect) {
+        let width = b.width * 2.6
+        wash.bounds = CGRect(x: 0, y: 0, width: width, height: b.height)
+        wash.position = CGPoint(x: b.midX, y: b.midY)
+        let tilt = width * tan(10 * Double.pi / 180) / 2 / max(b.height, 1)
+        wash.startPoint = CGPoint(x: 0, y: 0.5 + tilt)
+        wash.endPoint = CGPoint(x: 1, y: 0.5 - tilt)
+    }
+
+    private func washColors(_ color: NSColor) -> [CGColor] {
+        let clear = color.withAlphaComponent(0).cgColor
+        return [clear, clear, color.cgColor, clear, clear]
     }
 
     private func build(_ style: GlowStyle) -> Effect {
@@ -2179,18 +2408,13 @@ final class RunningGlowView: NSView {
             let edge = imageLayer(insetGlowImage(color: accent, blur: 18, spread: 1, scale: builtScale))
             edge.opacity = 0.35
             let wash = CAGradientLayer()
-            wash.colors = [clear, clear, cg, clear, clear]
+            wash.colors = washColors(accent)
             wash.locations = [0, 0.3, 0.5, 0.7, 1]
             clip.addSublayer(edge)
             clip.addSublayer(wash)
-            effect.layout = { b in
+            effect.layout = { [weak self] b in
                 edge.frame = b
-                let width = b.width * 2.6
-                wash.bounds = CGRect(x: 0, y: 0, width: width, height: b.height)
-                wash.position = CGPoint(x: b.midX, y: b.midY)
-                let tilt = width * tan(10 * Double.pi / 180) / 2 / max(b.height, 1)   // bands lean 10°
-                wash.startPoint = CGPoint(x: 0, y: 0.5 + tilt)
-                wash.endPoint = CGPoint(x: 1, y: 0.5 - tilt)
+                self?.layoutWash(wash, in: b)
             }
             effect.start = { b, still in
                 wash.opacity = still ? 0 : 0.32
@@ -2247,7 +2471,7 @@ final class RunningGlowView: NSView {
         if let made {
             layer.contents = made.image
             layer.contentsCenter = made.center
-            layer.contentsScale = builtScale
+            layer.contentsScale = scale
         }
         return layer
     }
@@ -2311,7 +2535,9 @@ final class FloatingController {
     private let glow = RunningGlowView(frame: .zero)
     private var clock: Timer?
     private var preview: DispatchWorkItem?
-    private var previewing = false
+    private var previewing: GlowPreview?
+    /// Running sessions at the last update, to catch the moment the last one stops.
+    private var wasRunning = 0
     private static let shownKey = "keepOnTop"
     private static let frameName = "LimboTasksKeepOnTop"
 
@@ -2340,20 +2566,33 @@ final class FloatingController {
         updateGlow()
     }
 
-    /// The glow runs while any session runs, and for a few seconds after a new
-    /// one is picked so it can be seen even when nothing runs.
-    private func updateGlow() {
+    /// The glow: amber while a session newly needs you, else the chosen effect
+    /// while any session runs; a green flash when the last one stops. A choice
+    /// just made in the sparkle menu shows for 4 seconds.
+    func updateGlow() {
         glow.configure(style: .saved, color: .saved)
-        let running = !Board(rows: model.rows, now: model.now).running.isEmpty
-        glow.setActive(model.pinned && (running || previewing))
+        let board = Board(rows: model.rows, now: model.now)
+        let running = board.running.count
+        let decision = glowDecision(pinned: model.pinned, running: running, wasRunning: wasRunning,
+                                    needsYou: !model.freshNeedsYou(board).isEmpty, previewing: previewing,
+                                    needsYouOn: GlowSignal.needsYou, flashOn: GlowSignal.doneFlash)
+        wasRunning = model.pinned ? running : 0
+        if decision.flash { glow.celebrate() }
+        glow.setMode(decision.mode)
     }
 
-    private func glowChanged() {
+    private func glowChanged(_ what: GlowPreview) {
         preview?.cancel()
-        previewing = true
+        previewing = nil
+        switch what {
+        case .running, .needsYou: previewing = what
+        case .done: glow.celebrate()
+        case .none: break
+        }
         updateGlow()
+        guard previewing != nil else { return }
         let done = DispatchWorkItem { [weak self] in
-            self?.previewing = false
+            self?.previewing = nil
             self?.updateGlow()
         }
         preview = done
@@ -2362,12 +2601,17 @@ final class FloatingController {
 
     func motionChanged() { glow.motionChanged() }
 
-    var glowState: [String: Any] { glow.state.merging(["previewing": previewing]) { a, _ in a } }
+    var glowState: [String: Any] {
+        let board = Board(rows: model.rows, now: model.now)
+        return glow.state.merging(["previewing": previewing.map { "\($0)" } ?? "",
+                                   "freshNeedsYou": model.freshNeedsYou(board).map(\.title)]) { a, _ in a }
+    }
 
     func hide() {
         preview?.cancel()
-        previewing = false
-        glow.setActive(false)
+        previewing = nil
+        wasRunning = 0
+        glow.setMode(.off)
         panel?.orderOut(nil)
         model.pinned = false
         UserDefaults.standard.set(false, forKey: Self.shownKey)
@@ -2393,14 +2637,15 @@ final class FloatingController {
 
     private func makePanel() -> KeepOnTopPanel {
         let view = FloatingView(model: model,
-                                open: { row in
+                                open: { [weak self] row in
                                     guard let id = row.link, isSessionId(id),
                                           let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
+                                    self?.model.markOpened(row)
                                     NSWorkspace.shared.open(url)
                                 },
                                 unpin: { [weak self] in self?.hide() },
                                 refit: { [weak self] in self?.fitToContent() },
-                                glowChanged: { [weak self] in self?.glowChanged() },
+                                glowChanged: { [weak self] in self?.glowChanged($0) },
                                 glow: glow)
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
@@ -2465,6 +2710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signalSource.resume()
         snapshotSignal = signalSource
         floating = FloatingController(model: model)
+        model.onOpened = { [weak self] in self?.floating.updateGlow() }
         model.onVisibilityChange = { [weak self] in
             guard let self else { return }
             self.engine.setActivityWanted(self.model.panelOpen || self.model.pinned)
@@ -2638,7 +2884,8 @@ func sampleRows(now: Date) -> [Row] {
         Row(id: "local_s4", group: .running, title: "Audit traffic before the old site is shut down",
             context: "Documents", since: minutesAgo(12), link: "local_s4"),
         Row(id: "pid:5", group: .running, title: "data-pipeline", context: "data-pipeline",
-            since: minutesAgo(0.5), terminal: true),
+            since: minutesAgo(31), terminal: true, activity: "Running the nightly export",
+            lastOutput: minutesAgo(14)),
         Row(id: "local_s6", group: .justFinished, title: "Fix the flaky checkout test", context: "web-app",
             since: minutesAgo(0.2), link: "local_s6"),
         Row(id: "local_s7", group: .review, title: "Move dashboards to the new BI tool",
@@ -2665,7 +2912,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     // The running glow, frozen at --phase seconds (default 1) into its loop.
     let floating = arguments.contains("--floating")
-    let glow: RunningGlowView? = floating && (arguments.contains("--glow")
+    let glowFlags = ["--glow", "--attention", "--flash"].contains { arguments.contains($0) }
+    let glow: RunningGlowView? = floating && (glowFlags
         || !Board(rows: model.rows, now: Date()).running.isEmpty) ? RunningGlowView(frame: .zero) : nil
     glow?.forceMotion = true
     let host: NSView = floating
@@ -2683,7 +2931,10 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
         glow.freeze()
         glow.configure(style: argument(after: "--glow").flatMap(GlowStyle.init(rawValue:)) ?? .saved,
                        color: argument(after: "--tint").flatMap(GlowColor.init(rawValue:)) ?? .saved)
-        glow.setActive(true)
+        // --attention: the amber needs-you glow; --flash: the green done flash.
+        glow.setMode(arguments.contains("--attention") ? .needsYou
+                     : arguments.contains("--flash") && !arguments.contains("--glow") ? .off : .running)
+        if arguments.contains("--flash") { glow.celebrate() }
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         glow.phase(argument(after: "--phase").flatMap(Double.init) ?? 1)
     }
@@ -2809,6 +3060,83 @@ for (flag, on) in [("--login-item-on", true), ("--login-item-off", false)] where
     }
 }
 
+/// Checks the glow decision, the "needs you" freshness rule, the quiet rule and
+/// the agent-file check. Exits 1 if any fails.
+func runSelfTest() {
+    var failed = 0
+    func check(_ name: String, _ ok: Bool) {
+        print(ok ? "pass" : "FAIL", name)
+        if !ok { failed += 1 }
+    }
+    func decide(pinned: Bool = true, running: Int = 0, was: Int = 0, needsYou: Bool = false,
+                previewing: GlowPreview? = nil, needsYouOn: Bool = true, flashOn: Bool = true) -> (GlowMode, Bool) {
+        let d = glowDecision(pinned: pinned, running: running, wasRunning: was, needsYou: needsYou,
+                             previewing: previewing, needsYouOn: needsYouOn, flashOn: flashOn)
+        return (d.mode, d.flash)
+    }
+    check("last session stops: flash, then nothing", decide(running: 0, was: 2) == (.off, true))
+    check("nothing was running: no flash", decide(running: 0, was: 0) == (.off, false))
+    check("one of two stops: no flash, still running", decide(running: 1, was: 2) == (.running, false))
+    check("window hidden: no flash, off", decide(pinned: false, running: 0, was: 2) == (.off, false))
+    check("flash turned off", decide(running: 0, was: 1, flashOn: false) == (.off, false))
+    check("needs you beats running", decide(running: 1, was: 1, needsYou: true) == (.needsYou, false))
+    check("stops and needs you: flash over amber", decide(running: 0, was: 1, needsYou: true) == (.needsYou, true))
+    check("amber turned off: running shows", decide(running: 1, needsYou: true, needsYouOn: false) == (.running, false))
+    check("previewing running beats amber", decide(needsYou: true, previewing: .running) == (.running, false))
+    check("previewing amber with nothing going on", decide(previewing: .needsYou) == (.needsYou, false))
+
+    let now = Date()
+    let model = SessionModel()
+    model.now = now
+    let recent = Row(id: "a", group: .yourTurn, title: "recent", context: "", since: now.addingTimeInterval(-600))
+    let old = Row(id: "b", group: .yourTurn, title: "old", context: "", since: now.addingTimeInterval(-7200))
+    let board = Board(rows: [recent, old], now: now)
+    check("waiting 10 min is fresh, 2 h is not", model.freshNeedsYou(board).map(\.id) == ["a"])
+    model.markOpened(recent)
+    check("opened from here: no longer fresh", model.freshNeedsYou(board).isEmpty)
+    let askedAgain = Row(id: "a", group: .yourTurn, title: "recent", context: "", since: now.addingTimeInterval(60))
+    model.now = now.addingTimeInterval(120)
+    check("asks again after being opened: fresh again",
+          model.freshNeedsYou(Board(rows: [askedAgain], now: model.now)).map(\.id) == ["a"])
+
+    let running = Row(id: "r", group: .running, title: "r", context: "", since: now.addingTimeInterval(-3600),
+                      lastOutput: now.addingTimeInterval(-660))
+    check("11 min without output is quiet", (running.quiet(now: now) ?? 0) >= 600)
+    check("5 min without output is not", Row(id: "r", group: .running, title: "r", context: "", since: now,
+                                             lastOutput: now.addingTimeInterval(-300)).quiet(now: now) == nil)
+    check("not running: never quiet", Row(id: "w", group: .yourTurn, title: "w", context: "", since: now,
+                                          lastOutput: now.addingTimeInterval(-3600)).quiet(now: now) == nil)
+
+    // A session whose main transcript is quiet while an agent writes.
+    let dir = NSTemporaryDirectory() + "limbo-selftest-\(getpid())"
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: dir + "/s/subagents", withIntermediateDirectories: true)
+    defer { try? fm.removeItem(atPath: dir) }
+    let transcript = dir + "/s.jsonl", agent = dir + "/s/subagents/agent-1.jsonl"
+    fm.createFile(atPath: transcript, contents: Data("{}\n".utf8))
+    fm.createFile(atPath: agent, contents: Data("{}\n".utf8))
+    try? fm.setAttributes([.modificationDate: now.addingTimeInterval(-1200)], ofItemAtPath: transcript)
+    try? fm.setAttributes([.modificationDate: now.addingTimeInterval(-900)], ofItemAtPath: agent)
+    let first = latestWrite(transcript: transcript)?.timeIntervalSince(now) ?? 0
+    check("newest write counts the agent's file", abs(first + 900) < 2)
+    let queue = DispatchQueue(label: "selftest")
+    let seen = DispatchSemaphore(value: 0)
+    var reports: [Activity] = []
+    let watcher = ActivityWatcher(key: "k", path: transcript, queue: queue, sideCheckEvery: 1) { activity in
+        reports.append(activity)
+        if reports.count == 2 { seen.signal() }
+    }
+    queue.sync {}
+    try? fm.setAttributes([.modificationDate: now], ofItemAtPath: agent)   // the agent writes; the transcript doesn't
+    let updated = seen.wait(timeout: .now() + 4) == .success
+    queue.sync { watcher.cancel() }
+    check("agent writing alone is picked up by the watcher",
+          updated && abs((reports.last?.lastOutput?.timeIntervalSince(now)) ?? 99) < 2)
+
+    print(failed == 0 ? "all passed" : "\(failed) failed")
+    exit(failed == 0 ? 0 : 1)
+}
+
 /// Runs Random in an offscreen window: prints the effect showing each second,
 /// then the CPU the process used meanwhile. Checks the 5-second shuffle.
 func runGlowCycle(seconds: Int) {
@@ -2837,6 +3165,9 @@ func runGlowCycle(seconds: Int) {
     exit(0)
 }
 
+if arguments.contains("--self-test") {
+    runSelfTest()
+}
 if let seconds = argument(after: "--glow-cycle").flatMap(Int.init) {
     runGlowCycle(seconds: seconds)
 }
