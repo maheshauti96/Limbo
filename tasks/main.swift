@@ -1819,12 +1819,12 @@ let glowStops: [(Double, Double)] = [
     (0.60, 0), (0.71, 0.85), (0.75, 1), (0.79, 0.85), (0.90, 0), (1, 0),
 ]
 
-/// While any session runs: a dim green outline around the whole window, two
+/// While any session runs: a dim red outline around the whole window, two
 /// bright 3 pt lights circling it every 2.4 s and a softer 8 pt glow behind
 /// them. All of it disappears the moment no session runs. Conic gradients
 /// masked to rings with the window's continuous corners, rotated by Core
 /// Animation at a capped frame rate, so the app does no work per frame. With
-/// Reduce Motion on it is a still green outline.
+/// Reduce Motion on it is a still red outline.
 final class GlowBorderView: NSView {
     private let base = CALayer()
     private let haloContainer = CALayer()
@@ -1894,7 +1894,7 @@ final class GlowBorderView: NSView {
     private func applyColors() {
         let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let green = NSColor.systemGreen
+            let green = NSColor.systemRed   // the border colour
             base.borderColor = green.withAlphaComponent(still ? 0.8 : 0.45).cgColor
             comet.colors = glowStops.map { green.withAlphaComponent($0.1).cgColor }
             comet.locations = glowStops.map { NSNumber(value: $0.0) }
@@ -2285,13 +2285,13 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
             .overlay(
                 ZStack {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.green.opacity(0.45), lineWidth: 1.5)
+                        .strokeBorder(Color.red.opacity(0.45), lineWidth: 1.5)
                     RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
-                        AngularGradient(stops: glowStops.map { .init(color: Color.green.opacity($0.1 * 0.35), location: $0.0) },
+                        AngularGradient(stops: glowStops.map { .init(color: Color.red.opacity($0.1 * 0.35), location: $0.0) },
                                         center: .center, angle: .degrees(-60)),
                         lineWidth: 8)
                     RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
-                        AngularGradient(stops: glowStops.map { .init(color: Color.green.opacity($0.1), location: $0.0) },
+                        AngularGradient(stops: glowStops.map { .init(color: Color.red.opacity($0.1), location: $0.0) },
                                         center: .center, angle: .degrees(-60)),
                         lineWidth: 3)
                 }
