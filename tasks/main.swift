@@ -1396,7 +1396,7 @@ struct SessionRow: View {
                     .fill(Color.primary.opacity(hovering && canOpen ? 0.07 : 0)))
         }
         .buttonStyle(.plain)
-        .background { if canOpen { PointingHandArea() } }
+        .pointerStyle(canOpen ? .link : nil)
         .onHover { hovering = $0 }
         .opacity(dimmed ? 0.72 : 1)
         .help(tooltip)
@@ -1470,7 +1470,7 @@ struct DisclosureTitle: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background { PointingHandArea() }
+        .pointerStyle(.link)
         .accessibilityLabel("\(title), \(count)")
         .accessibilityValue(expanded ? "expanded" : "collapsed")
         .accessibilityAddTraits(.isHeader)
@@ -1498,7 +1498,7 @@ struct OlderToggle: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background { PointingHandArea() }
+        .pointerStyle(.link)
     }
 }
 
@@ -1778,7 +1778,7 @@ struct CompactRow: View {
                     .fill(Color.primary.opacity(hovering && row.link != nil ? 0.08 : 0)))
         }
         .buttonStyle(.plain)
-        .background { if row.link != nil { PointingHandArea() } }
+        .pointerStyle(row.link != nil ? .link : nil)
         .onHover { hovering = $0 }
         .help([row.title, row.ask ?? row.detail,
                quiet.map { quietPhrase($0) + ": it may be stuck, or in one long command" }]
@@ -2642,9 +2642,11 @@ func resizedFrame(_ start: NSRect, edges: ResizeEdges, delta: NSPoint, minSize: 
 }
 
 /// Resizing for the borderless keep-on-top window: a thin band inside each
-/// edge takes the drag and shows the resize cursor; anywhere else clicks fall
-/// through to the rows. It tracks the mouse itself, because the window never
-/// becomes key, so the usual cursor handling does not reach it.
+/// edge takes the drag; anywhere else clicks fall through to the rows. It
+/// asks for the resize cursor, but macOS shows cursor changes only from the
+/// frontmost app, and this window never makes Limbo Tasks frontmost (so it
+/// never takes focus from a game or video): the cursor appears only when the
+/// app happens to be frontmost, for example right after using its panel.
 final class ResizeEdgesView: NSView {
     var minSize = FloatingLayout.minSize
     var onResize: (NSRect, ResizeEdges) -> Void = { _, _ in }
@@ -2712,38 +2714,6 @@ final class ResizeEdgesView: NSView {
         drag = nil
         onResizeEnd()
     }
-}
-
-/// The pointing hand over a row that opens a session. It tracks the mouse
-/// itself, so it also works in the keep-on-top window, which never becomes
-/// key; clicks pass through to the row.
-final class PointingHandView: NSView {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways,
-                                                              .inVisibleRect], owner: self))
-    }
-
-    override func mouseEntered(with event: NSEvent) { point(event) }
-    override func mouseMoved(with event: NSEvent) { point(event) }
-    override func mouseExited(with event: NSEvent) { NSCursor.arrow.set() }
-
-    private func point(_ event: NSEvent) {
-        // The keep-on-top window's resize band keeps its resize cursor.
-        if window is KeepOnTopPanel, let content = window?.contentView,
-           !ResizeEdges(at: content.convert(event.locationInWindow, from: nil), in: content.bounds.size).isEmpty {
-            return
-        }
-        if NSCursor.current != NSCursor.pointingHand { NSCursor.pointingHand.set() }
-    }
-}
-
-struct PointingHandArea: NSViewRepresentable {
-    func makeNSView(context: Context) -> PointingHandView { PointingHandView() }
-    func updateNSView(_ nsView: PointingHandView, context: Context) {}
 }
 
 /// A borderless panel that never takes keyboard focus from a game or video.
