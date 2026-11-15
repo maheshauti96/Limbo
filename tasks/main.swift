@@ -1811,6 +1811,94 @@ struct FloatingView: View {
     }
 }
 
+/// The comet's colours around the edge (0...1 around the circle): one bright
+/// arc fading out on both sides, so it reads the same in either direction.
+let glowStops: [(Double, Double)] = [(0, 0), (0.30, 0), (0.46, 0.85), (0.50, 1), (0.54, 0.85), (0.70, 0), (1, 0)]
+
+/// A light that travels around the window's edge while any session runs, and
+/// is gone the moment none does. A conic gradient, masked to a 2 pt ring with
+/// the same continuous corners as the window, rotated by Core Animation at a
+/// capped frame rate, so the app does no work per frame. With Reduce Motion
+/// on it is a still green edge.
+final class GlowBorderView: NSView {
+    private let container = CALayer()
+    private let gradient = CAGradientLayer()
+    private let ring = CALayer()
+    private var running = false
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(container)
+        container.addSublayer(gradient)
+        container.mask = ring
+        ring.borderColor = NSColor.black.cgColor
+        ring.borderWidth = 2
+        ring.cornerRadius = 12
+        ring.cornerCurve = .continuous
+        gradient.type = .conic
+        gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
+        gradient.endPoint = CGPoint(x: 0.5, y: 0)
+        container.isHidden = true
+        applyColors()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    // Clicks go through to the rows underneath.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        container.frame = bounds
+        ring.frame = bounds
+        let side = hypot(bounds.width, bounds.height)    // covers the corners while turning
+        gradient.bounds = CGRect(x: 0, y: 0, width: side, height: side)
+        gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        CATransaction.commit()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    private func applyColors() {
+        let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let green = NSColor.systemGreen
+            if still {
+                gradient.colors = [green.withAlphaComponent(0.7).cgColor, green.withAlphaComponent(0.7).cgColor]
+                gradient.locations = [0, 1]
+            } else {
+                gradient.colors = glowStops.map { green.withAlphaComponent($0.1).cgColor }
+                gradient.locations = glowStops.map { NSNumber(value: $0.0) }
+            }
+        }
+    }
+
+    func setRunning(_ isRunning: Bool) {
+        guard isRunning != running || (isRunning && gradient.animation(forKey: "travel") == nil) else { return }
+        running = isRunning
+        applyColors()
+        container.isHidden = !isRunning
+        guard isRunning, window != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            gradient.removeAllAnimations()
+            return
+        }
+        let travel = CABasicAnimation(keyPath: "transform.rotation.z")
+        travel.fromValue = 0
+        travel.toValue = -2 * Double.pi
+        travel.duration = 3
+        travel.repeatCount = .infinity
+        travel.isRemovedOnCompletion = false
+        travel.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 24)
+        gradient.add(travel, forKey: "travel")
+    }
+}
+
 /// Takes the first click, so a row opens without first focusing the window.
 final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -1829,6 +1917,7 @@ final class FloatingController {
     private let model: SessionModel
     private var panel: KeepOnTopPanel?
     private var host: FirstClickHostingView<FloatingView>?
+    private let glow = GlowBorderView(frame: .zero)
     private var clock: Timer?
     private static let shownKey = "keepOnTop"
     private static let frameName = "LimboTasksKeepOnTop"
@@ -1855,9 +1944,17 @@ final class FloatingController {
         clock = timer
         fitToContent()
         panel.orderFrontRegardless()
+        updateGlow()
+    }
+
+    /// The border light runs while any session runs.
+    private func updateGlow() {
+        let running = !Board(rows: model.rows, now: model.now).running.isEmpty
+        glow.setRunning(model.pinned && running)
     }
 
     func hide() {
+        glow.setRunning(false)
         panel?.orderOut(nil)
         model.pinned = false
         UserDefaults.standard.set(false, forKey: Self.shownKey)
@@ -1870,6 +1967,7 @@ final class FloatingController {
         guard model.pinned else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, let panel = self.panel, let host = self.host else { return }
+            self.updateGlow()
             let size = host.fittingSize
             var frame = panel.frame
             guard frame.size != size else { return }
@@ -1893,7 +1991,14 @@ final class FloatingController {
         let size = host.fittingSize
         let panel = KeepOnTopPanel(contentRect: NSRect(origin: .zero, size: size),
                                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
-        panel.contentView = host
+        let content = NSView(frame: NSRect(origin: .zero, size: size))
+        host.frame = content.bounds
+        host.autoresizingMask = [.width, .height]
+        glow.frame = content.bounds
+        glow.autoresizingMask = [.width, .height]
+        content.addSubview(host)
+        content.addSubview(glow)                    // above the rows, ignores clicks
+        panel.contentView = content
         panel.isFloatingPanel = true
         panel.level = .statusBar                      // above full-screen windows
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -2147,6 +2252,12 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     let host: NSView = arguments.contains("--floating")
         ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {})
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
+                    AngularGradient(stops: glowStops.map { .init(color: Color.green.opacity($0.1), location: $0.0) },
+                                    center: .center, angle: .degrees(-60)),
+                    lineWidth: 2)
+                .opacity(Board(rows: model.rows, now: Date()).running.isEmpty ? 0 : 1))
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
             .background(Color(nsColor: .windowBackgroundColor)))
