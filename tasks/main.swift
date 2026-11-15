@@ -1829,7 +1829,7 @@ struct FloatingView: View {
     @AppStorage(GlowSignal.doneFlashKey) private var doneFlash = true
     static let maxRows = 8
     /// Finished sessions stay listed, with a green check, for this long.
-    static let doneShownFor: TimeInterval = 30 * 60
+    static let doneShownFor: TimeInterval = 2 * 3600
 
     private var window: WaitingWindow { WaitingWindow(rawValue: waitingHours) ?? .day }
 
