@@ -1415,8 +1415,8 @@ struct CompactRow: View {
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
-                    if row.group == .yourTurn, let ask = row.ask {
-                        Text(ask).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                    if let line = row.group == .yourTurn ? row.ask : (row.group == .review ? row.detail : nil) {
+                        Text(line).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
                     }
                 }
             }
@@ -1429,7 +1429,7 @@ struct CompactRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help([row.title, row.ask].compactMap { $0 }.joined(separator: "\n\n"))
+        .help([row.title, row.ask ?? row.detail].compactMap { $0 }.joined(separator: "\n\n"))
     }
 }
 
@@ -1477,12 +1477,13 @@ struct FloatingView: View {
         let limit = window.hours * 3600
         let allWaiting = board.yourTurn + board.older
         let waiting = allWaiting.filter { model.now.timeIntervalSince($0.since) <= limit }
-        let hidden = allWaiting.count - waiting.count
+        let review = board.review.filter { model.now.timeIntervalSince($0.since) <= limit }
+        let hidden = allWaiting.count - waiting.count + board.review.count - review.count
         let recentlyDone = board.done.filter { model.now.timeIntervalSince($0.since) <= Self.doneShownFor }
-        let rows = board.running + waiting + board.justFinished + recentlyDone
+        let rows = board.running + waiting + review + board.justFinished + recentlyDone
         let shown = Array(rows.prefix(Self.maxRows))
         VStack(alignment: .leading, spacing: 0) {
-            header(running: board.running.count, waiting: waiting.count)
+            header(running: board.running.count, waiting: waiting.count, review: review.count)
             if rows.isEmpty {
                 Text(hidden > 0 ? "Nothing running or waiting in the \(window.menuTitle.lowercased())"
                                 : "Nothing running and nothing needs you")
@@ -1518,17 +1519,18 @@ struct FloatingView: View {
         return parts.joined(separator: " · ")
     }
 
-    private func header(running: Int, waiting: Int) -> some View {
+    private func header(running: Int, waiting: Int, review: Int) -> some View {
         HStack(spacing: 6) {
             Image(nsImage: claudeMark)
                 .renderingMode(.template)
                 .resizable()
                 .frame(width: 15, height: 15)
                 .foregroundStyle(.secondary)
-            Text(summary(running: running, waiting: waiting))
+            Text(summary(running: running, waiting: waiting, review: review, compact: true))
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .help(summary(running: running, waiting: waiting, review: review))
             Spacer(minLength: 4)
             Menu {
                 Picker("Show sessions waiting for you from", selection: $waitingHours) {
@@ -1569,10 +1571,12 @@ struct FloatingView: View {
         .gesture(WindowDragGesture())   // drag the window by its header
     }
 
-    private func summary(running: Int, waiting: Int) -> String {
+    /// Compact: the review count only when nothing else is there, so the header fits.
+    private func summary(running: Int, waiting: Int, review: Int, compact: Bool = false) -> String {
         var parts: [String] = []
         if running > 0 { parts.append("\(running) running") }
         if waiting > 0 { parts.append(waiting == 1 ? "1 needs you" : "\(waiting) need you") }
+        if review > 0 && (!compact || parts.isEmpty) { parts.append("\(review) to review") }
         return parts.isEmpty ? "All caught up" : parts.joined(separator: " · ")
     }
 }
