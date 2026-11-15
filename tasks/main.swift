@@ -132,6 +132,7 @@ struct LiveRecord: Equatable {
     let statusSince: Date
     let hostId: String?         // desktop session id; nil for sessions started in a terminal
     let cwd: String
+    let cliSessionId: String?   // names the transcript file
     var isBusy: Bool { status == "busy" || status == "shell" }
     var isWaiting: Bool { status == "waiting" }
 }
@@ -320,9 +321,168 @@ func readLiveRecords(exited: Set<String>) -> (records: [Int32: LiveRecord], pres
             waitingFor: plainLine(o["waitingFor"] as? String, max: 300, sentence: true),
             started: Date(timeIntervalSince1970: startedMs / 1000),
             statusSince: Date(timeIntervalSince1970: statusMs / 1000),
-            hostId: host, cwd: cwd)
+            hostId: host, cwd: cwd,
+            cliSessionId: (o["sessionId"] as? String).flatMap { id in
+                id.allSatisfy { isASCIIAlnum($0) || $0 == "-" } && !id.isEmpty && id.count <= 64 ? id : nil
+            })
     }
     return (records, present)
+}
+
+// MARK: - Live activity
+
+/// ~/.claude/projects/<cwd with every non-alphanumeric character as "-">/<id>.jsonl
+func transcriptPath(cwd: String, cliSessionId: String) -> String {
+    let encoded = String(cwd.map { isASCIIAlnum($0) ? $0 : "-" })
+    return Paths.home.appendingPathComponent(".claude/projects/\(encoded)/\(cliSessionId).jsonl").path
+}
+
+/// A short phrase for a tool call, like the Claude app's status line.
+func describeTool(_ name: String, _ input: [String: Any]) -> String? {
+    func file(_ key: String) -> String {
+        ((input[key] as? String).map { ($0 as NSString).lastPathComponent }) ?? "a file"
+    }
+    func text(_ key: String, _ max: Int) -> String? { plainLine(input[key] as? String, max: max) }
+    switch name {
+    case "mcp__ccd_turn__update_plan", "mcp__ccd_turn__wrap_up", "TodoWrite", "ToolSearch":
+        return nil                                    // bookkeeping; look further back
+    case "Bash": return text("description", 120) ?? text("command", 60).map { "Running \($0)" }
+    case "Read": return "Reading \(file("file_path"))"
+    case "Edit", "MultiEdit", "NotebookEdit": return "Editing \(file("file_path"))"
+    case "Write": return "Writing \(file("file_path"))"
+    case "Grep": return text("pattern", 40).map { "Searching for “\($0)”" } ?? "Searching"
+    case "Glob": return text("pattern", 40).map { "Finding \($0)" } ?? "Finding files"
+    case "WebFetch": return (input["url"] as? String).flatMap { URL(string: $0)?.host }.map { "Reading \($0)" } ?? "Reading a web page"
+    case "WebSearch": return text("query", 60).map { "Searching the web for “\($0)”" } ?? "Searching the web"
+    case "Agent", "Task": return text("description", 120) ?? "Running an agent"
+    case "Workflow": return "Running a workflow"
+    case "AskUserQuestion": return "Waiting for your answer"
+    case "ExitPlanMode": return "Waiting for you to approve the plan"
+    default:
+        if let described = text("description", 120) ?? text("action_summary", 120) { return described }
+        if let host = (input["url"] as? String).flatMap({ URL(string: $0)?.host }) { return "Opening \(host)" }
+        guard name.hasPrefix("mcp__") else { return "Using \(name)" }
+        // mcp__<server>__<tool> -> "Chrome: navigate"
+        let parts = name.dropFirst(5).components(separatedBy: "__")
+        let server = parts.first ?? ""
+        let tool = (parts.count > 1 ? parts.last! : server).replacingOccurrences(of: "_", with: " ")
+        let lower = server.lowercased()
+        let label: String
+        if lower.contains("chrome") { label = "Chrome" }
+        else if lower.contains("browser") { label = "Browser" }
+        else if server.count >= 32, server.contains("-") { label = "Connector" }     // an opaque connector id
+        else { label = server.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ") }
+        return "\(label): \(tool)"
+    }
+}
+
+/// What a running session is doing, read from the last 256 KB of its transcript.
+func transcriptActivity(path: String) -> String? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+    guard let size = try? handle.seekToEnd() else { return nil }
+    let window: UInt64 = 256 * 1024
+    let start = size > window ? size - window : 0
+    try? handle.seek(toOffset: start)
+    guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
+    var lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
+    if start > 0, !lines.isEmpty { lines.removeFirst() }    // a partial line
+    var parses = 0
+    for raw in lines.reversed() {
+        guard parses < 20 else { break }
+        // Only conversation lines; tool names also appear inside other line types.
+        guard raw.starts(with: Array(#"{"parentUuid""#.utf8)) || raw.starts(with: Array(#"{"type":"system""#.utf8))
+        else { continue }
+        parses += 1
+        guard let o = (try? JSONSerialization.jsonObject(with: Data(raw))) as? [String: Any] else { continue }
+        if (o["isSidechain"] as? Bool) == true { continue }
+        switch o["type"] as? String {
+        case "system":
+            if (o["subtype"] as? String) == "stop_hook_summary" { return "Background work still running" }
+        case "user":
+            if (o["isMeta"] as? Bool) == true { continue }
+            return "Thinking"
+        case "assistant":
+            let content = (o["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+            for block in content.reversed() {
+                switch block["type"] as? String {
+                case "tool_use":
+                    if let name = block["name"] as? String,
+                       let phrase = describeTool(name, block["input"] as? [String: Any] ?? [:]) { return phrase }
+                case "text": return "Writing a reply"
+                case "thinking": return "Thinking"
+                default: break
+                }
+            }
+        default: continue
+        }
+    }
+    return nil
+}
+
+/// Re-reads a running session's transcript tail when the file changes, at most
+/// once a second, on the engine queue.
+final class ActivityWatcher {
+    let key: String
+    private let path: String
+    private let queue: DispatchQueue
+    private let onChange: (String?) -> Void
+    private var source: DispatchSourceFileSystemObject?
+    private var pending = false
+    private var cancelled = false
+
+    init(key: String, path: String, queue: DispatchQueue, onChange: @escaping (String?) -> Void) {
+        self.key = key
+        self.path = path
+        self.queue = queue
+        self.onChange = onChange
+        attach()
+        onChange(transcriptActivity(path: path))
+    }
+
+    private func attach() {
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else {
+            // Not written yet: look again shortly.
+            queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, !self.cancelled, self.source == nil else { return }
+                self.attach()
+                if self.source != nil { self.onChange(transcriptActivity(path: self.path)) }
+            }
+            return
+        }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: queue)
+        src.setEventHandler { [weak self, weak src] in
+            guard let self, let src else { return }
+            if !src.data.intersection([.delete, .rename]).isEmpty {
+                src.cancel()
+                self.source = nil
+                self.attach()
+                return
+            }
+            self.scheduleRead()
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        source = src
+    }
+
+    private func scheduleRead() {
+        guard !pending else { return }
+        pending = true
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, !self.cancelled else { return }
+            self.pending = false
+            self.onChange(transcriptActivity(path: self.path))
+        }
+    }
+
+    func cancel() {
+        cancelled = true
+        source?.cancel()
+        source = nil
+    }
 }
 
 // MARK: - Rows
@@ -342,6 +502,7 @@ struct Row: Identifiable, Equatable {
     let since: Date             // turn end, or when it started running
     var link: String? = nil     // desktop session id, when it can be opened
     var terminal = false
+    var activity: String? = nil // what a running session is doing now
 }
 
 func rowsInOrder(_ rows: [Row]) -> [Row] {
@@ -367,7 +528,8 @@ let dataWindow: TimeInterval = 8 * 86400
 ///  These follow the Claude app's own sidebar rules (blocked/need_input = needs
 ///  input; failed or an error in the last 7 days = failed).
 ///  7. terminal session (no desktop id), idle          -> Terminal
-func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date) -> [Row] {
+func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
+              activities: [Int32: String] = [:]) -> [Row] {
     var bySession: [String: DeskRecord] = [:]
     for d in desk {
         // The same session can sit under several account folders; keep the newest copy.
@@ -392,7 +554,7 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date) -> [Row]
         let link = isSessionId(d.sessionId) ? d.sessionId : nil
         if let l, l.isBusy {
             rows.append(Row(id: d.sessionId, group: .running, title: d.title, context: context,
-                            since: l.statusSince, link: link))
+                            since: l.statusSince, link: link, activity: activities[l.pid]))
             continue
         }
         if let l, l.isWaiting {
@@ -447,14 +609,16 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date) -> [Row]
         let group: Group = l.isBusy ? .running : (l.isWaiting ? .yourTurn : .done)
         rows.append(Row(id: host, group: group, title: l.name,
                         ask: l.isWaiting ? (l.waitingFor ?? "Waiting for your input") : nil,
-                        context: folderLabel(l.cwd), since: l.statusSince, link: host))
+                        context: folderLabel(l.cwd), since: l.statusSince, link: host,
+                        activity: l.isBusy ? activities[l.pid] : nil))
     }
     // Sessions started in a terminal: no summary, so idle ones never count as your turn.
     for l in terminalLive {
         let group: Group = l.isBusy ? .running : (l.isWaiting ? .yourTurn : .terminal)
         rows.append(Row(id: "pid:\(l.pid)", group: group, title: l.name,
                         ask: l.isWaiting ? (l.waitingFor ?? "Waiting for your input") : nil,
-                        context: folderLabel(l.cwd), since: l.statusSince, terminal: true))
+                        context: folderLabel(l.cwd), since: l.statusSince, terminal: true,
+                        activity: l.isBusy ? activities[l.pid] : nil))
     }
     return rowsInOrder(rows)
 }
@@ -515,6 +679,10 @@ final class SessionEngine {
     private var exitSources: [Int32: DispatchSourceProcess] = [:]
     private var lastRows: [Row]?
     private var statsSignal: DispatchSourceSignal?
+    /// Transcripts are read only while a panel that shows the live activity is open.
+    private var activityWanted = false
+    private var activityWatchers: [Int32: ActivityWatcher] = [:]
+    private var activities: [Int32: String] = [:]
     private var eventBatches = 0
     private var fileParses = 0
 
@@ -540,7 +708,16 @@ final class SessionEngine {
         let engine = SessionEngine()
         return engine.queue.sync {
             engine.scanAll()
-            return classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date())
+            // One-off checks also read the live activity of running sessions.
+            var activities: [Int32: String] = [:]
+            for (pid, record) in engine.live where record.isBusy {
+                if let id = record.cliSessionId,
+                   let text = transcriptActivity(path: transcriptPath(cwd: record.cwd, cliSessionId: id)) {
+                    activities[pid] = text
+                }
+            }
+            return classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
+                            activities: activities)
         }
     }
 
@@ -564,6 +741,36 @@ final class SessionEngine {
             }
             source.resume()
             exitSources[pid] = source
+        }
+        syncActivityWatchers()
+    }
+
+    /// Called on the main queue when a panel that shows live activity opens or closes.
+    func setActivityWanted(_ wanted: Bool) {
+        queue.async {
+            guard self.activityWanted != wanted else { return }
+            self.activityWanted = wanted
+            self.syncActivityWatchers()
+            self.publishIfChanged()
+        }
+    }
+
+    private func syncActivityWatchers() {
+        let busy = activityWanted ? live.filter { $0.value.isBusy && $0.value.cliSessionId != nil } : [:]
+        for (pid, watcher) in activityWatchers where busy[pid]?.key != watcher.key {
+            watcher.cancel()
+            activityWatchers[pid] = nil
+            activities[pid] = nil
+        }
+        for (pid, record) in busy where activityWatchers[pid] == nil {
+            guard let id = record.cliSessionId else { continue }
+            let path = transcriptPath(cwd: record.cwd, cliSessionId: id)
+            activityWatchers[pid] = ActivityWatcher(key: record.key, path: path, queue: queue) { [weak self] text in
+                guard let self, self.activityWatchers[pid] != nil || self.activities[pid] == nil else { return }
+                guard self.activities[pid] != text else { return }
+                self.activities[pid] = text
+                self.publishIfChanged()
+            }
         }
     }
 
@@ -630,7 +837,7 @@ final class SessionEngine {
     }
 
     private func publishIfChanged() {
-        let rows = classify(desk: desk.values.compactMap(\.record), live: live, now: Date())
+        let rows = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities)
         guard rows != lastRows else { return }
         lastRows = rows
         DispatchQueue.main.async { [weak self] in self?.onRows?(rows) }
@@ -696,7 +903,15 @@ final class SessionModel: ObservableObject {
     /// Drives the "3 min ago" labels. Ticks only while a panel is showing.
     @Published var now = Date()
     /// True while the keep-on-top window is showing.
-    @Published var pinned = false
+    @Published var pinned = false {
+        didSet { if pinned != oldValue { onVisibilityChange?() } }
+    }
+    /// True while the menu bar panel is open.
+    var panelOpen = false {
+        didSet { if panelOpen != oldValue { onVisibilityChange?() } }
+    }
+    /// Live activity is read only while one of the two is showing.
+    var onVisibilityChange: (() -> Void)?
 }
 
 // MARK: - Start at login
@@ -861,6 +1076,14 @@ func elapsed(since d: Date, now: Date) -> String? {
     return days == 1 ? "1 day" : "\(days) days"
 }
 
+/// "45s", "2m 3s", "1h 5m", as the Claude app shows a running turn.
+func stopwatch(since d: Date, now: Date) -> String {
+    let s = max(0, Int(now.timeIntervalSince(d)))
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return "\(s / 60)m \(s % 60)s" }
+    return "\(s / 3600)h \((s % 3600) / 60)m"
+}
+
 func ago(_ d: Date, _ now: Date) -> String {
     elapsed(since: d, now: now).map { "\($0) ago" } ?? "just now"
 }
@@ -993,7 +1216,8 @@ struct SessionRow: View {
         switch row.group {
         case .yourTurn: return row.ask
         case .review, .done: return row.detail
-        case .running, .justFinished, .terminal: return nil
+        case .running: return row.activity
+        case .justFinished, .terminal: return nil
         }
     }
 
@@ -1369,6 +1593,7 @@ final class PanelController: NSObject, NSPopoverDelegate {
     }
 
     func popoverWillShow(_ notification: Notification) {
+        model.panelOpen = true
         model.now = Date()
         clock?.invalidate()
         let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.model.now = Date() }
@@ -1378,6 +1603,7 @@ final class PanelController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        model.panelOpen = false
         clock?.invalidate()
         clock = nil
         // One popover is kept and reused: building a new one per open leaked
@@ -1411,11 +1637,21 @@ struct CompactRow: View {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.tail)
                         Spacer(minLength: 4)
-                        Text(elapsed(since: row.since, now: now) ?? "now")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundStyle(.tertiary)
+                        if row.group == .running {
+                            // Seconds tick only for running rows, only while this window shows.
+                            TimelineView(.periodic(from: .now, by: 1)) { context in
+                                Text(stopwatch(since: row.since, now: context.date))
+                                    .font(.system(size: 10).monospacedDigit())
+                                    .foregroundStyle(.tertiary)
+                            }
+                        } else {
+                            Text(elapsed(since: row.since, now: now) ?? "now")
+                                .font(.system(size: 10).monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
                     }
-                    if let line = row.group == .yourTurn ? row.ask : (row.group == .review ? row.detail : nil) {
+                    if let line = row.group == .yourTurn ? row.ask
+                        : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil)) {
                         Text(line).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
                     }
                 }
@@ -1515,7 +1751,7 @@ struct FloatingView: View {
     private func footer(more: Int, hidden: Int) -> String {
         var parts: [String] = []
         if more > 0 { parts.append("\(more) more in the menu bar panel") }
-        if hidden > 0 { parts.append("\(hidden) waiting longer than \(window.short)") }
+        if hidden > 0 { parts.append("\(hidden) more need you, from over \(window.short) ago") }
         return parts.joined(separator: " · ")
     }
 
@@ -1722,6 +1958,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signalSource.resume()
         snapshotSignal = signalSource
         floating = FloatingController(model: model)
+        model.onVisibilityChange = { [weak self] in
+            guard let self else { return }
+            self.engine.setActivityWanted(self.model.panelOpen || self.model.pinned)
+        }
         panel = PanelController(model: model, pin: { [weak self] in self?.floating.toggle() }) { [weak self] in
             self?.engine.refresh()
         }
@@ -1969,7 +2209,8 @@ func runDump() {
     ]
     for (name, rows) in groups {
         for r in rows {
-            print("\(name)\t\(String(format: "%.1f", now.timeIntervalSince(r.since) / 3600))h\t\(r.title)")
+            print("\(name)\t\(String(format: "%.1f", now.timeIntervalSince(r.since) / 3600))h\t\(r.title)"
+                  + (r.activity.map { "\t[\($0)]" } ?? ""))
         }
     }
     print("counts: " + groups.map { "\($0.0)=\($0.1.count)" }.joined(separator: " "))
