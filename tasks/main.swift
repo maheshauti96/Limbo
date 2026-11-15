@@ -2016,6 +2016,13 @@ final class RunningGlowView: NSView {
         updateShuffle()
     }
 
+    /// For diagnostics: what was picked, what shows, and whether it moves.
+    var state: [String: Any] {
+        ["chosen": chosen.rawValue, "showing": showing.rawValue, "color": tint.rawValue, "active": active,
+         "animating": effect.probe?.animationKeys()?.isEmpty == false, "still": still,
+         "width": Int(bounds.width), "height": Int(bounds.height)]
+    }
+
     /// Snapshots: stop the clock, then `phase(_:)` picks the moment drawn.
     func freeze() { clip.speed = 0; clip.timeOffset = 0 }
     func phase(_ seconds: CFTimeInterval) { clip.timeOffset = seconds }
@@ -2355,6 +2362,8 @@ final class FloatingController {
 
     func motionChanged() { glow.motionChanged() }
 
+    var glowState: [String: Any] { glow.state.merging(["previewing": previewing]) { a, _ in a } }
+
     func hide() {
         preview?.cancel()
         previewing = false
@@ -2550,6 +2559,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.cacheDisplay(in: button.bounds, to: rep)
         let url = Paths.home.appendingPathComponent("Library/Caches/\(LoginItem.label).menubar.png")
         try? rep.representation(using: .png, properties: [:])?.write(to: url)
+        // And the keep-on-top window's glow.
+        if let json = try? JSONSerialization.data(withJSONObject: floating.glowState, options: [.sortedKeys]) {
+            try? json.write(to: Paths.home.appendingPathComponent("Library/Caches/\(LoginItem.label).glow.json"))
+        }
     }
 
     @objc private func didWake() {
@@ -2796,6 +2809,37 @@ for (flag, on) in [("--login-item-on", true), ("--login-item-off", false)] where
     }
 }
 
+/// Runs Random in an offscreen window: prints the effect showing each second,
+/// then the CPU the process used meanwhile. Checks the 5-second shuffle.
+func runGlowCycle(seconds: Int) {
+    _ = NSApplication.shared
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 160), styleMask: [.borderless],
+                          backing: .buffered, defer: false)
+    let glow = RunningGlowView(frame: window.contentView?.bounds ?? .zero)
+    glow.forceMotion = true
+    window.contentView?.addSubview(glow)
+    glow.layoutSubtreeIfNeeded()
+    glow.configure(style: .random, color: .red)
+    glow.setActive(true)
+    func cpu() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+            + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6
+    }
+    let start = cpu()
+    for second in 0...seconds {
+        let state = glow.state
+        print(second, state["showing"] ?? "", "animating:", state["animating"] ?? "", "size:", state["width"] ?? "", state["height"] ?? "")
+        RunLoop.main.run(until: Date().addingTimeInterval(1))
+    }
+    print(String(format: "cpu %.3f s over %d s", cpu() - start, seconds))
+    exit(0)
+}
+
+if let seconds = argument(after: "--glow-cycle").flatMap(Int.init) {
+    runGlowCycle(seconds: seconds)
+}
 if let path = argument(after: "--snapshot") {
     writeSnapshot(to: path, dark: arguments.contains("--dark"), sample: arguments.contains("--sample"),
                   expand: arguments.contains("--expand"), limit: argument(after: "--rows").flatMap(Int.init))
