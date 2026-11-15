@@ -81,7 +81,7 @@ make uninstall-tasks   # remove the app and the login item
 make tasks             # build only -> bin/limbo-tasks
 ```
 
-**Menu bar:** a speech bubble with the number of sessions waiting for you (last 3 days) and a play symbol with the number running. A check mark when neither. One template image, so it follows light and dark menu bars.
+**Menu bar:** the Claude mark with the number of sessions running, then a speech bubble with the number waiting for you (last 3 days); a check mark when neither. While sessions run, the mark turns once every 3 s. It is taken at run time from the installed Claude app's own menu bar icon (nothing copied here) and rotated by Core Animation, so the app does no work per frame: measured 0.0% app CPU and +0.1 points of WindowServer CPU, against about 5% of a core for swapping pre-drawn frames 8 times a second. It stops while the screens sleep or are locked and stays still with Reduce Motion on. Everything else is one template image, so it follows light and dark menu bars.
 
 **Panel groups**, first rule that matches wins:
 
@@ -108,7 +108,8 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 limbo-tasks --dump                                  # group, age and title per row, plus counts
 limbo-tasks --snapshot out.png [--dark] [--sample] [--expand] [--rows N]
 limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
-kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json
+kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json,
+                                                    # plus a picture of the menu bar button -> ...limbo-tasks.menubar.png
 ```
 
 ## Signals

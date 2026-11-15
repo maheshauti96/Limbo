@@ -622,7 +622,7 @@ final class SessionEngine {
             "deskRecordsParsed": desk.values.filter { $0.record != nil }.count, "liveRecords": live.count,
             "eventBatches": eventBatches, "fileParses": fileParses,
             "footprintMB": (footprintMB().now * 10).rounded() / 10, "cpuSeconds": (cpu * 1000).rounded() / 1000,
-        ]
+        ].merging(spinStats.snapshot()) { a, _ in a }
         let url = Paths.home.appendingPathComponent("Library/Caches/\(LoginItem.label).stats.json")
         if let data = try? JSONSerialization.data(withJSONObject: stats, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: url, options: .atomic)
@@ -740,50 +740,112 @@ func isOnlyInstance() -> Bool {
 
 // MARK: - Menu bar item
 
+/// The Claude mark, taken at run time from the installed Claude app's own menu
+/// bar icon (nothing is copied into this repo); a plain asterisk symbol if the
+/// app is not installed.
+let claudeMark: NSImage = {
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.anthropic.claudefordesktop"),
+       let image = Bundle(url: url)?.image(forResource: "TrayIconTemplate") {
+        image.isTemplate = true
+        return image
+    }
+    let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .bold)
+    return NSImage(systemSymbolName: "asterisk", accessibilityDescription: nil)?.withSymbolConfiguration(config)
+        ?? NSImage(size: NSSize(width: 14, height: 14))
+}()
+
 /// One template image, so the system tints it for light and dark menu bars:
-/// a play symbol with the number of sessions running, then a speech bubble
-/// with the number waiting for you. A check mark when neither.
-func statusImage(needYou: Int, running: Int) -> NSImage {
+/// the Claude mark with the number of sessions running, then a speech bubble
+/// with the number waiting for you. A check mark when neither. With
+/// `drawMark: false` the mark's slot is left empty and returned, so the app can
+/// put a separately animated mark there.
+func statusImage(needYou: Int, running: Int, angle: CGFloat = 0,
+                 drawMark: Bool = true) -> (image: NSImage, markRect: NSRect?) {
     let font = NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .medium)
     let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
     let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
-    var parts: [(symbol: String, text: String?)] = []
-    if running > 0 { parts.append(("play.fill", "\(running)")) }
-    if needYou > 0 { parts.append(("bubble.left.fill", "\(needYou)")) }
-    if parts.isEmpty { parts.append(("checkmark.circle", nil)) }
-
-    let items: [(NSImage?, NSAttributedString?)] = parts.map { part in
-        (NSImage(systemSymbolName: part.symbol, accessibilityDescription: nil)?.withSymbolConfiguration(config),
-         part.text.map { NSAttributedString(string: $0, attributes: attrs) })
+    let markSize = NSSize(width: 18, height: 18)   // the icon has padding; the mark itself is ~13 pt
+    struct Part { let image: NSImage?; let size: NSSize; let spins: Bool; let text: NSAttributedString? }
+    var parts: [Part] = []
+    if running > 0 {
+        parts.append(Part(image: claudeMark, size: markSize, spins: true,
+                          text: NSAttributedString(string: "\(running)", attributes: attrs)))
     }
+    for (symbol, count) in [("bubble.left.fill", needYou)] where count > 0 {
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+        parts.append(Part(image: image, size: image?.size ?? .zero, spins: false,
+                          text: NSAttributedString(string: "\(count)", attributes: attrs)))
+    }
+    if parts.isEmpty {
+        let image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+        parts.append(Part(image: image, size: image?.size ?? .zero, spins: false, text: nil))
+    }
+
     let height: CGFloat = 18, inner: CGFloat = 3, outer: CGFloat = 9
     var width: CGFloat = 0
-    for (i, item) in items.enumerated() {
+    for (i, part) in parts.enumerated() {
         if i > 0 { width += outer }
-        if let image = item.0 { width += image.size.width }
-        if let text = item.1 { width += inner + ceil(text.size().width) }
+        width += part.size.width
+        if let text = part.text { width += inner + ceil(text.size().width) }
     }
-    let result = NSImage(size: NSSize(width: ceil(width), height: height), flipped: false) { _ in
-        var x: CGFloat = 0
-        for (i, item) in items.enumerated() {
-            if i > 0 { x += outer }
-            if let image = item.0 {
-                image.draw(in: NSRect(x: x, y: (height - image.size.height) / 2,
-                                      width: image.size.width, height: image.size.height))
-                x += image.size.width
-            }
-            if let text = item.1 {
-                x += inner
-                let size = text.size()
-                text.draw(at: NSPoint(x: x, y: (height - size.height) / 2))
-                x += ceil(size.width)
+    let size = NSSize(width: ceil(width), height: height)
+    let scale = max(2, NSScreen.screens.map(\.backingScaleFactor).max() ?? 2)
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+    else { return (NSImage(size: size), nil) }
+    rep.size = size   // before the context, so drawing is in points
+    guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return (NSImage(size: size), nil) }
+    var markRect: NSRect?
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = context
+    var x: CGFloat = 0
+    for (i, part) in parts.enumerated() {
+        if i > 0 { x += outer }
+        if let image = part.image {
+            let rect = NSRect(x: x, y: (height - part.size.height) / 2, width: part.size.width, height: part.size.height)
+            if part.spins { markRect = rect }
+            if part.spins && !drawMark {
+                // Left empty for the animated mark.
+            } else if part.spins && angle != 0 {
+                let turn = NSAffineTransform()
+                turn.translateX(by: rect.midX, yBy: rect.midY)
+                turn.rotate(byDegrees: -angle)          // clockwise
+                turn.translateX(by: -rect.midX, yBy: -rect.midY)
+                NSGraphicsContext.saveGraphicsState()
+                turn.concat()
+                image.draw(in: rect)
+                NSGraphicsContext.restoreGraphicsState()
+            } else {
+                image.draw(in: rect)
             }
         }
-        return true
+        x += part.size.width
+        if let text = part.text {
+            x += inner
+            let textSize = text.size()
+            text.draw(at: NSPoint(x: x, y: (height - textSize.height) / 2))
+            x += ceil(textSize.width)
+        }
     }
-    result.isTemplate = true
-    return result
+    context.flushGraphics()
+    NSGraphicsContext.restoreGraphicsState()
+    let image = NSImage(size: size)
+    image.addRepresentation(rep)
+    image.isTemplate = true
+    return (image, markRect)
 }
+
+/// What the menu bar animation is doing, for the SIGUSR1 counts file.
+final class SpinStats {
+    private let lock = NSLock()
+    private var spinning = false
+    func set(spinning: Bool) { lock.lock(); self.spinning = spinning; lock.unlock() }
+    func snapshot() -> [String: Any] { lock.lock(); defer { lock.unlock() }; return ["spinning": spinning] }
+}
+let spinStats = SpinStats()
 
 // MARK: - Panel
 
@@ -1233,11 +1295,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: PanelController!
     private var expiry: DispatchSourceTimer?
     private var shownCounts: (Int, Int)?
+    // The Claude mark turns while sessions run, once every 3 s. It is its own
+    // image view over an empty slot in the button's image, rotated by Core
+    // Animation, so the app does no work per frame. (Swapping pre-drawn images
+    // 8 times a second cost about 5% of a core, measured.) It stops while the
+    // screens sleep or are locked, and stays still with Reduce Motion on.
+    private let markView = NSImageView()
+    private var markRect: NSRect?
+    private var screensAsleep = false
+    private var snapshotSignal: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel(_:))
+        if let button = statusItem.button {
+            markView.image = claudeMark
+            markView.imageScaling = .scaleProportionallyUpOrDown
+            markView.wantsLayer = true
+            markView.isHidden = true
+            button.addSubview(markView)
+            button.postsFrameChangedNotifications = true
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(buttonFrameChanged), name: NSView.frameDidChangeNotification, object: button)
+        }
+        // kill -USR1 also saves a picture of the menu bar button, to check the
+        // mark's placement without screen access.
+        let signalSource = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        signalSource.setEventHandler { [weak self] in self?.writeButtonSnapshot() }
+        signalSource.resume()
+        snapshotSignal = signalSource
         panel = PanelController(model: model) { [weak self] in self?.engine.refresh() }
         updateStatusItem()
         engine.onRows = { [weak self] rows in
@@ -1246,8 +1333,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         engine.enableStatsSignal()
         engine.start()
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(screensSlept), name: NSWorkspace.screensDidSleepNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(screensWoke), name: NSWorkspace.screensDidWakeNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(screensSlept), name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(screensWoke), name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(motionSettingChanged),
+                              name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(self, selector: #selector(screensSlept), name: .init("com.apple.screenIsLocked"), object: nil)
+        distributed.addObserver(self, selector: #selector(screensWoke), name: .init("com.apple.screenIsUnlocked"), object: nil)
+    }
+
+    @objc private func screensSlept() {
+        screensAsleep = true
+        updateSpinner()
+    }
+
+    @objc private func screensWoke() {
+        screensAsleep = false
+        updateSpinner()
+    }
+
+    @objc private func motionSettingChanged() {
+        updateSpinner()
+    }
+
+    @objc private func buttonFrameChanged() {
+        placeMark()
+    }
+
+    /// Puts the mark view over its slot. The button draws its image centred.
+    private func placeMark() {
+        guard let button = statusItem.button, let image = button.image, let slot = markRect else {
+            markView.isHidden = true
+            return
+        }
+        let bounds = button.bounds
+        let origin = NSPoint(x: (bounds.width - image.size.width) / 2, y: (bounds.height - image.size.height) / 2)
+        let frame = button.backingAlignedRect(slot.offsetBy(dx: origin.x, dy: origin.y), options: .alignAllEdgesNearest)
+        markView.frame = frame
+        markView.isHidden = false
+        // Rotate about the centre: AppKit places a view's layer by its corner.
+        if let layer = markView.layer {
+            layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            layer.position = CGPoint(x: frame.midX, y: frame.midY)
+        }
+    }
+
+    /// Starts or stops the menu bar animation to match the running count.
+    private func updateSpinner() {
+        let running = shownCounts?.1 ?? 0
+        let spin = running > 0 && !screensAsleep && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        spinStats.set(spinning: spin)
+        guard let layer = markView.layer else { return }
+        if !spin {
+            layer.removeAnimation(forKey: "spin")
+            return
+        }
+        guard layer.animation(forKey: "spin") == nil else { return }
+        let turn = CABasicAnimation(keyPath: "transform.rotation.z")
+        turn.fromValue = 0
+        turn.toValue = -2 * Double.pi              // clockwise
+        turn.duration = 3
+        turn.repeatCount = .infinity
+        turn.isRemovedOnCompletion = false
+        // A slow turn needs few frames; this keeps the window server's work small.
+        turn.preferredFrameRateRange = CAFrameRateRange(minimum: 8, maximum: 15, preferred: 12)
+        layer.add(turn, forKey: "spin")
+    }
+
+    private func writeButtonSnapshot() {
+        guard let button = statusItem.button,
+              let rep = button.bitmapImageRepForCachingDisplay(in: button.bounds) else { return }
+        button.cacheDisplay(in: button.bounds, to: rep)
+        let url = Paths.home.appendingPathComponent("Library/Caches/\(LoginItem.label).menubar.png")
+        try? rep.representation(using: .png, properties: [:])?.write(to: url)
     }
 
     @objc private func didWake() {
@@ -1261,7 +1423,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let counts = (board.yourTurn.count, board.running.count)
         if shownCounts.map({ $0 != counts }) ?? true {
             shownCounts = counts
-            statusItem.button?.image = statusImage(needYou: counts.0, running: counts.1)
+            let drawn = statusImage(needYou: counts.0, running: counts.1, drawMark: false)
+            statusItem.button?.image = drawn.image
+            markRect = drawn.markRect
+            statusItem.button?.layoutSubtreeIfNeeded()
+            placeMark()
+            updateSpinner()
             let text = "\(counts.0) waiting for you, \(counts.1) running"
             statusItem.button?.toolTip = "Claude sessions: \(text)"
             statusItem.button?.setAccessibilityLabel("Claude sessions: \(text)")
@@ -1357,22 +1524,32 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
 
     // The menu bar item, drawn the way a template image appears on each bar.
     let board = Board(rows: model.rows, now: Date())
-    let bar = statusImage(needYou: board.yourTurn.count, running: board.running.count)
-    let tinted = NSImage(size: bar.size, flipped: false) { rect in
-        bar.draw(in: rect)
-        (dark ? NSColor.white : NSColor.black).setFill()
-        rect.fill(using: .sourceIn)
-        return true
-    }
-    let strip = NSImage(size: NSSize(width: bar.size.width + 24, height: 24), flipped: false) { rect in
+    let angle = argument(after: "--angle").flatMap(Double.init).map { CGFloat($0) } ?? 0
+    let bar = statusImage(needYou: board.yourTurn.count, running: board.running.count, angle: angle).image
+    // Drawn at 2x so the check shows real menu bar pixels.
+    let stripSize = NSSize(width: bar.size.width + 24, height: 24)
+    if let strip = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: Int(stripSize.width * 2), pixelsHigh: Int(stripSize.height * 2),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) {
+        strip.size = stripSize   // before the context, so drawing is in points
+        guard let context = NSGraphicsContext(bitmapImageRep: strip) else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
         (dark ? NSColor(white: 0.16, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill()
-        rect.fill()
-        tinted.draw(in: NSRect(x: 12, y: 3, width: bar.size.width, height: bar.size.height))
-        return true
-    }
-    if let tiff = strip.tiffRepresentation, let stripRep = NSBitmapImageRep(data: tiff) {
-        try? stripRep.representation(using: .png, properties: [:])?
-            .write(to: URL(fileURLWithPath: path + ".bar.png"))
+        NSRect(origin: .zero, size: stripSize).fill()
+        let target = NSRect(x: 12, y: 3, width: bar.size.width, height: bar.size.height)
+        // A template image is drawn as a mask, tinted for the bar.
+        if let cg = bar.cgImage(forProposedRect: nil, context: context, hints: nil) {
+            context.cgContext.saveGState()
+            context.cgContext.clip(to: target, mask: cg)
+            (dark ? NSColor.white : NSColor.black).setFill()
+            target.fill()
+            context.cgContext.restoreGState()
+        }
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        try? strip.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path + ".bar.png"))
     }
 }
 
