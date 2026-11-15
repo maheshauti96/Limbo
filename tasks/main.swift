@@ -2091,7 +2091,14 @@ struct FloatingView: View {
                 headerCounts(list, filter: active, fit: .minimal)
             }
             .layoutPriority(1)
-            Spacer(minLength: 4)
+            // The empty middle: double-click it for the pill, or drag the window.
+            // (On the empty part only, so double-clicking a chip stays a chip click.)
+            Color.clear
+                .frame(minWidth: 4, maxWidth: .infinity, minHeight: 18)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { setMini(true) }
+                .gesture(WindowDragGesture())
+                .help("Double-click to shrink to a pill")
             glowMenu
             Menu {
                 Picker("Show sessions waiting for you from", selection: $waitingHours) {
@@ -2130,9 +2137,7 @@ struct FloatingView: View {
         .padding(.top, 9)
         .padding(.bottom, 4)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { setMini(true) }
         .gesture(WindowDragGesture())   // drag the window by its header
-        .help("Double-click to shrink to a pill")
         .contextMenu {
             Button("Shrink to Pill") { setMini(true) }
             Divider()
@@ -3911,7 +3916,10 @@ func runGestureCheck() {
     let model = SessionModel()
     model.rows = sampleRows(now: Date())
     let layout = FloatingLayout()
-    let host = FirstClickHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {}, layout: layout))
+    let glow = RunningGlowView(frame: .zero)
+    var unpinned = false
+    let host = FirstClickHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: { unpinned = true },
+                                                            glow: glow, layout: layout))
     host.frame = NSRect(origin: .zero, size: host.fittingSize)
     let panel = KeepOnTopPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel],
                                backing: .buffered, defer: false)
@@ -3919,8 +3927,15 @@ func runGestureCheck() {
     panel.setFrameOrigin(NSPoint(x: -6000, y: -6000))
     panel.orderFrontRegardless()
     RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-    func doubleClick(at point: NSPoint) {
-        for count in 1...2 {
+    glow.configure(style: .aurora, color: .red)
+    glow.setMode(.running)
+    func refit() {
+        host.frame = NSRect(origin: .zero, size: host.fittingSize)
+        panel.setContentSize(host.frame.size)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    }
+    func click(at point: NSPoint, times: Int = 1) {
+        for count in 1...times {
             for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
                 let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
                                                timestamp: ProcessInfo.processInfo.systemUptime,
@@ -3932,16 +3947,44 @@ func runGestureCheck() {
         }
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
     }
-    // The header's empty middle: right of the chips, left of the menus.
-    doubleClick(at: NSPoint(x: host.frame.width - 110, y: host.frame.height - 16))
-    print("after double-clicking the header: mini =", layout.mini)
-    host.frame = NSRect(origin: .zero, size: host.fittingSize)
-    panel.setContentSize(host.frame.size)
-    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-    print("pill size:", NSStringFromSize(host.frame.size))
-    doubleClick(at: NSPoint(x: host.frame.width / 2, y: host.frame.height / 2))
-    print("after double-clicking the pill: mini =", layout.mini)
-    exit(0)
+    func glowState() -> String {
+        "glow in window: \(glow.window != nil), size \(Int(glow.bounds.width))x\(Int(glow.bounds.height)), animating: \(glow.state["animating"] ?? "-")"
+    }
+    var failed = 0
+    func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+        print(ok ? "pass" : "FAIL", name, detail)
+        if !ok { failed += 1 }
+    }
+    let fullHeight = host.frame.height
+    let headerY = host.frame.height - 18
+    // A single click on the first count chip filters the list.
+    click(at: NSPoint(x: 45, y: headerY))
+    refit()
+    check("a single click on a chip filters", host.frame.height < fullHeight,
+          "(height \(Int(fullHeight)) -> \(Int(host.frame.height)))")
+    click(at: NSPoint(x: 45, y: host.frame.height - 18))
+    refit()
+    check("clicking it again shows everything", host.frame.height == fullHeight)
+    // A double-click on a chip doesn't shrink the window.
+    click(at: NSPoint(x: 45, y: host.frame.height - 18), times: 2)
+    refit()
+    check("a double-click on a chip doesn't shrink to the pill", !layout.mini)
+    if host.frame.height != fullHeight { click(at: NSPoint(x: 45, y: host.frame.height - 18)); refit() }
+    // Double-click the header's empty middle: the pill, with the glow.
+    click(at: NSPoint(x: 175, y: host.frame.height - 18), times: 2)   // between the chips and the menus
+    refit()
+    check("double-clicking the header shrinks to the pill", layout.mini, "(\(NSStringFromSize(host.frame.size)))")
+    check("the glow comes along to the pill", glow.window != nil && Int(glow.bounds.height) == 32, glowState())
+    click(at: NSPoint(x: host.frame.width / 2, y: host.frame.height / 2), times: 2)
+    refit()
+    check("double-clicking the pill expands it", !layout.mini)
+    check("the glow comes back to the window", glow.window != nil && glow.bounds.height == host.frame.height
+              && glow.bounds.height > 100, glowState())
+    // A single click on the close button still works.
+    click(at: NSPoint(x: host.frame.width - 20, y: host.frame.height - 18))
+    check("the close button takes a single click", unpinned)
+    print(failed == 0 ? "all passed" : "\(failed) failed")
+    exit(failed == 0 ? 0 : 1)
 }
 
 if arguments.contains("--gesture-check") {
