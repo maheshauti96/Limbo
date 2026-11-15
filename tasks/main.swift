@@ -1701,7 +1701,12 @@ struct FloatingView: View {
     let open: (Row) -> Void
     let unpin: () -> Void
     var refit: () -> Void = {}
+    var glowChanged: () -> Void = {}
+    /// Drawn between the window's material and the rows, so text stays crisp.
+    var glow: RunningGlowView?
     @AppStorage("keepOnTopWaitingHours") private var waitingHours = WaitingWindow.day.rawValue
+    @AppStorage(GlowStyle.key) private var glowStyle = GlowStyle.aurora.rawValue
+    @AppStorage(GlowColor.key) private var glowColor = GlowColor.red.rawValue
     static let maxRows = 8
     /// Finished sessions stay listed, with a green check, for this long.
     static let doneShownFor: TimeInterval = 30 * 60
@@ -1744,9 +1749,12 @@ struct FloatingView: View {
             }
         }
         .frame(width: 300)
+        .background { if let glow { GlowBackdrop(view: glow) } }
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
         .onChange(of: waitingHours) { refit() }
+        .onChange(of: glowStyle) { glowChanged() }
+        .onChange(of: glowColor) { glowChanged() }
     }
 
     private func header(running: Int, waiting: Int, review: Int) -> some View {
@@ -1762,6 +1770,7 @@ struct FloatingView: View {
                 .lineLimit(1)
                 .help(summary(running: running, waiting: waiting, review: review))
             Spacer(minLength: 4)
+            glowMenu
             Menu {
                 Picker("Show sessions waiting for you from", selection: $waitingHours) {
                     ForEach(WaitingWindow.allCases) { Text($0.menuTitle).tag($0.rawValue) }
@@ -1801,6 +1810,34 @@ struct FloatingView: View {
         .gesture(WindowDragGesture())   // drag the window by its header
     }
 
+    /// Picks how the window glows while a session runs, and in what colour.
+    private var glowMenu: some View {
+        let style = GlowStyle(rawValue: glowStyle) ?? .aurora
+        return Menu {
+            Picker("Glow while a session runs", selection: $glowStyle) {
+                ForEach(GlowStyle.allCases) { Text($0.title).tag($0.rawValue) }
+            }
+            .pickerStyle(.inline)
+            Picker("Colour", selection: $glowColor) {
+                ForEach(GlowColor.allCases) { Text($0.title).tag($0.rawValue) }
+            }
+            .pickerStyle(.inline)
+            .disabled(style == .none)
+        } label: {
+            Image(systemName: "sparkles")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Glow while a session runs: \(style.title)")
+        .accessibilityLabel("Glow while a session runs: \(style.title)")
+    }
+
     /// Compact: the review count only when nothing else is there, so the header fits.
     private func summary(running: Int, waiting: Int, review: Int, compact: Bool = false) -> String {
         var parts: [String] = []
@@ -1811,45 +1848,136 @@ struct FloatingView: View {
     }
 }
 
-/// The ambient border's colours around the edge (0...1 around the circle):
-/// red, coral and rose with gentle changes in strength, no sharp highlights.
-/// (location, red, green, blue, alpha)
-let ambientStops: [(Double, Double, Double, Double, Double)] = [
-    (0.00, 1.00, 0.23, 0.19, 0.80),   // red
-    (0.20, 1.00, 0.45, 0.35, 0.45),   // coral, softer
-    (0.40, 0.95, 0.25, 0.45, 0.75),   // rose
-    (0.60, 1.00, 0.30, 0.22, 0.40),   // red, softer
-    (0.80, 1.00, 0.50, 0.38, 0.75),   // coral
-    (1.00, 1.00, 0.23, 0.19, 0.80),   // back to red
-]
+// MARK: - Running glow
 
-/// While any session runs: one soft band of red tones flowing slowly around
-/// the window's edge; gone the moment no session runs. A conic gradient masked
-/// to a 4 pt ring with the window's continuous corners, rotated by Core
-/// Animation at a capped frame rate, so the app does no work per frame. Still
-/// with Reduce Motion on.
-final class GlowBorderView: NSView {
-    private let container = CALayer()
-    private let gradient = CAGradientLayer()
-    private let ring = CALayer()
-    private var running = false
+/// How the keep-on-top window shows that a session is running: colour that
+/// comes in from its edges, with no border line. Picked from the sparkle menu
+/// in the window's header.
+enum GlowStyle: String, CaseIterable, Identifiable {
+    case aurora, ember, corners, tide, rise, heartbeat, random, none
+    static let key = "runningGlow"
+    /// The effects themselves, the ones Random picks from.
+    static let effects: [GlowStyle] = [.aurora, .ember, .corners, .tide, .rise, .heartbeat]
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .aurora: return "Aurora drift"
+        case .ember: return "Ember breath"
+        case .corners: return "Corner bloom"
+        case .tide: return "Tide sweep"
+        case .rise: return "Rising warmth"
+        case .heartbeat: return "Heartbeat"
+        case .random: return "Random, a new one every 5 seconds"
+        case .none: return "No glow"
+        }
+    }
+    static var saved: GlowStyle {
+        UserDefaults.standard.string(forKey: key).flatMap(GlowStyle.init(rawValue:)) ?? .aurora
+    }
+}
+
+enum GlowColor: String, CaseIterable, Identifiable {
+    case red, orange, rose, green
+    static let key = "runningGlowColor"
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+    var color: NSColor {
+        switch self {
+        case .red: return NSColor(srgbRed: 1.00, green: 0.30, blue: 0.24, alpha: 1)      // #FF4D3D
+        case .orange: return NSColor(srgbRed: 1.00, green: 0.54, blue: 0.24, alpha: 1)   // #FF8A3D
+        case .rose: return NSColor(srgbRed: 0.89, green: 0.28, blue: 0.48, alpha: 1)     // #E2477A
+        case .green: return NSColor(srgbRed: 0.20, green: 0.78, blue: 0.35, alpha: 1)    // #34C759
+        }
+    }
+    static var saved: GlowColor {
+        UserDefaults.standard.string(forKey: key).flatMap(GlowColor.init(rawValue:)) ?? .red
+    }
+}
+
+extension NSColor {
+    /// The same colour turned a little around the colour wheel.
+    func shifted(hue dh: CGFloat, saturation ds: CGFloat = 0, brightness db: CGFloat = 0) -> NSColor {
+        guard let c = usingColorSpace(.sRGB) else { return self }
+        let h = c.hueComponent + dh
+        return NSColor(colorSpace: .sRGB, hue: h - floor(h),
+                       saturation: min(1, max(0, c.saturationComponent + ds)),
+                       brightness: min(1, max(0, c.brightnessComponent + db)), alpha: c.alphaComponent)
+    }
+}
+
+/// A small image for the edges of a window of any size: `alpha` gets the
+/// distance in points from the nearest left or right edge and from the nearest
+/// top or bottom edge. Its middle pixel stretches (the returned contentsCenter),
+/// so the picture is the same few kilobytes however big the window gets.
+func stretchableEdgeImage(depth: CGFloat, scale: CGFloat, color: NSColor,
+                          alpha: (Double, Double) -> Double) -> (image: CGImage, center: CGRect)? {
+    let points = 2 * depth + 1
+    let side = Int((points * scale).rounded())
+    guard side > 0, let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side * 4,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+          let data = context.data else { return nil }
+    let c = color.usingColorSpace(.sRGB) ?? color
+    let rgb = [Double(c.redComponent), Double(c.greenComponent), Double(c.blueComponent)]
+    let distance = (0..<side).map { (Double(min($0, side - 1 - $0)) + 0.5) / Double(scale) }
+    let pixels = data.bindMemory(to: UInt8.self, capacity: side * side * 4)
+    for y in 0..<side {
+        for x in 0..<side {
+            let a = max(0, min(1, alpha(distance[x], distance[y])))
+            let o = (y * side + x) * 4
+            for i in 0..<3 { pixels[o + i] = UInt8((rgb[i] * a * 255).rounded()) }
+            pixels[o + 3] = UInt8((a * 255).rounded())
+        }
+    }
+    guard let image = context.makeImage() else { return nil }
+    let unit = 1 / points
+    return (image, CGRect(x: depth * unit, y: depth * unit, width: unit, height: unit))
+}
+
+/// A glow along every edge that fades inward, as CSS draws
+/// `box-shadow: inset 0 0 <blur> <spread>`: one minus a Gaussian-blurred
+/// rectangle, which is a row profile times a column profile.
+func insetGlowImage(color: NSColor, blur: CGFloat, spread: CGFloat, scale: CGFloat) -> (image: CGImage, center: CGRect)? {
+    let sigma = Double(blur) / 2, s = Double(spread)
+    func inside(_ d: Double) -> Double { 0.5 * erfc(-(d - s) / (sigma * 2.0.squareRoot())) }
+    return stretchableEdgeImage(depth: ceil(spread + 1.5 * blur), scale: scale, color: color) { dx, dy in
+        1 - inside(dx) * inside(dy)
+    }
+}
+
+/// While a session runs, colour moves in from the keep-on-top window's edges
+/// in the chosen style. Core Animation runs it at a capped frame rate, so the
+/// app does no work per frame; a steady glow with Reduce Motion on. Random
+/// cross-fades to a different effect every 5 seconds.
+final class RunningGlowView: NSView {
+    private struct Effect {
+        var layout: (CGRect) -> Void = { _ in }
+        /// Sets the starting look and adds the animations (none when still).
+        var start: (_ bounds: CGRect, _ still: Bool) -> Void = { _, _ in }
+        /// A layer that carries an animation while the effect moves.
+        var probe: CALayer?
+    }
+
+    private let clip = CALayer()
+    private var chosen: GlowStyle = .none
+    private var tint: GlowColor = .red
+    private var showing: GlowStyle = .none
+    private var effect = Effect()
+    private var builtScale: CGFloat = 0
+    private var laidOut: CGSize = .zero
+    private var active = false
+    private var shuffle: Timer?
+    /// Snapshots draw the effect moving even with Reduce Motion on.
+    var forceMotion = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        ring.cornerRadius = 12
-        ring.cornerCurve = .continuous
-        ring.borderWidth = 4
-        ring.borderColor = NSColor.black.cgColor
-        container.addSublayer(gradient)
-        container.mask = ring
-        gradient.type = .conic
-        gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
-        gradient.endPoint = CGPoint(x: 0.5, y: 0)
-        gradient.colors = ambientStops.map { CGColor(red: $0.1, green: $0.2, blue: $0.3, alpha: $0.4) }
-        gradient.locations = ambientStops.map { NSNumber(value: $0.0) }
-        layer?.addSublayer(container)
-        container.isHidden = true
+        clip.cornerRadius = 12
+        clip.cornerCurve = .continuous
+        clip.masksToBounds = true
+        clip.isHidden = true
+        layer?.addSublayer(clip)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1857,36 +1985,302 @@ final class GlowBorderView: NSView {
     // Clicks go through to the rows underneath.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    private var scale: CGFloat { window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2 }
+    private var still: Bool { !forceMotion && NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+    private var moving: Bool { still || effect.probe?.animationKeys()?.isEmpty == false }
+
+    func configure(style: GlowStyle, color: GlowColor) {
+        guard style != chosen || color != tint else { return }
+        chosen = style
+        tint = color
+        show(style == .random ? GlowStyle.effects.randomElement()! : style, fade: false)
+        if chosen == .none { setActive(false) }
+        updateShuffle()
+    }
+
+    func setActive(_ on: Bool) {
+        let on = on && chosen != .none
+        guard on != active || (on && !moving) else { return }
+        active = on
+        clip.isHidden = !on
+        stopAnimations(clip)
+        if on { effect.start(bounds, still) }
+        updateShuffle()
+    }
+
+    /// Reduce Motion was turned on or off.
+    func motionChanged() {
+        guard active else { return }
+        stopAnimations(clip)
+        effect.start(bounds, still)
+        updateShuffle()
+    }
+
+    /// Snapshots: stop the clock, then `phase(_:)` picks the moment drawn.
+    func freeze() { clip.speed = 0; clip.timeOffset = 0 }
+    func phase(_ seconds: CFTimeInterval) { clip.timeOffset = seconds }
+
     override func layout() {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        container.frame = bounds
-        ring.frame = bounds
-        let side = hypot(bounds.width, bounds.height)    // covers the corners while turning
-        gradient.bounds = CGRect(x: 0, y: 0, width: side, height: side)
-        gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        clip.frame = bounds
+        effect.layout(bounds)
+        CATransaction.commit()
+        if bounds.size != laidOut {
+            laidOut = bounds.size
+            if active { stopAnimations(clip); effect.start(bounds, still) }   // sizes are baked into them
+        }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsLayout = true
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        if builtScale != scale { show(showing, fade: false) }
+    }
+
+    private func updateShuffle() {
+        guard active, chosen == .random, !still else { stopShuffle(); return }
+        guard shuffle == nil else { return }
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.show(GlowStyle.effects.filter { $0 != self.showing }.randomElement()!, fade: true)
+        }
+        timer.tolerance = 0.5
+        RunLoop.main.add(timer, forMode: .common)
+        shuffle = timer
+    }
+
+    private func stopShuffle() {
+        shuffle?.invalidate()
+        shuffle = nil
+    }
+
+    private func stopAnimations(_ layer: CALayer) {
+        layer.sublayers?.forEach { $0.removeAllAnimations(); stopAnimations($0) }
+    }
+
+    /// Replaces the layers with those of `style`, cross-fading when asked.
+    private func show(_ style: GlowStyle, fade: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        stopAnimations(clip)
+        if fade {
+            let swap = CATransition()
+            swap.type = .fade
+            swap.duration = 0.9
+            clip.add(swap, forKey: "swap")
+        }
+        clip.sublayers = nil
+        showing = style
+        builtScale = scale
+        effect = build(style)
+        effect.layout(bounds)
+        if active { effect.start(bounds, still) }
         CATransaction.commit()
     }
 
-    func setRunning(_ isRunning: Bool) {
-        let animating = gradient.animation(forKey: "flow") != nil
-        guard isRunning != running || (isRunning && !animating) else { return }
-        running = isRunning
-        container.isHidden = !isRunning
-        guard isRunning, window != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            gradient.removeAllAnimations()
-            return
+    private func build(_ style: GlowStyle) -> Effect {
+        let accent = tint.color
+        let cg = accent.cgColor, clear = accent.withAlphaComponent(0).cgColor
+        var effect = Effect()
+        switch style {
+        case .ember, .heartbeat:
+            // A soft inset glow that breathes, or beats twice and rests.
+            let ember = style == .ember
+            let edge = imageLayer(insetGlowImage(color: accent, blur: ember ? 26 : 30, spread: ember ? 3 : 4, scale: builtScale))
+            clip.addSublayer(edge)
+            effect.layout = { edge.frame = $0 }
+            effect.start = { _, still in
+                edge.opacity = still ? (ember ? 0.7 : 0.6) : (ember ? 0.3 : 0.2)
+                guard !still else { return }
+                edge.add(ember ? loop("opacity", from: 0.3, to: 1.0, duration: 1.2)
+                               : keyframes("opacity", values: [0.2, 1, 0.35, 0.85, 0.2, 0.2],
+                                           times: [0, 0.1, 0.22, 0.32, 0.5, 1], duration: 1.6, timing: .easeOut),
+                         forKey: "glow")
+            }
+            effect.probe = edge
+
+        case .aurora:
+            // Red, coral and rose turning slowly, seen only near the edges.
+            let holder = CALayer()
+            let edges = imageLayer(stretchableEdgeImage(depth: 38, scale: builtScale, color: .white) { dx, dy in
+                max(0, 1 - dx / 38) + max(0, 1 - dy / 30)
+            })
+            holder.mask = edges
+            holder.opacity = 0.95
+            let band = CAGradientLayer()
+            band.type = .conic
+            band.startPoint = CGPoint(x: 0.5, y: 0.5)
+            band.endPoint = CGPoint(x: 0.5, y: 1)
+            band.colors = [accent, accent.shifted(hue: 0.05, saturation: -0.25, brightness: 0.05),
+                           accent.shifted(hue: -0.07, saturation: -0.05, brightness: -0.1),
+                           accent.withAlphaComponent(0.25), accent].map(\.cgColor)
+            holder.addSublayer(band)
+            clip.addSublayer(holder)
+            effect.layout = { bounds in
+                holder.frame = bounds
+                edges.frame = CGRect(origin: .zero, size: bounds.size)
+                let side = max(560, hypot(bounds.width, bounds.height) + 40)   // covers the corners while turning
+                band.bounds = CGRect(x: 0, y: 0, width: side, height: side)
+                band.position = CGPoint(x: bounds.midX, y: bounds.midY)
+            }
+            effect.start = { _, still in
+                guard !still else { return }
+                band.add(loop("transform.rotation.z", from: 0, to: -2 * Double.pi, duration: 4,
+                              autoreverses: false, timing: .linear), forKey: "glow")
+            }
+            effect.probe = band
+
+        case .corners:
+            // Soft light blooming from each corner in turn, clockwise.
+            let blooms = (0..<4).map { _ -> CAGradientLayer in
+                let bloom = CAGradientLayer()
+                bloom.type = .radial
+                bloom.colors = [cg, clear]
+                bloom.locations = [0, 0.96]
+                bloom.startPoint = CGPoint(x: 0.5, y: 0.5)
+                bloom.endPoint = CGPoint(x: 1, y: 1)
+                bloom.bounds = CGRect(x: 0, y: 0, width: 200, height: 200)
+                bloom.opacity = 0
+                clip.addSublayer(bloom)
+                return bloom
+            }
+            effect.layout = { b in
+                // Top left, top right, bottom right, bottom left (y goes up).
+                let spots = [CGPoint(x: b.minX, y: b.maxY), CGPoint(x: b.maxX, y: b.maxY),
+                             CGPoint(x: b.maxX, y: b.minY), CGPoint(x: b.minX, y: b.minY)]
+                for (bloom, spot) in zip(blooms, spots) { bloom.position = spot }
+            }
+            effect.start = { _, still in
+                for (i, bloom) in blooms.enumerated() {
+                    bloom.opacity = still ? 0.5 : 0
+                    guard !still else { continue }
+                    let pulse = keyframes("opacity", values: [0, 0.9, 0, 0], times: [0, 0.25, 0.55, 1], duration: 3.2)
+                    pulse.timeOffset = 3.2 * Double((4 - i) % 4) / 4   // each a quarter turn after the last
+                    bloom.add(pulse, forKey: "glow")
+                }
+            }
+            effect.probe = blooms[0]
+
+        case .tide:
+            // A faint edge glow with a wash of colour sweeping across.
+            let edge = imageLayer(insetGlowImage(color: accent, blur: 18, spread: 1, scale: builtScale))
+            edge.opacity = 0.35
+            let wash = CAGradientLayer()
+            wash.colors = [clear, clear, cg, clear, clear]
+            wash.locations = [0, 0.3, 0.5, 0.7, 1]
+            clip.addSublayer(edge)
+            clip.addSublayer(wash)
+            effect.layout = { b in
+                edge.frame = b
+                let width = b.width * 2.6
+                wash.bounds = CGRect(x: 0, y: 0, width: width, height: b.height)
+                wash.position = CGPoint(x: b.midX, y: b.midY)
+                let tilt = width * tan(10 * Double.pi / 180) / 2 / max(b.height, 1)   // bands lean 10°
+                wash.startPoint = CGPoint(x: 0, y: 0.5 + tilt)
+                wash.endPoint = CGPoint(x: 1, y: 0.5 - tilt)
+            }
+            effect.start = { b, still in
+                wash.opacity = still ? 0 : 0.32
+                guard !still else { return }
+                wash.add(loop("position.x", from: b.minX - 0.54 * b.width, to: b.minX + 1.54 * b.width,
+                              duration: 3, autoreverses: false), forKey: "glow")
+            }
+            effect.probe = wash
+
+        case .rise:
+            // Warmth rising from the bottom edge and settling back.
+            let heat = CAGradientLayer()
+            heat.type = .radial
+            heat.colors = [cg, clear]
+            heat.locations = [0, 0.62]
+            heat.startPoint = CGPoint(x: 0.5, y: 0)                 // bottom centre
+            heat.endPoint = CGPoint(x: 0.5 + 0.707, y: 1.414)
+            heat.anchorPoint = CGPoint(x: 0.5, y: 0)
+            clip.addSublayer(heat)
+            effect.layout = { b in
+                heat.bounds = CGRect(x: 0, y: 0, width: b.width * 1.2, height: b.height * 1.4)
+                heat.position = CGPoint(x: b.midX, y: b.minY - 20)
+            }
+            effect.start = { _, still in
+                heat.transform = CATransform3DMakeScale(1, still ? 0.5 : 0.35, 1)
+                heat.opacity = still ? 0.6 : 0.45
+                guard !still else { return }
+                let group = CAAnimationGroup()
+                group.animations = [("transform.scale.y", 0.35, 0.75), ("opacity", 0.45, 0.95)].map {
+                    let part = CABasicAnimation(keyPath: $0.0)
+                    part.fromValue = $0.1
+                    part.toValue = $0.2
+                    part.duration = 1.5
+                    return part
+                }
+                group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                group.duration = 1.5
+                group.autoreverses = true
+                group.repeatCount = .infinity
+                group.isRemovedOnCompletion = false
+                group.preferredFrameRateRange = glowFrameRate
+                heat.add(group, forKey: "glow")
+            }
+            effect.probe = heat
+
+        case .random, .none:
+            break
         }
-        let flow = CABasicAnimation(keyPath: "transform.rotation.z")
-        flow.fromValue = 0
-        flow.toValue = -2 * Double.pi
-        flow.duration = 4
-        flow.repeatCount = .infinity
-        flow.isRemovedOnCompletion = false
-        flow.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 24)
-        gradient.add(flow, forKey: "flow")
+        return effect
     }
+
+    private func imageLayer(_ made: (image: CGImage, center: CGRect)?) -> CALayer {
+        let layer = CALayer()
+        if let made {
+            layer.contents = made.image
+            layer.contentsCenter = made.center
+            layer.contentsScale = builtScale
+        }
+        return layer
+    }
+}
+
+/// Puts the controller's glow view behind the rows.
+struct GlowBackdrop: NSViewRepresentable {
+    let view: RunningGlowView
+    func makeNSView(context: Context) -> RunningGlowView { view }
+    func updateNSView(_ nsView: RunningGlowView, context: Context) {}
+}
+
+/// Smooth enough for slow light, light on the GPU.
+let glowFrameRate = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 24)
+
+private func loop(_ keyPath: String, from: Double, to: Double, duration: CFTimeInterval,
+                  autoreverses: Bool = true, timing: CAMediaTimingFunctionName = .easeInEaseOut) -> CABasicAnimation {
+    let animation = CABasicAnimation(keyPath: keyPath)
+    animation.fromValue = from
+    animation.toValue = to
+    animation.duration = duration
+    animation.autoreverses = autoreverses
+    animation.timingFunction = CAMediaTimingFunction(name: timing)
+    animation.repeatCount = .infinity
+    animation.isRemovedOnCompletion = false
+    animation.preferredFrameRateRange = glowFrameRate
+    return animation
+}
+
+private func keyframes(_ keyPath: String, values: [Double], times: [Double], duration: CFTimeInterval,
+                       timing: CAMediaTimingFunctionName = .easeInEaseOut) -> CAKeyframeAnimation {
+    let animation = CAKeyframeAnimation(keyPath: keyPath)
+    animation.values = values
+    animation.keyTimes = times.map { NSNumber(value: $0) }
+    animation.timingFunctions = Array(repeating: CAMediaTimingFunction(name: timing), count: values.count - 1)
+    animation.duration = duration
+    animation.repeatCount = .infinity
+    animation.isRemovedOnCompletion = false
+    animation.preferredFrameRateRange = glowFrameRate
+    return animation
 }
 
 /// Takes the first click, so a row opens without first focusing the window.
@@ -1907,8 +2301,10 @@ final class FloatingController {
     private let model: SessionModel
     private var panel: KeepOnTopPanel?
     private var host: FirstClickHostingView<FloatingView>?
-    private let glow = GlowBorderView(frame: .zero)
+    private let glow = RunningGlowView(frame: .zero)
     private var clock: Timer?
+    private var preview: DispatchWorkItem?
+    private var previewing = false
     private static let shownKey = "keepOnTop"
     private static let frameName = "LimboTasksKeepOnTop"
 
@@ -1937,14 +2333,32 @@ final class FloatingController {
         updateGlow()
     }
 
-    /// The border light runs while any session runs.
+    /// The glow runs while any session runs, and for a few seconds after a new
+    /// one is picked so it can be seen even when nothing runs.
     private func updateGlow() {
+        glow.configure(style: .saved, color: .saved)
         let running = !Board(rows: model.rows, now: model.now).running.isEmpty
-        glow.setRunning(model.pinned && running)
+        glow.setActive(model.pinned && (running || previewing))
     }
 
+    private func glowChanged() {
+        preview?.cancel()
+        previewing = true
+        updateGlow()
+        let done = DispatchWorkItem { [weak self] in
+            self?.previewing = false
+            self?.updateGlow()
+        }
+        preview = done
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: done)
+    }
+
+    func motionChanged() { glow.motionChanged() }
+
     func hide() {
-        glow.setRunning(false)
+        preview?.cancel()
+        previewing = false
+        glow.setActive(false)
         panel?.orderOut(nil)
         model.pinned = false
         UserDefaults.standard.set(false, forKey: Self.shownKey)
@@ -1976,19 +2390,14 @@ final class FloatingController {
                                     NSWorkspace.shared.open(url)
                                 },
                                 unpin: { [weak self] in self?.hide() },
-                                refit: { [weak self] in self?.fitToContent() })
+                                refit: { [weak self] in self?.fitToContent() },
+                                glowChanged: { [weak self] in self?.glowChanged() },
+                                glow: glow)
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
         let panel = KeepOnTopPanel(contentRect: NSRect(origin: .zero, size: size),
                                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
-        let content = NSView(frame: NSRect(origin: .zero, size: size))
-        host.frame = content.bounds
-        host.autoresizingMask = [.width, .height]
-        glow.frame = content.bounds
-        glow.autoresizingMask = [.width, .height]
-        content.addSubview(host)
-        content.addSubview(glow)                    // above the rows, ignores clicks
-        panel.contentView = content
+        panel.contentView = host
         panel.isFloatingPanel = true
         panel.level = .statusBar                      // above full-screen windows
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -2088,6 +2497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func motionSettingChanged() {
         updateSpinner()
+        floating.motionChanged()
     }
 
     @objc private func buttonFrameChanged() {
@@ -2240,15 +2650,13 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     let rows = sample ? sampleRows(now: Date()) : SessionEngine.scanOnce()
     model.rows = limit.map { Array(rows.prefix($0)) } ?? rows
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-    let host: NSView = arguments.contains("--floating")
-        ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {})
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
-                    AngularGradient(stops: ambientStops.map {
-                        .init(color: Color(red: $0.1, green: $0.2, blue: $0.3).opacity($0.4), location: $0.0)
-                    }, center: .center, angle: .degrees(-90)),
-                    lineWidth: 4)
-                .opacity(Board(rows: model.rows, now: Date()).running.isEmpty ? 0 : 1))
+    // The running glow, frozen at --phase seconds (default 1) into its loop.
+    let floating = arguments.contains("--floating")
+    let glow: RunningGlowView? = floating && (arguments.contains("--glow")
+        || !Board(rows: model.rows, now: Date()).running.isEmpty) ? RunningGlowView(frame: .zero) : nil
+    glow?.forceMotion = true
+    let host: NSView = floating
+        ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {}, glow: glow)
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
             .background(Color(nsColor: .windowBackgroundColor)))
@@ -2258,9 +2666,28 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     window.appearance = appearance
     window.contentView = host
     host.layoutSubtreeIfNeeded()
+    if let glow {
+        glow.freeze()
+        glow.configure(style: argument(after: "--glow").flatMap(GlowStyle.init(rawValue:)) ?? .saved,
+                       color: argument(after: "--tint").flatMap(GlowColor.init(rawValue:)) ?? .saved)
+        glow.setActive(true)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        glow.phase(argument(after: "--phase").flatMap(Double.init) ?? 1)
+    }
     RunLoop.main.run(until: Date().addingTimeInterval(0.4))
     guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { exit(1) }
     host.cacheDisplay(in: host.bounds, to: rep)
+    // The glow layer is not drawn by cacheDisplay. Screen blending puts it
+    // over the dark background while leaving light text about as it is,
+    // close to how it shows behind the rows in the real window.
+    if let glow, let layer = glow.layer?.presentation() ?? glow.layer,
+       let context = NSGraphicsContext(bitmapImageRep: rep) {
+        let place = glow.convert(glow.bounds, to: nil)
+        context.cgContext.translateBy(x: place.minX, y: place.minY)
+        context.cgContext.setBlendMode(.screen)
+        layer.render(in: context.cgContext)
+        context.flushGraphics()
+    }
     try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
 
     // The menu bar item, drawn the way a template image appears on each bar.
