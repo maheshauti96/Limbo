@@ -1965,7 +1965,7 @@ struct FloatingView: View {
             .disabled(style == .none)
             Divider()
             Toggle("Amber glow when a session needs you", isOn: $needsYouGlow)
-            Toggle("Green flash when the last session stops", isOn: $doneFlash)
+            Toggle("Green when everything finishes", isOn: $doneFlash)
         } label: {
             Image(systemName: "sparkles")
                 .font(.system(size: 10, weight: .semibold))
@@ -2031,13 +2031,29 @@ enum GlowSignal {
 /// session newly needs you, else the running effect while any session runs; a
 /// flash when the last running session stops. A choice just made in the
 /// sparkle menu shows for a few seconds.
-func glowDecision(pinned: Bool, running: Int, wasRunning: Int, needsYou: Bool, previewing: GlowPreview?,
-                  needsYouOn: Bool, flashOn: Bool) -> (mode: GlowMode, flash: Bool) {
-    guard pinned else { return (.off, false) }
-    let flash = flashOn && running == 0 && wasRunning > 0
-    if previewing == .needsYou || (previewing != .running && needsYouOn && needsYou) { return (.needsYou, flash) }
-    if previewing == .running || running > 0 { return (.running, flash) }
-    return (.off, flash)
+/// `finished` is whether everything had finished at the last update: it
+/// turns on when the last running session stops and off when one runs again
+/// (or, outside this function, when you open a session). While it is on, the
+/// whole window stays green.
+func glowDecision(pinned: Bool, running: Int, wasRunning: Int, finished: Bool, needsYou: Bool,
+                  previewing: GlowPreview?, needsYouOn: Bool, doneOn: Bool)
+    -> (mode: GlowMode, flash: Bool, finished: Bool) {
+    guard pinned else { return (.off, false, finished) }
+    let justFinished = running == 0 && wasRunning > 0
+    let allFinished = running == 0 && (finished || justFinished)
+    let flash = doneOn && justFinished
+    let mode: GlowMode
+    switch previewing {
+    case .needsYou?: mode = .needsYou
+    case .running?: mode = .running
+    case .done?: mode = .done
+    default:
+        if needsYouOn && needsYou { mode = .needsYou }
+        else if running > 0 { mode = .running }
+        else if doneOn && allFinished { mode = .done }
+        else { mode = .off }
+    }
+    return (mode, flash, allFinished)
 }
 
 /// What changed in the sparkle menu, so it can be shown straight away.
@@ -2116,7 +2132,7 @@ func insetGlowImage(color: NSColor, blur: CGFloat, spread: CGFloat, scale: CGFlo
 
 /// What the keep-on-top window's glow shows.
 enum GlowMode: String {
-    case off, running, needsYou
+    case off, running, needsYou, done
 }
 
 /// Amber, for a session that needs you; yellower than the orange glow colour.
@@ -2316,6 +2332,7 @@ final class RunningGlowView: NSView {
         case .off: effect = Effect()
         case .running: effect = build(showing)
         case .needsYou: effect = buildNeedsYou()
+        case .done: effect = buildDone()
         }
         effect.layout(bounds)
         clip.isHidden = mode == .off
@@ -2336,6 +2353,32 @@ final class RunningGlowView: NSView {
             edge.add(loop("opacity", from: 0.25, to: 0.9, duration: 1.6), forKey: "glow")
         }
         effect.probe = edge
+        return effect
+    }
+
+    /// Everything has finished: the whole window turns green behind the rows,
+    /// a little stronger at the edges, breathing slowly.
+    private func buildDone() -> Effect {
+        let green = GlowColor.green.color
+        let holder = CALayer()
+        let fill = CALayer()
+        fill.backgroundColor = green.withAlphaComponent(0.34).cgColor
+        let edge = imageLayer(insetGlowImage(color: green, blur: 26, spread: 3, scale: builtScale))
+        holder.addSublayer(fill)
+        holder.addSublayer(edge)
+        clip.addSublayer(holder)
+        var effect = Effect()
+        effect.layout = { b in
+            holder.frame = b
+            fill.frame = CGRect(origin: .zero, size: b.size)
+            edge.frame = CGRect(origin: .zero, size: b.size)
+        }
+        effect.start = { _, still in
+            holder.opacity = still ? 0.9 : 0.7
+            guard !still else { return }
+            holder.add(loop("opacity", from: 0.7, to: 1.0, duration: 2.5), forKey: "glow")
+        }
+        effect.probe = holder
         return effect
     }
 
@@ -2735,6 +2778,8 @@ final class FloatingController {
     private var previewing: GlowPreview?
     /// Running sessions at the last update, to catch the moment the last one stops.
     private var wasRunning = 0
+    /// Everything has finished and you have not opened a session since.
+    private var finished = false
     private let layout = FloatingLayout.saved()
     /// While an edge is being dragged, the window follows the mouse, not the rows.
     private var resizing = false
@@ -2774,9 +2819,11 @@ final class FloatingController {
         let board = Board(rows: model.rows, now: model.now)
         let running = board.running.count
         let decision = glowDecision(pinned: model.pinned, running: running, wasRunning: wasRunning,
-                                    needsYou: !model.freshNeedsYou(board).isEmpty, previewing: previewing,
-                                    needsYouOn: GlowSignal.needsYou, flashOn: GlowSignal.doneFlash)
+                                    finished: finished, needsYou: !model.freshNeedsYou(board).isEmpty,
+                                    previewing: previewing, needsYouOn: GlowSignal.needsYou,
+                                    doneOn: GlowSignal.doneFlash)
         wasRunning = model.pinned ? running : 0
+        finished = decision.finished
         if decision.flash { glow.celebrate() }
         glow.setMode(decision.mode)
     }
@@ -2786,7 +2833,9 @@ final class FloatingController {
         previewing = nil
         switch what {
         case .running, .needsYou: previewing = what
-        case .done: glow.celebrate()
+        case .done:
+            previewing = .done
+            glow.celebrate()
         case .none: break
         }
         updateGlow()
@@ -2801,9 +2850,15 @@ final class FloatingController {
 
     func motionChanged() { glow.motionChanged() }
 
+    /// You opened a session: the green "all finished" window has been seen.
+    func sessionOpened() {
+        finished = false
+        updateGlow()
+    }
+
     var glowState: [String: Any] {
         let board = Board(rows: model.rows, now: model.now)
-        return glow.state.merging(["previewing": previewing.map { "\($0)" } ?? "",
+        return glow.state.merging(["previewing": previewing.map { "\($0)" } ?? "", "finished": finished,
                                    "freshNeedsYou": model.freshNeedsYou(board).map(\.title)]) { a, _ in a }
     }
 
@@ -2938,7 +2993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signalSource.resume()
         snapshotSignal = signalSource
         floating = FloatingController(model: model)
-        model.onOpened = { [weak self] in self?.floating.updateGlow() }
+        model.onOpened = { [weak self] in self?.floating.sessionOpened() }
         model.onVisibilityChange = { [weak self] in
             guard let self else { return }
             self.engine.setActivityWanted(self.model.panelOpen || self.model.pinned)
@@ -3148,7 +3203,7 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     // The running glow, frozen at --phase seconds (default 1) into its loop.
     let floating = arguments.contains("--floating")
-    let glowFlags = ["--glow", "--attention", "--flash"].contains { arguments.contains($0) }
+    let glowFlags = ["--glow", "--attention", "--flash", "--done"].contains { arguments.contains($0) }
     let glow: RunningGlowView? = floating && (glowFlags
         || !Board(rows: model.rows, now: Date()).running.isEmpty) ? RunningGlowView(frame: .zero) : nil
     glow?.forceMotion = true
@@ -3169,7 +3224,7 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
         glow.configure(style: argument(after: "--glow").flatMap(GlowStyle.init(rawValue:)) ?? .saved,
                        color: argument(after: "--tint").flatMap(GlowColor.init(rawValue:)) ?? .saved)
         // --attention: the amber needs-you glow; --flash: the green done flash.
-        glow.setMode(arguments.contains("--attention") ? .needsYou
+        glow.setMode(arguments.contains("--done") ? .done : arguments.contains("--attention") ? .needsYou
                      : arguments.contains("--flash") && !arguments.contains("--glow") ? .off : .running)
         if arguments.contains("--flash") { glow.celebrate() }
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
@@ -3305,22 +3360,25 @@ func runSelfTest() {
         print(ok ? "pass" : "FAIL", name)
         if !ok { failed += 1 }
     }
-    func decide(pinned: Bool = true, running: Int = 0, was: Int = 0, needsYou: Bool = false,
-                previewing: GlowPreview? = nil, needsYouOn: Bool = true, flashOn: Bool = true) -> (GlowMode, Bool) {
-        let d = glowDecision(pinned: pinned, running: running, wasRunning: was, needsYou: needsYou,
-                             previewing: previewing, needsYouOn: needsYouOn, flashOn: flashOn)
-        return (d.mode, d.flash)
+    func decide(pinned: Bool = true, running: Int = 0, was: Int = 0, finished: Bool = false, needsYou: Bool = false,
+                previewing: GlowPreview? = nil, needsYouOn: Bool = true, doneOn: Bool = true) -> (GlowMode, Bool, Bool) {
+        let d = glowDecision(pinned: pinned, running: running, wasRunning: was, finished: finished, needsYou: needsYou,
+                             previewing: previewing, needsYouOn: needsYouOn, doneOn: doneOn)
+        return (d.mode, d.flash, d.finished)
     }
-    check("last session stops: flash, then nothing", decide(running: 0, was: 2) == (.off, true))
-    check("nothing was running: no flash", decide(running: 0, was: 0) == (.off, false))
-    check("one of two stops: no flash, still running", decide(running: 1, was: 2) == (.running, false))
-    check("window hidden: no flash, off", decide(pinned: false, running: 0, was: 2) == (.off, false))
-    check("flash turned off", decide(running: 0, was: 1, flashOn: false) == (.off, false))
-    check("needs you beats running", decide(running: 1, was: 1, needsYou: true) == (.needsYou, false))
-    check("stops and needs you: flash over amber", decide(running: 0, was: 1, needsYou: true) == (.needsYou, true))
-    check("amber turned off: running shows", decide(running: 1, needsYou: true, needsYouOn: false) == (.running, false))
-    check("previewing running beats amber", decide(needsYou: true, previewing: .running) == (.running, false))
-    check("previewing amber with nothing going on", decide(previewing: .needsYou) == (.needsYou, false))
+    check("last session stops: flash, then the window stays green", decide(running: 0, was: 2) == (.done, true, true))
+    check("still all finished later: stays green, no new flash", decide(running: 0, was: 0, finished: true) == (.done, false, true))
+    check("nothing has run: no green", decide(running: 0, was: 0) == (.off, false, false))
+    check("one of two stops: no flash, still running", decide(running: 1, was: 2) == (.running, false, false))
+    check("a session runs again: green ends", decide(running: 1, was: 0, finished: true) == (.running, false, false))
+    check("window hidden: off, state kept", decide(pinned: false, running: 0, was: 2, finished: true) == (.off, false, true))
+    check("green turned off: no flash, no green", decide(running: 0, was: 1, doneOn: false) == (.off, false, true))
+    check("needs you beats running", decide(running: 1, was: 1, needsYou: true) == (.needsYou, false, false))
+    check("stops and needs you: flash, amber over green", decide(running: 0, was: 1, needsYou: true) == (.needsYou, true, true))
+    check("amber turned off: running shows", decide(running: 1, needsYou: true, needsYouOn: false) == (.running, false, false))
+    check("previewing running beats amber", decide(needsYou: true, previewing: .running) == (.running, false, false))
+    check("previewing amber with nothing going on", decide(previewing: .needsYou) == (.needsYou, false, false))
+    check("previewing green with nothing going on", decide(previewing: .done) == (.done, false, false))
 
     let now = Date()
     let model = SessionModel()
