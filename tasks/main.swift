@@ -993,6 +993,12 @@ final class SessionModel: ObservableObject {
         onOpened?()
     }
 
+    /// Marks sessions as seen without opening them: the Got it button.
+    func acknowledge(_ rows: [Row]) {
+        let now = Date()
+        for row in rows { openedAt[row.id] = now }
+    }
+
     /// Sessions that started waiting for you in the last hour and have not been
     /// opened from here since.
     func freshNeedsYou(_ board: Board) -> [Row] {
@@ -1263,38 +1269,92 @@ struct PulsingDot: NSViewRepresentable {
     func updateNSView(_ view: PulseView, context: Context) { view.updateAnimation() }
 }
 
-/// Amber: a running session that has written nothing for a while.
-let quietColor = Color(red: 0.96, green: 0.66, blue: 0.10)
-
-/// "No output for 12 min", for a running session gone quiet.
-func quietPhrase(_ gap: TimeInterval) -> String {
-    "No output for " + (elapsed(since: Date(timeIntervalSinceNow: -gap), now: Date()) ?? "a while")
+/// Increase Contrast as the window and panel draw it. Read from the system,
+/// or forced on for snapshots.
+private struct HighContrastKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var highContrast: Bool {
+        get { self[HighContrastKey.self] }
+        set { self[HighContrastKey.self] = newValue }
+    }
 }
 
+/// The state colours and text greys, chosen to pass contrast on the window's
+/// dark and light backgrounds, and stronger with Increase Contrast.
+struct Palette {
+    let dark: Bool
+    let contrast: Bool
+
+    init(_ scheme: ColorScheme, contrast: Bool) {
+        dark = scheme == .dark
+        self.contrast = contrast
+    }
+
+    private func pick(_ d: (Double, Double, Double), _ l: (Double, Double, Double)) -> Color {
+        let c = dark ? d : l
+        return Color(red: c.0, green: c.1, blue: c.2)
+    }
+
+    var needsYou: Color { pick((1.0, 0.62, 0.04), (0.76, 0.37, 0.0)) }       // #FF9F0A, #C25E00
+    var needsYouMark: Color { dark ? Color(white: 0.11) : .white }           // the "!" inside it
+    var review: Color { pick((0.39, 0.66, 1.0), (0.04, 0.39, 0.84)) }        // #64A8FF, #0A64D6
+    var quiet: Color { pick((0.96, 0.66, 0.10), (0.70, 0.42, 0.0)) }         // #F5A81A, #B26B00
+    var done: Color { pick((0.20, 0.78, 0.35), (0.12, 0.56, 0.24)) }         // #34C759, #1E8E3E
+    /// Second lines.
+    var text2: Color { dark ? Color(white: contrast ? 0.92 : 0.78) : Color(white: contrast ? 0.12 : 0.30) }
+    /// Times and counts.
+    var time: Color { dark ? Color(white: contrast ? 0.88 : 0.64) : Color(white: contrast ? 0.16 : 0.37) }
+}
+
+/// "No output for 12 min" (the panel), or "No output for 12m" (the window).
+func quietPhrase(_ gap: TimeInterval, compact: Bool = false) -> String {
+    let since = Date(timeIntervalSinceNow: -gap)
+    return "No output for " + (compact ? compactAge(since: since, now: Date())
+                                       : elapsed(since: since, now: Date()) ?? "a while")
+}
+
+/// "now", "6m", "18h", "3d": the window's one short style, matching its "4m 12s" clocks.
+func compactAge(since d: Date, now: Date) -> String {
+    let s = max(0, Int(now.timeIntervalSince(d)))
+    if s < 60 { return "now" }
+    if s < 3600 { return "\(s / 60)m" }
+    if s < 86400 { return "\(s / 3600)h" }
+    return "\(s / 86400)d"
+}
+
+/// One mark per state, told apart by shape as well as colour: a pulsing dot
+/// (running), an hourglass (running but quiet), an exclamation (needs you),
+/// an eye (ready for review), a check (finished), a ring (idle terminal).
 struct Indicator: View {
     let group: Group
     var quiet = false
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.colorSchemeContrast) private var systemContrast
+    @Environment(\.highContrast) private var forcedContrast
 
     var body: some View {
+        let p = Palette(scheme, contrast: forcedContrast || systemContrast == .increased)
         ZStack {
             switch group {
             case .yourTurn:
-                Circle().fill(Color.orange).frame(width: 8, height: 8)
+                Image(systemName: "exclamationmark.circle.fill")
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(p.needsYouMark, p.needsYou)
+                    .font(.system(size: 11, weight: .semibold))
             case .running where quiet:
                 // Still running, but nothing written for 10 minutes: no pulse.
-                Image(systemName: "hourglass").font(.system(size: 10, weight: .bold)).foregroundStyle(quietColor)
+                Image(systemName: "hourglass").font(.system(size: 10, weight: .bold)).foregroundStyle(p.quiet)
             case .running:
                 if staticIndicators {
-                    Circle().fill(Color.green.opacity(0.22)).frame(width: 16, height: 16)
-                    Circle().fill(Color.green).frame(width: 8, height: 8)
+                    Circle().fill(p.done.opacity(0.22)).frame(width: 16, height: 16)
+                    Circle().fill(p.done).frame(width: 8, height: 8)
                 } else {
                     PulsingDot().frame(width: 16, height: 16)
                 }
             case .justFinished, .done:
-                // Finished: a green check. Orange is kept for sessions that need you.
-                Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.green)
+                Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(p.done)
             case .review:
-                Circle().fill(Color.blue).frame(width: 8, height: 8)
+                Image(systemName: "eye").font(.system(size: 9, weight: .bold)).foregroundStyle(p.review)
             case .terminal:
                 Circle().strokeBorder(Color.secondary.opacity(0.7), lineWidth: 1.5).frame(width: 8, height: 8)
             }
@@ -1309,6 +1369,9 @@ struct SessionRow: View {
     let now: Date
     let open: (Row) -> Void
     var dimmed = false
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.colorSchemeContrast) private var systemContrast
+    private var contrast: Bool { systemContrast == .increased }
     @State private var hovering = false
 
     private var canOpen: Bool { row.link != nil }
@@ -1374,7 +1437,8 @@ struct SessionRow: View {
                         Text(line)
                             .font(.system(size: 12))
                             .foregroundStyle(row.group == .yourTurn ? AnyShapeStyle(.primary)
-                                             : quiet != nil ? AnyShapeStyle(quietColor) : AnyShapeStyle(.secondary))
+                                             : quiet != nil ? AnyShapeStyle(Palette(scheme, contrast: contrast).quiet)
+                                             : AnyShapeStyle(.secondary))
                             .lineLimit(row.group == .done ? 1 : 2)
                             .truncationMode(.tail)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1738,35 +1802,42 @@ struct CompactRow: View {
     let now: Date
     let open: (Row) -> Void
     @State private var hovering = false
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.highContrast) private var contrast
 
     var body: some View {
         let quiet = row.quiet(now: now)
+        let p = Palette(scheme, contrast: contrast)
         Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
                 Indicator(group: row.group, quiet: quiet != nil)
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(row.title).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.tail)
+                        Text(row.title).font(.system(size: 12, weight: contrast ? .bold : .medium))
+                            .lineLimit(1).truncationMode(.tail)
                         Spacer(minLength: 4)
+                        // One short style for every time: "4m 12s" ticking for running rows
+                        // (only while this window shows), "6m", "18h", "now" for the rest.
                         if row.group == .running {
-                            // Seconds tick only for running rows, only while this window shows.
                             TimelineView(.periodic(from: .now, by: 1)) { context in
                                 Text(stopwatch(since: row.since, now: context.date))
                                     .font(.system(size: 10).monospacedDigit())
-                                    .foregroundStyle(.tertiary)
+                                    .foregroundStyle(p.time)
                             }
                         } else {
-                            Text(elapsed(since: row.since, now: now) ?? "now")
+                            Text(compactAge(since: row.since, now: now))
                                 .font(.system(size: 10).monospacedDigit())
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(p.time)
                         }
                     }
                     if let quiet {
-                        Text([quietPhrase(quiet), row.activity].compactMap { $0 }.joined(separator: " · "))
-                            .font(.system(size: 11)).foregroundStyle(quietColor).lineLimit(1).truncationMode(.tail)
+                        Text([quietPhrase(quiet, compact: true), row.activity].compactMap { $0 }.joined(separator: " · "))
+                            .font(.system(size: 11)).foregroundStyle(p.quiet).lineLimit(1).truncationMode(.tail)
                     } else if let line = row.group == .yourTurn ? row.ask
                         : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil)) {
-                        Text(line).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                        Text(line).font(.system(size: 11))
+                            .foregroundStyle(row.group == .yourTurn ? Color.primary : p.text2)
+                            .lineLimit(1).truncationMode(.tail)
                     }
                 }
             }
@@ -1811,17 +1882,87 @@ enum WaitingWindow: Int, CaseIterable, Identifiable {
     }
 }
 
-/// The small window that stays on top: running sessions and the ones waiting
-/// for you, one line each. How far back "waiting" goes is set from its header.
+/// What the header's count chips narrow the list to.
+enum RowFilter: String, CaseIterable {
+    case running, needsYou, review
+}
+
+/// What the keep-on-top window lists, in order, and what its header counts.
+struct FloatingRows {
+    let running: [Row]
+    let waiting: [Row]
+    let review: [Row]
+    let finished: [Row]
+    /// Waiting or review sessions older than the header's time choice.
+    let hidden: Int
+
+    init(board: Board, now: Date, within limit: TimeInterval, finishedWithin: TimeInterval) {
+        let allWaiting = board.yourTurn + board.older
+        running = board.running
+        waiting = allWaiting.filter { now.timeIntervalSince($0.since) <= limit }
+        review = board.review.filter { now.timeIntervalSince($0.since) <= limit }
+        finished = board.justFinished + board.done.filter { now.timeIntervalSince($0.since) <= finishedWithin }
+        hidden = (allWaiting + board.review).filter { now.timeIntervalSince($0.since) > limit }.count
+    }
+
+    var all: [Row] { running + waiting + review + finished }
+
+    func rows(_ filter: RowFilter?) -> [Row] {
+        switch filter {
+        case .running?: return running
+        case .needsYou?: return waiting
+        case .review?: return review
+        case nil: return all
+        }
+    }
+
+    func count(_ filter: RowFilter) -> Int { rows(filter).count }
+
+    /// A filter whose rows have all gone shows everything again.
+    func effective(_ filter: RowFilter?) -> RowFilter? {
+        filter.flatMap { count($0) > 0 ? $0 : nil }
+    }
+}
+
+/// What the glow shows, for the window's header and pill: Got it appears
+/// while it is amber or green.
+final class GlowStatus: ObservableObject {
+    @Published var mode: GlowMode = .off
+    @Published var previewing = false
+}
+
+/// The keep-on-top window's frame at a new size: the top stays put, and so
+/// does whichever side is nearer its screen's edge, so collapsing to the pill
+/// keeps it in its corner.
+func anchoredFrame(_ old: NSRect, size: NSSize, screen: NSRect) -> NSRect {
+    let x = old.midX > screen.midX ? old.maxX - size.width : old.minX
+    return NSRect(x: x, y: old.maxY - size.height, width: size.width, height: size.height)
+}
+
+/// The small window that stays on top: running sessions, the ones waiting for
+/// you or ready for review, and recently finished ones, one line each. The
+/// header's counts filter the list; double-click the header for the pill.
 struct FloatingView: View {
     @ObservedObject var model: SessionModel
     let open: (Row) -> Void
     let unpin: () -> Void
     var refit: () -> Void = {}
     var glowChanged: (GlowPreview) -> Void = { _ in }
+    /// The Got it button: stops the green or amber without opening anything.
+    var acknowledge: () -> Void = {}
     /// Drawn between the window's material and the rows, so text stays crisp.
     var glow: RunningGlowView?
     @ObservedObject var layout = FloatingLayout()
+    @ObservedObject var status = GlowStatus()
+    /// Snapshots: draw as with Increase Contrast or Reduce Transparency on,
+    /// or with a filter chosen.
+    var forceContrast: Bool? = nil
+    var forceSolid: Bool? = nil
+    var initialFilter: RowFilter? = nil
+    @State private var filter: RowFilter?
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.colorSchemeContrast) private var systemContrast
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppStorage("keepOnTopWaitingHours") private var waitingHours = WaitingWindow.day.rawValue
     @AppStorage(GlowStyle.key) private var glowStyle = GlowStyle.aurora.rawValue
     @AppStorage(GlowColor.key) private var glowColor = GlowColor.red.rawValue
@@ -1832,77 +1973,124 @@ struct FloatingView: View {
     static let doneShownFor: TimeInterval = 2 * 3600
 
     private var window: WaitingWindow { WaitingWindow(rawValue: waitingHours) ?? .day }
+    private var contrast: Bool { forceContrast ?? (systemContrast == .increased) }
+    private var solid: Bool { forceSolid ?? reduceTransparency }
+    private var palette: Palette { Palette(scheme, contrast: contrast) }
+    private var showGotIt: Bool { !status.previewing && (status.mode == .done || status.mode == .needsYou) }
 
     var body: some View {
-        let board = Board(rows: model.rows, now: model.now)
-        let limit = window.hours * 3600
-        let allWaiting = board.yourTurn + board.older
-        let waiting = allWaiting.filter { model.now.timeIntervalSince($0.since) <= limit }
-        let review = board.review.filter { model.now.timeIntervalSince($0.since) <= limit }
-        let hiddenRows = (allWaiting + board.review).filter { model.now.timeIntervalSince($0.since) > limit }
-        let hidden = hiddenRows.count
-        let recentlyDone = board.done.filter { model.now.timeIntervalSince($0.since) <= Self.doneShownFor }
-        let rows = board.running + waiting + review + board.justFinished + recentlyDone
-        // With a height you set, every row shows and the list scrolls.
-        let fixedHeight = layout.height != nil
-        let shown = fixedHeight ? rows : Array(rows.prefix(Self.maxRows))
-        VStack(alignment: .leading, spacing: 0) {
-            header(running: board.running.count, waiting: waiting.count, review: review.count)
-            if rows.isEmpty {
-                Text(hidden > 0 ? "Nothing running or waiting in the \(window.menuTitle.lowercased())"
-                                : "Nothing running and nothing needs you")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
-            } else if fixedHeight {
-                ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(shown) { CompactRow(row: $0, now: model.now, open: open) }
-                    }
-                    .padding(.horizontal, 4)
-                    .padding(.bottom, 6)
-                }
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(shown) { CompactRow(row: $0, now: model.now, open: open) }
-                }
-                .padding(.horizontal, 4)
-                .padding(.bottom, rows.count > shown.count ? 2 : 6)
-            }
-            if rows.count > shown.count {
-                Text("\(rows.count - shown.count) more in the menu bar panel")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, rows.isEmpty ? 12 : 36)
-                    .padding(.bottom, 8)
-            }
+        let list = FloatingRows(board: Board(rows: model.rows, now: model.now), now: model.now,
+                                within: window.hours * 3600, finishedWithin: Self.doneShownFor)
+        SwiftUI.Group {
+            if layout.mini { pill(list) } else { full(list) }
         }
-        .frame(width: layout.width, height: layout.height, alignment: .top)
-        .background { if let glow { GlowBackdrop(view: glow) } }
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
+        .environment(\.highContrast, contrast)
+        .onAppear { if let initialFilter { filter = initialFilter } }
         .onChange(of: waitingHours) { refit() }
         .onChange(of: layout.width) { refit() }
         .onChange(of: layout.height) { refit() }
+        .onChange(of: layout.mini) { refit() }
+        .onChange(of: filter) { refit() }
+        .onChange(of: showGotIt) { refit() }
         .onChange(of: glowStyle) { glowChanged(.running) }
         .onChange(of: glowColor) { glowChanged(.running) }
         .onChange(of: needsYouGlow) { glowChanged(needsYouGlow ? .needsYou : .none) }
         .onChange(of: doneFlash) { glowChanged(doneFlash ? .done : .none) }
     }
 
-    private func header(running: Int, waiting: Int, review: Int) -> some View {
+    // MARK: The window
+
+    private func full(_ list: FloatingRows) -> some View {
+        let active = list.effective(filter)
+        let rows = list.rows(active)
+        // With a height you set, every row shows and the list scrolls.
+        let fixedHeight = layout.height != nil
+        let shown = fixedHeight ? rows : Array(rows.prefix(Self.maxRows))
+        return VStack(alignment: .leading, spacing: 0) {
+            header(list, filter: active)
+            if rows.isEmpty {
+                Text(list.hidden > 0 ? "Nothing running or waiting in the \(window.menuTitle.lowercased())"
+                                     : "Nothing running and nothing needs you")
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.text2)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+            } else if fixedHeight {
+                ScrollView { rowStack(shown) }
+            } else {
+                rowStack(shown)
+            }
+            if active != nil {
+                HStack(spacing: 6) {
+                    Text("Showing \(rows.count) of \(list.all.count)")
+                        .foregroundStyle(palette.time)
+                    Button("Show all") { filter = nil }
+                        .buttonStyle(.plain)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(palette.review)
+                        .pointerStyle(.link)
+                }
+                .font(.system(size: 11))
+                .padding(.leading, 36)
+                .padding(.bottom, 8)
+            } else if rows.count > shown.count {
+                Text("\(rows.count - shown.count) more in the menu bar panel")
+                    .font(.system(size: 10))
+                    .foregroundStyle(palette.time)
+                    .padding(.leading, 36)
+                    .padding(.bottom, 8)
+            }
+        }
+        .frame(width: layout.width, height: layout.height, alignment: .top)
+        .background { if let glow { GlowBackdrop(view: glow) } }
+        .background { surface(RoundedRectangle(cornerRadius: 12, style: .continuous)) }
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+    }
+
+    private func rowStack(_ rows: [Row]) -> some View {
+        VStack(spacing: 0) {
+            ForEach(rows) { CompactRow(row: $0, now: model.now, open: open) }
+        }
+        .padding(.horizontal, 4)
+        .padding(.bottom, 6)
+        // A soft band behind the text while a running glow moves under it.
+        .background {
+            if status.mode == .running && !contrast {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(scheme == .dark ? Color.black.opacity(0.28) : Color.white.opacity(0.5))
+                    .blur(radius: 8)
+            }
+        }
+    }
+
+    /// The window's background: the blurred material, or a solid one with
+    /// Reduce Transparency on.
+    @ViewBuilder private func surface<S: Shape>(_ shape: S) -> some View {
+        if solid {
+            shape.fill(Color(nsColor: .windowBackgroundColor))
+        } else {
+            shape.fill(.regularMaterial)
+        }
+    }
+
+    private func header(_ list: FloatingRows, filter active: RowFilter?) -> some View {
         HStack(spacing: 6) {
             Image(nsImage: claudeMark)
                 .renderingMode(.template)
                 .resizable()
                 .frame(width: 15, height: 15)
                 .foregroundStyle(.secondary)
-            Text(summary(running: running, waiting: waiting, review: review, compact: true))
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .help(summary(running: running, waiting: waiting, review: review))
+            // Full chips when they fit, then compact ones (mark and number),
+            // then a check for Got it, then only the chosen filter's chip: the
+            // header never grows past the window.
+            ViewThatFits(in: .horizontal) {
+                headerCounts(list, filter: active, fit: .full)
+                headerCounts(list, filter: active, fit: .compact)
+                headerCounts(list, filter: active, fit: .compactIcon)
+                headerCounts(list, filter: active, fit: .minimal)
+            }
+            .layoutPriority(1)
             Spacer(minLength: 4)
             glowMenu
             Menu {
@@ -1915,10 +2103,11 @@ struct FloatingView: View {
                     Text(window.short).font(.system(size: 10, weight: .medium).monospacedDigit())
                     Image(systemName: "chevron.down").font(.system(size: 7, weight: .bold))
                 }
-                .foregroundStyle(.secondary)
+                .foregroundStyle(contrast ? Color.primary : Color.secondary)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
                 .background(Capsule().fill(Color.primary.opacity(0.08)))
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.6 : 0)))
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
@@ -1929,7 +2118,7 @@ struct FloatingView: View {
             Button(action: unpin) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(contrast ? Color.primary : Color.secondary)
                     .frame(width: 16, height: 16)
                     .contentShape(Rectangle())
             }
@@ -1941,13 +2130,166 @@ struct FloatingView: View {
         .padding(.top, 9)
         .padding(.bottom, 4)
         .contentShape(Rectangle())
+        .onTapGesture(count: 2) { setMini(true) }
         .gesture(WindowDragGesture())   // drag the window by its header
+        .help("Double-click to shrink to a pill")
         .contextMenu {
+            Button("Shrink to Pill") { setMini(true) }
+            Divider()
             Button("Fit to Content") { layout.height = nil; layout.save() }
                 .disabled(layout.height == nil)
             Button("Default Size") { layout.width = FloatingLayout.defaultWidth; layout.height = nil; layout.save() }
                 .disabled(layout.height == nil && layout.width == FloatingLayout.defaultWidth)
         }
+    }
+
+    /// How much of the header's middle fits, widest first.
+    enum HeaderFit { case full, compact, compactIcon, minimal }
+
+    /// The counts as chips that filter the list, "All finished" or "All
+    /// caught up" when there are none, and Got it while it glows amber or green.
+    private func headerCounts(_ list: FloatingRows, filter active: RowFilter?, fit: HeaderFit) -> some View {
+        let all = RowFilter.allCases.filter { list.count($0) > 0 }
+        let kinds = fit == .minimal ? all.filter { $0 == active } : all
+        let compact = fit != .full
+        let iconGotIt = fit == .compactIcon || (fit == .minimal && !kinds.isEmpty)
+        let title = all.isEmpty || ((fit == .full || fit == .compact) && status.mode == .done)
+        return HStack(spacing: 5) {
+            if title {
+                Text(status.mode == .done ? "All finished" : "All caught up")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(status.mode == .done ? Color.primary : palette.time)
+                    .lineLimit(1)
+            }
+            ForEach(kinds, id: \.self) { kind in
+                countChip(kind, list.count(kind), selected: active == kind, compact: compact)
+            }
+            if showGotIt {
+                Button(action: acknowledge) {
+                    if iconGotIt {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(Color.primary)
+                            .frame(width: 20, height: 17)
+                            .background(Capsule().fill(Color.primary.opacity(0.16)))
+                            .contentShape(Capsule())
+                    } else {
+                        Text("Got it")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.primary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(Color.primary.opacity(0.16)))
+                            .contentShape(Capsule())
+                    }
+                }
+                .buttonStyle(.plain)
+                .pointerStyle(.link)
+                .help(status.mode == .done ? "Got it: stop the green, you've seen that everything finished"
+                                           : "Got it: stop the amber glow without opening the session")
+                .accessibilityLabel("Got it")
+            }
+        }
+        .fixedSize()
+    }
+
+    private func chipTitle(_ kind: RowFilter, _ n: Int) -> String {
+        switch kind {
+        case .running: return "\(n) running"
+        case .needsYou: return n == 1 ? "1 needs you" : "\(n) need you"
+        case .review: return "\(n) to review"
+        }
+    }
+
+    private func countChip(_ kind: RowFilter, _ n: Int, selected: Bool, compact: Bool) -> some View {
+        let p = palette
+        let tint = kind == .running ? p.done : kind == .needsYou ? p.needsYou : p.review
+        return Button {
+            filter = selected ? nil : kind
+        } label: {
+            HStack(spacing: 4) {
+                if compact {
+                    chipMark(kind)
+                    Text("\(n)")
+                } else {
+                    Text(chipTitle(kind, n))
+                }
+                if selected { Image(systemName: "xmark").font(.system(size: 7, weight: .bold)) }
+            }
+            .font(.system(size: 11, weight: .semibold).monospacedDigit())
+            .foregroundStyle(selected ? tint : Color.primary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(selected ? tint.opacity(0.2) : Color.clear))
+            .overlay(Capsule().strokeBorder(selected ? tint.opacity(0.7) : Color.primary.opacity(contrast ? 0.6 : 0.18)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .help(selected ? "Show all sessions" : "Show only: \(chipTitle(kind, n))")
+        .accessibilityLabel(selected ? "Showing only \(chipTitle(kind, n)); show all" : "Show only \(chipTitle(kind, n))")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    // MARK: The pill
+
+    /// Mini mode: just the counts, with the glow, in a pill. Double-click to expand.
+    private func pill(_ list: FloatingRows) -> some View {
+        let p = palette
+        let running = list.running.count, waiting = list.waiting.count
+        return HStack(spacing: 6) {
+            if running == 0 && status.mode == .done {
+                Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(p.done)
+                Text("All finished")
+            } else {
+                Image(nsImage: claudeMark)
+                    .renderingMode(.template)
+                    .resizable()
+                    .frame(width: 14, height: 14)
+                    .foregroundStyle(.secondary)
+                if running == 0 && waiting == 0 { Text("All caught up").foregroundStyle(p.time) }
+                if running > 0 { Text("\(running) running") }
+                if running > 0 && waiting > 0 { Text("·").foregroundStyle(p.time) }
+                if waiting > 0 {
+                    chipMark(.needsYou)
+                    Text("\(waiting)")
+                }
+            }
+        }
+        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .fixedSize()
+        .background { if let glow { GlowBackdrop(view: glow) } }
+        .background { surface(Capsule()) }
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+        .contentShape(Capsule())
+        .onTapGesture(count: 2) { setMini(false) }
+        .gesture(WindowDragGesture())
+        .help("Double-click to expand")
+        .contextMenu { Button("Expand") { setMini(false) } }
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Double-click to expand")
+    }
+
+    /// The small mark for a count: a dot, an exclamation or an eye.
+    @ViewBuilder private func chipMark(_ kind: RowFilter) -> some View {
+        switch kind {
+        case .running:
+            Circle().fill(palette.done).frame(width: 6, height: 6)
+        case .needsYou:
+            Image(systemName: "exclamationmark.circle.fill")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(palette.needsYouMark, palette.needsYou)
+                .font(.system(size: 10, weight: .semibold))
+        case .review:
+            Image(systemName: "eye").font(.system(size: 8, weight: .bold)).foregroundStyle(palette.review)
+        }
+    }
+
+    private func setMini(_ on: Bool) {
+        layout.mini = on
+        layout.save()
     }
 
     /// Picks how the window glows while a session runs, and in what colour.
@@ -1969,7 +2311,7 @@ struct FloatingView: View {
         } label: {
             Image(systemName: "sparkles")
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(contrast ? Color.primary : Color.secondary)
                 .frame(width: 16, height: 16)
                 .contentShape(Rectangle())
         }
@@ -1979,15 +2321,6 @@ struct FloatingView: View {
         .fixedSize()
         .help("Glow while a session runs: \(style.title)")
         .accessibilityLabel("Glow while a session runs: \(style.title)")
-    }
-
-    /// Compact: the review count only when nothing else is there, so the header fits.
-    private func summary(running: Int, waiting: Int, review: Int, compact: Bool = false) -> String {
-        var parts: [String] = []
-        if running > 0 { parts.append("\(running) running") }
-        if waiting > 0 { parts.append(waiting == 1 ? "1 needs you" : "\(waiting) need you") }
-        if review > 0 && (!compact || parts.isEmpty) { parts.append("\(review) to review") }
-        return parts.isEmpty ? "All caught up" : parts.joined(separator: " · ")
     }
 }
 
@@ -2168,6 +2501,16 @@ final class RunningGlowView: NSView {
     private var restart: DispatchWorkItem?
     /// Snapshots draw the effect moving even with Reduce Motion on.
     var forceMotion = false
+    /// Snapshots draw it as with Increase Contrast on (or off).
+    var forceContrast: Bool?
+    /// 12 for the window, 16 for the pill.
+    var cornerRadius: CGFloat = 12 {
+        didSet {
+            guard cornerRadius != oldValue else { return }
+            for layer in [clip, flashClip] { layer.cornerRadius = cornerRadius }
+            if mode != .off && highContrast { render(fade: false) }   // the ring follows the corners
+        }
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -2188,6 +2531,15 @@ final class RunningGlowView: NSView {
 
     private var scale: CGFloat { window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2 }
     private var still: Bool { !forceMotion && NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+    /// Increase Contrast: a steady 2 pt ring in the glow's colour instead of
+    /// moving light.
+    private var highContrast: Bool { forceContrast ?? NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast }
+    private var isLight: Bool { effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .aqua }
+
+    /// On a light background the glow colours are deepened, so they still show.
+    private func deepen(_ color: NSColor) -> NSColor {
+        isLight ? color.shifted(hue: 0, saturation: 0.08, brightness: -0.12) : color
+    }
     /// The effect is as it should be: moving, or meant to be still.
     private var settled: Bool { still || effect.probe.map { $0.animationKeys()?.isEmpty == false } ?? true }
 
@@ -2210,14 +2562,20 @@ final class RunningGlowView: NSView {
     /// On means running; for the snapshot and the Random check.
     func setActive(_ on: Bool) { setMode(on ? .running : .off) }
 
-    /// Reduce Motion was turned on or off.
+    /// Reduce Motion or Increase Contrast was turned on or off.
     func motionChanged() { render(fade: false) }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if mode != .off { render(fade: false) }
+    }
 
     /// The last running session stopped: a green glow sweeps across once and
     /// fades, in about 2 seconds (a plain fade with Reduce Motion on).
     func celebrate() {
         let b = bounds
-        let green = GlowColor.green.color
+        let green = deepen(GlowColor.green.color)
+        let calm = still || highContrast
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         flashClip.sublayers = nil
@@ -2230,7 +2588,7 @@ final class RunningGlowView: NSView {
         wash.colors = washColors(green)
         wash.locations = [0, 0.3, 0.5, 0.7, 1]
         layoutWash(wash, in: b)
-        wash.opacity = still ? 0 : 0.5
+        wash.opacity = calm ? 0 : 0.5
         holder.addSublayer(edge)
         holder.addSublayer(wash)
         flashClip.addSublayer(holder)
@@ -2238,7 +2596,7 @@ final class RunningGlowView: NSView {
         fade.repeatCount = 1
         CATransaction.setCompletionBlock { [weak holder] in holder?.removeFromSuperlayer() }
         holder.add(fade, forKey: "flash")
-        if !still {
+        if !calm {
             let sweep = loop("position.x", from: b.minX - 0.54 * b.width, to: b.minX + 1.54 * b.width,
                              duration: 1.4, autoreverses: false)
             sweep.repeatCount = 1
@@ -2251,7 +2609,8 @@ final class RunningGlowView: NSView {
     var state: [String: Any] {
         ["mode": mode.rawValue, "chosen": chosen.rawValue, "showing": showing.rawValue, "color": tint.rawValue,
          "active": mode != .off, "animating": effect.probe?.animationKeys()?.isEmpty == false, "still": still,
-         "flashing": flashClip.sublayers?.isEmpty == false,
+         "flashing": flashClip.sublayers?.isEmpty == false, "contrast": highContrast, "light": isLight,
+         "cornerRadius": Int(cornerRadius),
          "width": Int(bounds.width), "height": Int(bounds.height)]
     }
 
@@ -2294,7 +2653,7 @@ final class RunningGlowView: NSView {
     }
 
     private func updateShuffle() {
-        guard mode == .running, chosen == .random, !still else { stopShuffle(); return }
+        guard mode == .running, chosen == .random, !still, !highContrast else { stopShuffle(); return }
         guard shuffle == nil else { return }
         let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -2328,11 +2687,14 @@ final class RunningGlowView: NSView {
         }
         clip.sublayers = nil
         builtScale = scale
-        switch mode {
-        case .off: effect = Effect()
-        case .running: effect = build(showing)
-        case .needsYou: effect = buildNeedsYou()
-        case .done: effect = buildDone()
+        switch (mode, highContrast) {
+        case (.off, _): effect = Effect()
+        case (.running, false): effect = build(showing)
+        case (.needsYou, false): effect = buildNeedsYou()
+        case (.done, false): effect = buildDone()
+        case (.running, true): effect = chosen == .none ? Effect() : buildRing(deepen(tint.color))
+        case (.needsYou, true): effect = buildRing(deepen(needsYouColor))
+        case (.done, true): effect = buildRing(deepen(GlowColor.green.color), fill: 0.22)
         }
         effect.layout(bounds)
         clip.isHidden = mode == .off
@@ -2341,9 +2703,24 @@ final class RunningGlowView: NSView {
         updateShuffle()
     }
 
+    /// Increase Contrast: a steady ring just inside the edge (and, for "all
+    /// finished", a light fill), no motion.
+    private func buildRing(_ color: NSColor, fill: CGFloat = 0) -> Effect {
+        let ring = CALayer()
+        ring.borderWidth = 2
+        ring.borderColor = color.cgColor
+        ring.cornerRadius = cornerRadius
+        ring.cornerCurve = .continuous
+        if fill > 0 { ring.backgroundColor = color.withAlphaComponent(fill).cgColor }
+        clip.addSublayer(ring)
+        var effect = Effect()
+        effect.layout = { ring.frame = $0 }
+        return effect
+    }
+
     /// A session needs you: a slow amber breath along the edges.
     private func buildNeedsYou() -> Effect {
-        let edge = imageLayer(insetGlowImage(color: needsYouColor, blur: 30, spread: 3, scale: builtScale))
+        let edge = imageLayer(insetGlowImage(color: deepen(needsYouColor), blur: 30, spread: 3, scale: builtScale))
         clip.addSublayer(edge)
         var effect = Effect()
         effect.layout = { edge.frame = $0 }
@@ -2359,7 +2736,7 @@ final class RunningGlowView: NSView {
     /// Everything has finished: the whole window turns green behind the rows,
     /// a little stronger at the edges, breathing slowly.
     private func buildDone() -> Effect {
-        let green = GlowColor.green.color
+        let green = deepen(GlowColor.green.color)
         let holder = CALayer()
         let fill = CALayer()
         fill.backgroundColor = green.withAlphaComponent(0.34).cgColor
@@ -2398,7 +2775,7 @@ final class RunningGlowView: NSView {
     }
 
     private func build(_ style: GlowStyle) -> Effect {
-        let accent = tint.color
+        let accent = deepen(tint.color)
         let cg = accent.cgColor, clear = accent.withAlphaComponent(0).cgColor
         var effect = Effect()
         switch style {
@@ -2601,24 +2978,29 @@ final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
 final class FloatingLayout: ObservableObject {
     static let defaultWidth: CGFloat = 300
     static let minSize = NSSize(width: 220, height: 64)
-    private static let widthKey = "keepOnTopWidth", heightKey = "keepOnTopHeight"
+    private static let widthKey = "keepOnTopWidth", heightKey = "keepOnTopHeight", miniKey = "keepOnTopMini"
     @Published var width: CGFloat
     @Published var height: CGFloat?
+    /// Shrunk to a pill with just the counts.
+    @Published var mini: Bool
 
-    init(width: CGFloat = FloatingLayout.defaultWidth, height: CGFloat? = nil) {
+    init(width: CGFloat = FloatingLayout.defaultWidth, height: CGFloat? = nil, mini: Bool = false) {
         self.width = width
         self.height = height
+        self.mini = mini
     }
 
     static func saved() -> FloatingLayout {
         let d = UserDefaults.standard
         let w = d.double(forKey: widthKey), h = d.double(forKey: heightKey)
-        return FloatingLayout(width: w >= minSize.width ? w : defaultWidth, height: h >= minSize.height ? h : nil)
+        return FloatingLayout(width: w >= minSize.width ? w : defaultWidth, height: h >= minSize.height ? h : nil,
+                              mini: d.bool(forKey: miniKey))
     }
 
     func save() {
         UserDefaults.standard.set(Double(width), forKey: Self.widthKey)
         UserDefaults.standard.set(Double(height ?? 0), forKey: Self.heightKey)
+        UserDefaults.standard.set(mini, forKey: Self.miniKey)
     }
 }
 
@@ -2781,6 +3163,8 @@ final class FloatingController {
     /// Everything has finished and you have not opened a session since.
     private var finished = false
     private let layout = FloatingLayout.saved()
+    private let status = GlowStatus()
+    private var edges: ResizeEdgesView?
     /// While an edge is being dragged, the window follows the mouse, not the rows.
     private var resizing = false
     private static let shownKey = "keepOnTop"
@@ -2826,6 +3210,16 @@ final class FloatingController {
         finished = decision.finished
         if decision.flash { glow.celebrate() }
         glow.setMode(decision.mode)
+        if status.mode != decision.mode { status.mode = decision.mode }
+        if status.previewing != (previewing != nil) { status.previewing = previewing != nil }
+    }
+
+    /// Got it: the amber and the green stop until something new happens,
+    /// without opening any session.
+    private func acknowledgeGlow() {
+        finished = false
+        model.acknowledge(model.freshNeedsYou(Board(rows: model.rows, now: model.now)))
+        updateGlow()
     }
 
     private func glowChanged(_ what: GlowPreview) {
@@ -2881,13 +3275,13 @@ final class FloatingController {
             guard let self, let panel = self.panel, let host = self.host else { return }
             self.updateGlow()
             guard !self.resizing else { return }
+            // The pill: rounder glow, and no resizing.
+            self.glow.cornerRadius = self.layout.mini ? 16 : 12
+            self.edges?.isHidden = self.layout.mini
             let size = host.fittingSize
-            var frame = panel.frame
-            guard frame.size != size else { return }
-            let top = frame.maxY
-            frame.size = size
-            frame.origin.y = top - size.height
-            panel.setFrame(frame, display: true)
+            guard panel.frame.size != size else { return }
+            let screen = panel.screen?.frame ?? NSScreen.main?.frame ?? panel.frame
+            panel.setFrame(anchoredFrame(panel.frame, size: size, screen: screen), display: true)
         }
     }
 
@@ -2917,8 +3311,10 @@ final class FloatingController {
                                 unpin: { [weak self] in self?.hide() },
                                 refit: { [weak self] in self?.fitToContent() },
                                 glowChanged: { [weak self] in self?.glowChanged($0) },
+                                acknowledge: { [weak self] in self?.acknowledgeGlow() },
                                 glow: glow,
-                                layout: layout)
+                                layout: layout,
+                                status: status)
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
         let panel = KeepOnTopPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -2931,10 +3327,11 @@ final class FloatingController {
         edges.autoresizingMask = [.width, .height]
         edges.onResize = { [weak self] frame, moved in self?.userResized(to: frame, edges: moved) }
         edges.onResizeEnd = { [weak self] in self?.resizeEnded() }
+        edges.isHidden = layout.mini
         content.addSubview(host)
         content.addSubview(edges)
+        self.edges = edges
         panel.contentView = content
-        panel.minSize = FloatingLayout.minSize
         panel.isFloatingPanel = true
         panel.level = .statusBar                      // above full-screen windows
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -3190,7 +3587,7 @@ func snapshotLayout() -> FloatingLayout {
     let parts = (argument(after: "--size") ?? "").split(separator: "x").map(String.init)
     let width = parts.first.flatMap(Double.init).map { CGFloat($0) } ?? FloatingLayout.defaultWidth
     let height = parts.count > 1 ? Double(parts[1]).map { CGFloat($0) } : nil
-    return FloatingLayout(width: width, height: height)
+    return FloatingLayout(width: width, height: height, mini: arguments.contains("--mini"))
 }
 
 /// Renders the panel and the menu bar item to PNG files.
@@ -3207,9 +3604,19 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     let glow: RunningGlowView? = floating && (glowFlags
         || !Board(rows: model.rows, now: Date()).running.isEmpty) ? RunningGlowView(frame: .zero) : nil
     glow?.forceMotion = true
+    // --contrast and --solid: as with Increase Contrast and Reduce Transparency;
+    // --filter running|needsYou|review: a header chip chosen; --mini: the pill.
+    let contrast = arguments.contains("--contrast")
+    glow?.forceContrast = contrast
+    if arguments.contains("--mini") { glow?.cornerRadius = 16 }
+    let status = GlowStatus()
+    status.mode = arguments.contains("--done") ? .done : arguments.contains("--attention") ? .needsYou
+        : glow != nil && !arguments.contains("--flash") ? .running : .off
     let host: NSView = floating
         ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {}, glow: glow,
-                                               layout: snapshotLayout())
+                                               layout: snapshotLayout(), status: status,
+                                               forceContrast: contrast, forceSolid: arguments.contains("--solid"),
+                                               initialFilter: argument(after: "--filter").flatMap(RowFilter.init(rawValue:)))
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
             .background(Color(nsColor: .windowBackgroundColor)))
@@ -3233,14 +3640,14 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     RunLoop.main.run(until: Date().addingTimeInterval(0.4))
     guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { exit(1) }
     host.cacheDisplay(in: host.bounds, to: rep)
-    // The glow layer is not drawn by cacheDisplay. Screen blending puts it
-    // over the dark background while leaving light text about as it is,
-    // close to how it shows behind the rows in the real window.
+    // The glow layer is not drawn by cacheDisplay. Screen blending (multiply
+    // in light mode) puts it over the background while leaving the text about
+    // as it is, close to how it shows behind the rows in the real window.
     if let glow, let layer = glow.layer?.presentation() ?? glow.layer,
        let context = NSGraphicsContext(bitmapImageRep: rep) {
         let place = glow.convert(glow.bounds, to: nil)
         context.cgContext.translateBy(x: place.minX, y: place.minY)
-        context.cgContext.setBlendMode(.screen)
+        context.cgContext.setBlendMode(dark ? .screen : .multiply)
         layer.render(in: context.cgContext)
         context.flushGraphics()
     }
@@ -3446,6 +3853,25 @@ func runSelfTest() {
     check("never past the screen", resizedFrame(start, edges: .right, delta: NSPoint(x: 5000, y: 0), minSize: minimum,
                                                 limit: screen).maxX == 1440)
 
+    check("short ages", [30.0, 360, 18 * 3600, 3 * 86400].map { compactAge(since: now.addingTimeInterval(-$0), now: now) }
+                        == ["now", "6m", "18h", "3d"])
+    let waitingRow = Row(id: "w1", group: .yourTurn, title: "w", context: "", since: now.addingTimeInterval(-300))
+    let list = FloatingRows(board: Board(rows: [waitingRow, running], now: now), now: now, within: 86400,
+                            finishedWithin: 7200)
+    check("filter to needs you", list.rows(list.effective(.needsYou)).map(\.id) == ["w1"])
+    check("a filter with nothing left shows everything", list.effective(.review) == nil && list.rows(nil).count == 2)
+    let acknowledging = SessionModel()
+    acknowledging.now = now
+    acknowledging.acknowledge([waitingRow])
+    check("Got it stops the amber without opening", acknowledging.freshNeedsYou(Board(rows: [waitingRow], now: now)).isEmpty)
+    let screenFrame = NSRect(x: 0, y: 0, width: 1440, height: 900)
+    check("shrinking on the right keeps the right edge",
+          anchoredFrame(NSRect(x: 1100, y: 600, width: 320, height: 200), size: NSSize(width: 150, height: 32),
+                        screen: screenFrame) == NSRect(x: 1270, y: 768, width: 150, height: 32))
+    check("shrinking on the left keeps the left edge",
+          anchoredFrame(NSRect(x: 40, y: 600, width: 320, height: 200), size: NSSize(width: 150, height: 32),
+                        screen: screenFrame) == NSRect(x: 40, y: 768, width: 150, height: 32))
+
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
 }
@@ -3478,6 +3904,49 @@ func runGlowCycle(seconds: Int) {
     exit(0)
 }
 
+/// Double-clicks the keep-on-top window's header, then the pill, with
+/// synthetic clicks in an off-screen window, and reports the mini setting.
+func runGestureCheck() {
+    _ = NSApplication.shared
+    let model = SessionModel()
+    model.rows = sampleRows(now: Date())
+    let layout = FloatingLayout()
+    let host = FirstClickHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {}, layout: layout))
+    host.frame = NSRect(origin: .zero, size: host.fittingSize)
+    let panel = KeepOnTopPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel],
+                               backing: .buffered, defer: false)
+    panel.contentView = host
+    panel.setFrameOrigin(NSPoint(x: -6000, y: -6000))
+    panel.orderFrontRegardless()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    func doubleClick(at point: NSPoint) {
+        for count in 1...2 {
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                               timestamp: ProcessInfo.processInfo.systemUptime,
+                                               windowNumber: panel.windowNumber, context: nil, eventNumber: 0,
+                                               clickCount: count, pressure: type == .leftMouseDown ? 1 : 0)!
+                panel.sendEvent(event)
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+    }
+    // The header's empty middle: right of the chips, left of the menus.
+    doubleClick(at: NSPoint(x: host.frame.width - 110, y: host.frame.height - 16))
+    print("after double-clicking the header: mini =", layout.mini)
+    host.frame = NSRect(origin: .zero, size: host.fittingSize)
+    panel.setContentSize(host.frame.size)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    print("pill size:", NSStringFromSize(host.frame.size))
+    doubleClick(at: NSPoint(x: host.frame.width / 2, y: host.frame.height / 2))
+    print("after double-clicking the pill: mini =", layout.mini)
+    exit(0)
+}
+
+if arguments.contains("--gesture-check") {
+    runGestureCheck()
+}
 if arguments.contains("--self-test") {
     runSelfTest()
 }
