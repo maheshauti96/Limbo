@@ -865,6 +865,92 @@ func ago(_ d: Date, _ now: Date) -> String {
     elapsed(since: d, now: now).map { "\($0) ago" } ?? "just now"
 }
 
+/// Set by --snapshot: layer animations don't show in a cached drawing, so
+/// pictures use the plain dot.
+var staticIndicators = false
+
+/// The running dot: a ring that ripples out and fades every 1.6 s while the
+/// dot breathes. Core Animation runs it in the window server at a capped frame
+/// rate, so the app does no work per frame. Still with Reduce Motion on.
+final class PulseView: NSView {
+    private let ring = CALayer()
+    private let dot = CALayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
+        wantsLayer = true
+        layer?.addSublayer(ring)
+        layer?.addSublayer(dot)
+        ring.frame = CGRect(x: 0, y: 0, width: 16, height: 16)
+        ring.cornerRadius = 8
+        dot.frame = CGRect(x: 4, y: 4, width: 8, height: 8)
+        dot.cornerRadius = 4
+        applyColors()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 16, height: 16) }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateAnimation()
+    }
+
+    private func applyColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            ring.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.35).cgColor
+            dot.backgroundColor = NSColor.systemGreen.cgColor
+        }
+    }
+
+    func updateAnimation() {
+        let still = window == nil || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if still {
+            ring.removeAllAnimations()
+            dot.removeAllAnimations()
+            ring.opacity = 0.65
+            return
+        }
+        guard ring.animation(forKey: "ripple") == nil else { return }
+        let rate = CAFrameRateRange(minimum: 10, maximum: 20, preferred: 15)
+        let grow = CABasicAnimation(keyPath: "transform.scale")
+        grow.fromValue = 0.5
+        grow.toValue = 1.15
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.9
+        fade.toValue = 0
+        let ripple = CAAnimationGroup()
+        ripple.animations = [grow, fade]
+        ripple.duration = 1.6
+        ripple.repeatCount = .infinity
+        ripple.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ripple.isRemovedOnCompletion = false
+        ripple.preferredFrameRateRange = rate
+        ring.add(ripple, forKey: "ripple")
+        let breathe = CABasicAnimation(keyPath: "opacity")
+        breathe.fromValue = 1
+        breathe.toValue = 0.45
+        breathe.duration = 0.8
+        breathe.autoreverses = true
+        breathe.repeatCount = .infinity
+        breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        breathe.isRemovedOnCompletion = false
+        breathe.preferredFrameRateRange = rate
+        dot.add(breathe, forKey: "breathe")
+    }
+}
+
+struct PulsingDot: NSViewRepresentable {
+    func makeNSView(context: Context) -> PulseView { PulseView(frame: .zero) }
+    func updateNSView(_ view: PulseView, context: Context) { view.updateAnimation() }
+}
+
 struct Indicator: View {
     let group: Group
 
@@ -874,14 +960,17 @@ struct Indicator: View {
             case .yourTurn:
                 Circle().fill(Color.orange).frame(width: 8, height: 8)
             case .running:
-                Circle().fill(Color.green.opacity(0.22)).frame(width: 16, height: 16)
-                Circle().fill(Color.green).frame(width: 8, height: 8)
-            case .justFinished:
-                Circle().strokeBorder(Color.orange, lineWidth: 1.5).frame(width: 8, height: 8)
+                if staticIndicators {
+                    Circle().fill(Color.green.opacity(0.22)).frame(width: 16, height: 16)
+                    Circle().fill(Color.green).frame(width: 8, height: 8)
+                } else {
+                    PulsingDot().frame(width: 16, height: 16)
+                }
+            case .justFinished, .done:
+                // Finished: a green check. Orange is kept for sessions that need you.
+                Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.green)
             case .review:
                 Circle().fill(Color.blue).frame(width: 8, height: 8)
-            case .done:
-                Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.tertiary)
             case .terminal:
                 Circle().strokeBorder(Color.secondary.opacity(0.7), lineWidth: 1.5).frame(width: 8, height: 8)
             }
@@ -1378,6 +1467,8 @@ struct FloatingView: View {
     var refit: () -> Void = {}
     @AppStorage("keepOnTopWaitingHours") private var waitingHours = WaitingWindow.day.rawValue
     static let maxRows = 8
+    /// Finished sessions stay listed, with a green check, for this long.
+    static let doneShownFor: TimeInterval = 30 * 60
 
     private var window: WaitingWindow { WaitingWindow(rawValue: waitingHours) ?? .day }
 
@@ -1387,7 +1478,8 @@ struct FloatingView: View {
         let allWaiting = board.yourTurn + board.older
         let waiting = allWaiting.filter { model.now.timeIntervalSince($0.since) <= limit }
         let hidden = allWaiting.count - waiting.count
-        let rows = board.running + waiting + board.justFinished
+        let recentlyDone = board.done.filter { model.now.timeIntervalSince($0.since) <= Self.doneShownFor }
+        let rows = board.running + waiting + board.justFinished + recentlyDone
         let shown = Array(rows.prefix(Self.maxRows))
         VStack(alignment: .leading, spacing: 0) {
             header(running: board.running.count, waiting: waiting.count)
@@ -1810,6 +1902,7 @@ func sampleRows(now: Date) -> [Row] {
 /// Renders the panel and the menu bar item to PNG files.
 func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limit: Int?) {
     _ = NSApplication.shared
+    staticIndicators = true
     let model = SessionModel()
     let rows = sample ? sampleRows(now: Date()) : SessionEngine.scanOnce()
     model.rows = limit.map { Array(rows.prefix($0)) } ?? rows
