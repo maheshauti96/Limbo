@@ -1714,7 +1714,11 @@ struct FloatingView: View {
         let allWaiting = board.yourTurn + board.older
         let waiting = allWaiting.filter { model.now.timeIntervalSince($0.since) <= limit }
         let review = board.review.filter { model.now.timeIntervalSince($0.since) <= limit }
-        let hidden = allWaiting.count - waiting.count + board.review.count - review.count
+        let hiddenRows = (allWaiting + board.review).filter { model.now.timeIntervalSince($0.since) > limit }
+        let hidden = hiddenRows.count
+        // The shortest choice that shows every hidden session.
+        let oldest = hiddenRows.map { model.now.timeIntervalSince($0.since) }.max() ?? 0
+        let showAll = WaitingWindow.allCases.first { $0.hours * 3600 >= oldest } ?? .week
         let recentlyDone = board.done.filter { model.now.timeIntervalSince($0.since) <= Self.doneShownFor }
         let rows = board.running + waiting + review + board.justFinished + recentlyDone
         let shown = Array(rows.prefix(Self.maxRows))
@@ -1734,25 +1738,36 @@ struct FloatingView: View {
                 .padding(.horizontal, 4)
                 .padding(.bottom, rows.count > shown.count || hidden > 0 ? 2 : 6)
             }
-            if rows.count > shown.count || hidden > 0 {
-                Text(footer(more: rows.count - shown.count, hidden: hidden))
+            if rows.count > shown.count {
+                Text("\(rows.count - shown.count) more in the menu bar panel")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .padding(.leading, rows.isEmpty ? 12 : 36)
-                    .padding(.bottom, 8)
+                    .padding(.bottom, hidden > 0 ? 2 : 8)
+            }
+            if hidden > 0 {
+                // "5 older sessions hidden, waiting on you over 1 hr. Show": a click
+                // widens the filter just enough to show them.
+                Button { waitingHours = showAll.rawValue } label: {
+                    Text("\(hidden == 1 ? "1 older session waiting on you. " : "\(hidden) older sessions waiting on you. ")\(Text("Show").foregroundColor(.accentColor))")
+                        .foregroundColor(.secondary)
+                        .font(.system(size: 10))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Hidden because they have waited over \(window.short). Show sessions from the \(showAll.menuTitle.lowercased()).")
+                .padding(.leading, rows.isEmpty ? 12 : 36)
+                .padding(.trailing, 12)
+                .padding(.bottom, 8)
             }
         }
         .frame(width: 300)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
         .onChange(of: waitingHours) { refit() }
-    }
-
-    private func footer(more: Int, hidden: Int) -> String {
-        var parts: [String] = []
-        if more > 0 { parts.append("\(more) more in the menu bar panel") }
-        if hidden > 0 { parts.append("\(hidden) more need you, from over \(window.short) ago") }
-        return parts.joined(separator: " · ")
     }
 
     private func header(running: Int, waiting: Int, review: Int) -> some View {
