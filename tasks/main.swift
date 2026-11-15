@@ -1811,54 +1811,45 @@ struct FloatingView: View {
     }
 }
 
-/// The lights' colours around the edge (0...1 around the circle): two bright
-/// arcs on opposite sides, each fading out both ways, so they read the same in
-/// either direction.
-let glowStops: [(Double, Double)] = [
-    (0, 0), (0.10, 0), (0.21, 0.85), (0.25, 1), (0.29, 0.85), (0.40, 0),
-    (0.60, 0), (0.71, 0.85), (0.75, 1), (0.79, 0.85), (0.90, 0), (1, 0),
+/// The ambient border's colours around the edge (0...1 around the circle):
+/// red, coral and rose with gentle changes in strength, no sharp highlights.
+/// (location, red, green, blue, alpha)
+let ambientStops: [(Double, Double, Double, Double, Double)] = [
+    (0.00, 1.00, 0.23, 0.19, 0.80),   // red
+    (0.20, 1.00, 0.45, 0.35, 0.45),   // coral, softer
+    (0.40, 0.95, 0.25, 0.45, 0.75),   // rose
+    (0.60, 1.00, 0.30, 0.22, 0.40),   // red, softer
+    (0.80, 1.00, 0.50, 0.38, 0.75),   // coral
+    (1.00, 1.00, 0.23, 0.19, 0.80),   // back to red
 ]
 
-/// While any session runs: a dim red outline around the whole window, two
-/// bright 3 pt lights circling it every 2.4 s and a softer 8 pt glow behind
-/// them. All of it disappears the moment no session runs. Conic gradients
-/// masked to rings with the window's continuous corners, rotated by Core
-/// Animation at a capped frame rate, so the app does no work per frame. With
-/// Reduce Motion on it is a still red outline.
+/// While any session runs: one soft band of red tones flowing slowly around
+/// the window's edge; gone the moment no session runs. A conic gradient masked
+/// to a 4 pt ring with the window's continuous corners, rotated by Core
+/// Animation at a capped frame rate, so the app does no work per frame. Still
+/// with Reduce Motion on.
 final class GlowBorderView: NSView {
-    private let base = CALayer()
-    private let haloContainer = CALayer()
-    private let halo = CAGradientLayer()
-    private let haloRing = CALayer()
-    private let cometContainer = CALayer()
-    private let comet = CAGradientLayer()
-    private let cometRing = CALayer()
+    private let container = CALayer()
+    private let gradient = CAGradientLayer()
+    private let ring = CALayer()
     private var running = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        for ring in [base, haloRing, cometRing] {
-            ring.cornerRadius = 12
-            ring.cornerCurve = .continuous
-        }
-        base.borderWidth = 1.5
-        haloRing.borderWidth = 8
-        haloRing.borderColor = NSColor.black.cgColor
-        cometRing.borderWidth = 3
-        cometRing.borderColor = NSColor.black.cgColor
-        for (container, gradient, ring) in [(haloContainer, halo, haloRing), (cometContainer, comet, cometRing)] {
-            container.addSublayer(gradient)
-            container.mask = ring
-            gradient.type = .conic
-            gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
-            gradient.endPoint = CGPoint(x: 0.5, y: 0)
-        }
-        layer?.addSublayer(base)
-        layer?.addSublayer(haloContainer)
-        layer?.addSublayer(cometContainer)
-        setLayersHidden(true)
-        applyColors()
+        ring.cornerRadius = 12
+        ring.cornerCurve = .continuous
+        ring.borderWidth = 4
+        ring.borderColor = NSColor.black.cgColor
+        container.addSublayer(gradient)
+        container.mask = ring
+        gradient.type = .conic
+        gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
+        gradient.endPoint = CGPoint(x: 0.5, y: 0)
+        gradient.colors = ambientStops.map { CGColor(red: $0.1, green: $0.2, blue: $0.3, alpha: $0.4) }
+        gradient.locations = ambientStops.map { NSNumber(value: $0.0) }
+        layer?.addSublayer(container)
+        container.isHidden = true
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1870,62 +1861,31 @@ final class GlowBorderView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        container.frame = bounds
+        ring.frame = bounds
         let side = hypot(bounds.width, bounds.height)    // covers the corners while turning
-        for item in [base, haloContainer, haloRing, cometContainer, cometRing] { item.frame = bounds }
-        for gradient in [halo, comet] {
-            gradient.bounds = CGRect(x: 0, y: 0, width: side, height: side)
-            gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
-        }
+        gradient.bounds = CGRect(x: 0, y: 0, width: side, height: side)
+        gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
         CATransaction.commit()
     }
 
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyColors()
-    }
-
-    private func setLayersHidden(_ hidden: Bool) {
-        base.isHidden = hidden
-        let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        haloContainer.isHidden = hidden || still
-        cometContainer.isHidden = hidden || still
-    }
-
-    private func applyColors() {
-        let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            let green = NSColor.systemRed   // the border colour
-            base.borderColor = green.withAlphaComponent(still ? 0.8 : 0.45).cgColor
-            comet.colors = glowStops.map { green.withAlphaComponent($0.1).cgColor }
-            comet.locations = glowStops.map { NSNumber(value: $0.0) }
-            halo.colors = glowStops.map { green.withAlphaComponent($0.1 * 0.35).cgColor }
-            halo.locations = glowStops.map { NSNumber(value: $0.0) }
-        }
-    }
-
     func setRunning(_ isRunning: Bool) {
-        let animating = comet.animation(forKey: "travel") != nil
+        let animating = gradient.animation(forKey: "flow") != nil
         guard isRunning != running || (isRunning && !animating) else { return }
         running = isRunning
-        applyColors()
-        setLayersHidden(!isRunning)
+        container.isHidden = !isRunning
         guard isRunning, window != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            halo.removeAllAnimations()
-            comet.removeAllAnimations()
+            gradient.removeAllAnimations()
             return
         }
-        let travel = CABasicAnimation(keyPath: "transform.rotation.z")
-        travel.fromValue = 0
-        travel.toValue = -2 * Double.pi
-        travel.duration = 2.4
-        travel.repeatCount = .infinity
-        travel.isRemovedOnCompletion = false
-        travel.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 24)
-        // Same start time, so the glow stays under the lights.
-        let now = CACurrentMediaTime()
-        travel.beginTime = now
-        halo.add(travel, forKey: "travel")
-        comet.add(travel, forKey: "travel")
+        let flow = CABasicAnimation(keyPath: "transform.rotation.z")
+        flow.fromValue = 0
+        flow.toValue = -2 * Double.pi
+        flow.duration = 4
+        flow.repeatCount = .infinity
+        flow.isRemovedOnCompletion = false
+        flow.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 24)
+        gradient.add(flow, forKey: "flow")
     }
 }
 
@@ -2283,18 +2243,11 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     let host: NSView = arguments.contains("--floating")
         ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {})
             .overlay(
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.red.opacity(0.45), lineWidth: 1.5)
-                    RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
-                        AngularGradient(stops: glowStops.map { .init(color: Color.red.opacity($0.1 * 0.35), location: $0.0) },
-                                        center: .center, angle: .degrees(-60)),
-                        lineWidth: 8)
-                    RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
-                        AngularGradient(stops: glowStops.map { .init(color: Color.red.opacity($0.1), location: $0.0) },
-                                        center: .center, angle: .degrees(-60)),
-                        lineWidth: 3)
-                }
+                RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(
+                    AngularGradient(stops: ambientStops.map {
+                        .init(color: Color(red: $0.1, green: $0.2, blue: $0.3).opacity($0.4), location: $0.0)
+                    }, center: .center, angle: .degrees(-90)),
+                    lineWidth: 4)
                 .opacity(Board(rows: model.rows, now: Date()).running.isEmpty ? 0 : 1))
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
