@@ -1184,25 +1184,36 @@ func ago(_ d: Date, _ now: Date) -> String {
 }
 
 /// Set by --snapshot: layer animations don't show in a cached drawing, so
-/// pictures use the plain dot.
+/// pictures use the still ring and plain status text.
 var staticIndicators = false
 
-/// The running dot: a ring that ripples out and fades every 1.6 s while the
-/// dot breathes. Core Animation runs it in the window server at a capped frame
-/// rate, so the app does no work per frame. Still with Reduce Motion on.
-final class PulseView: NSView {
-    private let ring = CALayer()
-    private let dot = CALayer()
+/// The running mark: a ring whose arc turns once a second. Core Animation
+/// turns it in the window server at a capped frame rate, so the app does no
+/// work per frame. Still with Reduce Motion on.
+final class SpinnerView: NSView {
+    private let track = CAShapeLayer()
+    private let arc = CAShapeLayer()
+    var color: NSColor = .systemBlue {
+        didSet { if color != oldValue { applyColors() } }
+    }
 
     override init(frame: NSRect) {
         super.init(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
         wantsLayer = true
-        layer?.addSublayer(ring)
-        layer?.addSublayer(dot)
-        ring.frame = CGRect(x: 0, y: 0, width: 16, height: 16)
-        ring.cornerRadius = 8
-        dot.frame = CGRect(x: 4, y: 4, width: 8, height: 8)
-        dot.cornerRadius = 4
+        // Set up as is, or the arc animates in from a full ring.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        let ring = CGPath(ellipseIn: CGRect(x: 2.5, y: 2.5, width: 11, height: 11), transform: nil)
+        for shape in [track, arc] {
+            shape.frame = CGRect(x: 0, y: 0, width: 16, height: 16)
+            shape.path = ring
+            shape.fillColor = nil
+            shape.lineWidth = 2
+            shape.lineCap = .round
+            layer?.addSublayer(shape)
+        }
+        arc.strokeEnd = 0.3
         applyColors()
     }
 
@@ -1210,63 +1221,198 @@ final class PulseView: NSView {
 
     override var intrinsicContentSize: NSSize { NSSize(width: 16, height: 16) }
 
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyColors()
-    }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }   // clicks go to the row
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        applyScale()
         updateAnimation()
     }
 
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        applyScale()
+    }
+
+    /// Shape layers draw at their own scale: match the screen, or the ring blurs.
+    private func applyScale() {
+        let scale = window?.backingScaleFactor ?? 2
+        track.contentsScale = scale
+        arc.contentsScale = scale
+    }
+
     private func applyColors() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            ring.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.35).cgColor
-            dot.backgroundColor = NSColor.systemGreen.cgColor
-        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        track.strokeColor = color.withAlphaComponent(0.24).cgColor
+        arc.strokeColor = color.cgColor
+        CATransaction.commit()
     }
 
     func updateAnimation() {
         let still = window == nil || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         if still {
-            ring.removeAllAnimations()
-            dot.removeAllAnimations()
-            ring.opacity = 0.65
+            arc.removeAllAnimations()
             return
         }
-        guard ring.animation(forKey: "ripple") == nil else { return }
-        let rate = CAFrameRateRange(minimum: 10, maximum: 20, preferred: 15)
-        let grow = CABasicAnimation(keyPath: "transform.scale")
-        grow.fromValue = 0.5
-        grow.toValue = 1.15
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = 0.9
-        fade.toValue = 0
-        let ripple = CAAnimationGroup()
-        ripple.animations = [grow, fade]
-        ripple.duration = 1.6
-        ripple.repeatCount = .infinity
-        ripple.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        ripple.isRemovedOnCompletion = false
-        ripple.preferredFrameRateRange = rate
-        ring.add(ripple, forKey: "ripple")
-        let breathe = CABasicAnimation(keyPath: "opacity")
-        breathe.fromValue = 1
-        breathe.toValue = 0.45
-        breathe.duration = 0.8
-        breathe.autoreverses = true
-        breathe.repeatCount = .infinity
-        breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        breathe.isRemovedOnCompletion = false
-        breathe.preferredFrameRateRange = rate
-        dot.add(breathe, forKey: "breathe")
+        guard arc.animation(forKey: "spin") == nil else { return }
+        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+        spin.fromValue = 0
+        spin.toValue = -2 * Double.pi   // clockwise
+        spin.duration = 1
+        spin.repeatCount = .infinity
+        spin.isRemovedOnCompletion = false
+        spin.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 24)
+        arc.add(spin, forKey: "spin")
     }
 }
 
-struct PulsingDot: NSViewRepresentable {
-    func makeNSView(context: Context) -> PulseView { PulseView(frame: .zero) }
-    func updateNSView(_ view: PulseView, context: Context) { view.updateAnimation() }
+struct RunningSpinner: NSViewRepresentable {
+    let color: Color
+    func makeNSView(context: Context) -> SpinnerView { SpinnerView(frame: .zero) }
+    func updateNSView(_ view: SpinnerView, context: Context) {
+        view.color = NSColor(color)
+        view.updateAnimation()
+    }
+}
+
+/// A running row's status line with a light band sweeping across it, like
+/// Claude's own "Thinking": a brighter copy of the text shows through a
+/// gradient mask that Core Animation moves in the window server, so the app
+/// does no work per frame. The label spans the row, so a new status doesn't
+/// restart the sweep. Plain text with Reduce Motion on.
+final class ShimmerLabel: NSView {
+    private let base = CATextLayer()
+    private let bright = CATextLayer()
+    private let band = CAGradientLayer()
+    private static let bandWidth: CGFloat = 60
+    private var sweptWidth: CGFloat = -1
+    var text = "" { didSet { if text != oldValue { applyText() } } }
+    var font = NSFont.systemFont(ofSize: 11) { didSet { if font != oldValue { applyText() } } }
+    var baseColor = NSColor.secondaryLabelColor { didSet { if baseColor != oldValue { applyText() } } }
+    var brightColor = NSColor.labelColor { didSet { if brightColor != oldValue { applyText() } } }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        layer = CALayer()   // layer-hosting: the layers below are this view's own
+        wantsLayer = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        for line in [base, bright] {
+            line.isWrapped = false
+            line.truncationMode = .end
+            line.alignmentMode = .left
+            layer?.addSublayer(line)
+        }
+        band.colors = [NSColor.clear.cgColor, NSColor.white.cgColor, NSColor.clear.cgColor]
+        band.startPoint = CGPoint(x: 0, y: 0.5)
+        band.endPoint = CGPoint(x: 1, y: 0.5)
+        bright.mask = band
+        applyText()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    /// The brighter text under the moving band, for `--snapshot --live`.
+    var bandLayer: CALayer { bright }
+
+    /// One line, as tall as SwiftUI lays out a Text in the same font.
+    var lineHeight: CGFloat { ceil(font.ascender) + ceil(-font.descender) }
+    var idealWidth: CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }   // clicks go to the row
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        // SwiftUI puts the baseline a whole point below the top; so does this.
+        let drop = ceil(font.ascender) - font.ascender
+        for line in [base, bright] { line.frame = bounds.offsetBy(dx: 0, dy: -drop) }
+        band.bounds = CGRect(x: 0, y: 0, width: Self.bandWidth, height: bounds.height + drop)
+        band.position = CGPoint(x: -Self.bandWidth, y: (bounds.height + drop) / 2)   // parked off the left
+        CATransaction.commit()
+        if abs(bounds.width - sweptWidth) > 0.5 { restart() }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyScale()
+        restart()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        applyScale()
+    }
+
+    private func applyScale() {
+        let scale = window?.backingScaleFactor ?? 2
+        base.contentsScale = scale
+        bright.contentsScale = scale
+    }
+
+    private func applyText() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (line, color) in [(base, baseColor), (bright, brightColor)] {
+            line.font = font
+            line.fontSize = font.pointSize
+            line.foregroundColor = color.cgColor
+            line.string = text
+        }
+        CATransaction.commit()
+    }
+
+    private var wantsMotion: Bool {
+        window != nil && bounds.width >= 1 && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// Reduce Motion may have been turned on or off.
+    func refreshMotion() {
+        if wantsMotion != (band.animation(forKey: "sweep") != nil) { restart() }
+    }
+
+    private func restart() {
+        sweptWidth = bounds.width
+        band.removeAnimation(forKey: "sweep")
+        bright.isHidden = !wantsMotion
+        guard wantsMotion else { return }
+        let sweep = CABasicAnimation(keyPath: "position.x")
+        sweep.fromValue = -Self.bandWidth / 2
+        sweep.toValue = bounds.width + Self.bandWidth / 2
+        sweep.duration = max(1.2, (bounds.width + Self.bandWidth) / 150)
+        let loop = CAAnimationGroup()
+        loop.animations = [sweep]
+        loop.duration = sweep.duration + 0.4   // a short rest between sweeps
+        loop.repeatCount = .infinity
+        loop.isRemovedOnCompletion = false
+        loop.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 24)
+        band.add(loop, forKey: "sweep")
+    }
+}
+
+struct ShimmerText: NSViewRepresentable {
+    let text: String
+    var size: CGFloat = 11
+    let base: Color
+    let bright: Color
+
+    func makeNSView(context: Context) -> ShimmerLabel { ShimmerLabel(frame: .zero) }
+
+    func updateNSView(_ view: ShimmerLabel, context: Context) {
+        view.font = .systemFont(ofSize: size)
+        view.text = text
+        view.baseColor = NSColor(base)
+        view.brightColor = NSColor(bright)
+        view.refreshMotion()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: ShimmerLabel, context: Context) -> CGSize? {
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? nsView.idealWidth
+        return CGSize(width: width, height: nsView.lineHeight)
+    }
 }
 
 /// Increase Contrast as the window and panel draw it. Read from the system,
@@ -1300,6 +1446,12 @@ struct Palette {
     var review: Color { pick((0.39, 0.66, 1.0), (0.04, 0.39, 0.84)) }        // #64A8FF, #0A64D6
     var quiet: Color { pick((0.96, 0.66, 0.10), (0.70, 0.42, 0.0)) }         // #F5A81A, #B26B00
     var done: Color { pick((0.20, 0.78, 0.35), (0.12, 0.56, 0.24)) }         // #34C759, #1E8E3E
+    /// Running: blue, so it never reads as the green of finished.
+    var running: Color { pick((0.25, 0.61, 1.0), (0.0, 0.48, 1.0)) }         // #409CFF, #007AFF
+    /// A running row's status line: a little dimmer than other second lines,
+    /// so the band sweeping across it (`shimmer`) shows.
+    var shimmerBase: Color { contrast ? text2 : (dark ? Color(white: 0.62) : Color(white: 0.42)) }
+    var shimmer: Color { dark ? .white : .black }
     /// Second lines.
     var text2: Color { dark ? Color(white: contrast ? 0.92 : 0.78) : Color(white: contrast ? 0.12 : 0.30) }
     /// Times and counts.
@@ -1322,7 +1474,7 @@ func compactAge(since d: Date, now: Date) -> String {
     return "\(s / 86400)d"
 }
 
-/// One mark per state, told apart by shape as well as colour: a pulsing dot
+/// One mark per state, told apart by shape as well as colour: a turning ring
 /// (running), an hourglass (running but quiet), an exclamation (needs you),
 /// an eye (ready for review), a check (finished), a ring (idle terminal).
 struct Indicator: View {
@@ -1342,14 +1494,17 @@ struct Indicator: View {
                     .foregroundStyle(p.needsYouMark, p.needsYou)
                     .font(.system(size: 11, weight: .semibold))
             case .running where quiet:
-                // Still running, but nothing written for 10 minutes: no pulse.
+                // Still running, but nothing written for 10 minutes: no turning ring.
                 Image(systemName: "hourglass").font(.system(size: 10, weight: .bold)).foregroundStyle(p.quiet)
             case .running:
                 if staticIndicators {
-                    Circle().fill(p.done.opacity(0.22)).frame(width: 16, height: 16)
-                    Circle().fill(p.done).frame(width: 8, height: 8)
+                    Circle().stroke(p.running.opacity(0.24), lineWidth: 2).frame(width: 11, height: 11)
+                    Circle().trim(from: 0, to: 0.3)
+                        .stroke(p.running, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .frame(width: 11, height: 11)
+                        .rotationEffect(.degrees(-90))
                 } else {
-                    PulsingDot().frame(width: 16, height: 16)
+                    RunningSpinner(color: p.running).frame(width: 16, height: 16)
                 }
             case .justFinished, .done:
                 Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(p.done)
@@ -1835,9 +1990,15 @@ struct CompactRow: View {
                             .font(.system(size: 11)).foregroundStyle(p.quiet).lineLimit(1).truncationMode(.tail)
                     } else if let line = row.group == .yourTurn ? row.ask
                         : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil)) {
-                        Text(line).font(.system(size: 11))
-                            .foregroundStyle(row.group == .yourTurn ? Color.primary : p.text2)
-                            .lineLimit(1).truncationMode(.tail)
+                        if row.group == .running && !staticIndicators {
+                            ShimmerText(text: line, base: p.shimmerBase, bright: p.shimmer)
+                                .accessibilityLabel(line)
+                        } else {
+                            Text(line).font(.system(size: 11))
+                                .foregroundStyle(row.group == .yourTurn ? Color.primary
+                                                 : row.group == .running ? p.shimmerBase : p.text2)
+                                .lineLimit(1).truncationMode(.tail)
+                        }
                     }
                 }
             }
@@ -2214,7 +2375,7 @@ struct FloatingView: View {
 
     private func countChip(_ kind: RowFilter, _ n: Int, selected: Bool, compact: Bool) -> some View {
         let p = palette
-        let tint = kind == .running ? p.done : kind == .needsYou ? p.needsYou : p.review
+        let tint = kind == .running ? p.running : kind == .needsYou ? p.needsYou : p.review
         return Button {
             filter = selected ? nil : kind
         } label: {
@@ -2287,7 +2448,7 @@ struct FloatingView: View {
     @ViewBuilder private func chipMark(_ kind: RowFilter) -> some View {
         switch kind {
         case .running:
-            Circle().fill(palette.done).frame(width: 6, height: 6)
+            Circle().fill(palette.running).frame(width: 6, height: 6)
         case .needsYou:
             Image(systemName: "exclamationmark.circle.fill")
                 .symbolRenderingMode(.palette)
@@ -3618,7 +3779,8 @@ func sampleRows(now: Date) -> [Row] {
             ask: "Run the step 3 check and tell me whether it returns recent rows.",
             context: "Go-live readiness", since: minutesAgo(4 * 1440), link: "local_s3"),
         Row(id: "local_s4", group: .running, title: "Audit traffic before the old site is shut down",
-            context: "Documents", since: minutesAgo(12), link: "local_s4"),
+            context: "Documents", since: minutesAgo(12), link: "local_s4",
+            activity: "Scanning the app logs for scope errors"),
         Row(id: "pid:5", group: .running, title: "data-pipeline", context: "data-pipeline",
             since: minutesAgo(31), terminal: true, activity: "Running the nightly export",
             lastOutput: minutesAgo(14)),
@@ -3649,7 +3811,8 @@ func snapshotLayout() -> FloatingLayout {
 /// Renders the panel and the menu bar item to PNG files.
 func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limit: Int?) {
     _ = NSApplication.shared
-    staticIndicators = true
+    // --live: the real turning rings and shimmering status lines, frozen mid-animation.
+    staticIndicators = !arguments.contains("--live")
     let model = SessionModel()
     let rows = sample ? sampleRows(now: Date()) : SessionEngine.scanOnce()
     model.rows = limit.map { Array(rows.prefix($0)) } ?? rows
@@ -3705,6 +3868,22 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
         context.cgContext.translateBy(x: place.minX, y: place.minY)
         context.cgContext.setBlendMode(dark ? .screen : .multiply)
         layer.render(in: context.cgContext)
+        context.flushGraphics()
+    }
+    // cacheDisplay draws the rings and status lines as they rest; the band
+    // moving across a status line it leaves out, so draw that where it sits.
+    if !staticIndicators, let context = NSGraphicsContext(bitmapImageRep: rep) {
+        func labels(in view: NSView) -> [ShimmerLabel] {
+            view.subviews.flatMap { ($0 as? ShimmerLabel).map { [$0] } ?? labels(in: $0) }
+        }
+        for view in labels(in: host) {
+            guard let layer = view.bandLayer.presentation() else { continue }
+            let place = view.convert(view.bounds, to: nil)
+            context.cgContext.saveGState()
+            context.cgContext.translateBy(x: place.minX, y: place.minY)
+            layer.render(in: context.cgContext)
+            context.cgContext.restoreGState()
+        }
         context.flushGraphics()
     }
     try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
