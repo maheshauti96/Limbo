@@ -9,14 +9,23 @@
 //       One record per desktop session. After each turn the Claude app writes a
 //       short summary into it: completed, blocked or ready for review, and what
 //       it needs from you.
-// Never opened: the *.key files beside the live records, transcripts, and every
-// other file in those folders (waiting-input/, backlog/, deleted_*, ...).
+//   ~/.claude/projects/<folder>/<session>.jsonl
+//       Transcripts: only their last 256 KB, and only while the panel or the
+//       keep-on-top window shows. What a running session is doing now, and how a
+//       finished one's latest turn ended (its question, buttons and reply).
+// Never opened: the *.key files beside the live records, and every other file
+// in those folders (waiting-input/, backlog/, deleted_*, ...).
 //
-// Cost model: no polling. One FSEvents stream wakes the app when a session file
+// Writes nothing to those files. With "Answer from Cards" on (off by default), a
+// card's button presses the same button in the Claude app through macOS
+// Accessibility, only after checking the question on screen (ClaudeAnswerer).
+//
+// Cost model: no polling while the panel and window are hidden. One FSEvents stream wakes the app when a session file
 // changes, and only the changed files are re-read, on a low-priority queue. The
 // panel's views exist only while it is open.
 
 import AppKit
+import ApplicationServices
 import CoreServices
 import SwiftUI
 
@@ -71,6 +80,11 @@ func isDeskRecordPath(_ path: String) -> Bool {
 }
 
 // MARK: - File access
+
+/// A CLI session id names a transcript file: letters, digits and dashes only.
+func isTranscriptId(_ s: String) -> Bool {
+    !s.isEmpty && s.count <= 64 && s.allSatisfy { isASCIIAlnum($0) || $0 == "-" }
+}
 
 struct FileStamp: Equatable {
     let inode: UInt64
@@ -156,6 +170,8 @@ struct DeskRecord: Equatable {
     let parentId: String?
     let errorAt: Date?          // set when the session stopped with an error
     let errorText: String?
+    /// The CLI session that wrote the latest reply: names its transcript file.
+    var transcriptId: String? = nil
 }
 
 // Lenient decoding: a field with an unexpected type is dropped, not fatal.
@@ -210,11 +226,14 @@ private struct RawDesk: Decodable {
     var error: String?
     var errorAt: Double?
     var errorCategory: String?
+    var cliSessionId: String?
+    var lastAssistantCliSessionId: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionId, title, cwd, lastActivityAt, lastTurnEdgeAt, isArchived, lastAssistantUuid
         case summary = "postTurnSummary", summaryFor = "postTurnSummaryFor", wrapUp = "turnWrapUp"
         case lastTurnReport, parent = "spawnedFrom", error, errorAt, errorCategory
+        case cliSessionId, lastAssistantCliSessionId
     }
 
     init(from decoder: Decoder) throws {
@@ -234,6 +253,8 @@ private struct RawDesk: Decodable {
         error = try? c.decodeIfPresent(String.self, forKey: .error)
         errorAt = try? c.decodeIfPresent(Double.self, forKey: .errorAt)
         errorCategory = try? c.decodeIfPresent(String.self, forKey: .errorCategory)
+        cliSessionId = try? c.decodeIfPresent(String.self, forKey: .cliSessionId)
+        lastAssistantCliSessionId = try? c.decodeIfPresent(String.self, forKey: .lastAssistantCliSessionId)
     }
 }
 
@@ -265,7 +286,8 @@ func parseDeskRecord(path: String, stamp: FileStamp) -> DeskRecord? {
         parentId: raw.parent?.sessionId,
         errorAt: raw.error == nil ? nil : dateFromMillis(raw.errorAt),
         errorText: raw.error == nil ? nil
-            : plainLine(raw.errorCategory?.replacingOccurrences(of: "_", with: " ") ?? raw.error, max: 120))
+            : plainLine(raw.errorCategory?.replacingOccurrences(of: "_", with: " ") ?? raw.error, max: 120),
+        transcriptId: [raw.lastAssistantCliSessionId, raw.cliSessionId].compactMap { $0 }.first(where: isTranscriptId))
 }
 
 /// Kernel start time of a running process, nil if there is none.
@@ -420,6 +442,127 @@ func transcriptActivity(path: String) -> String? {
     return nil
 }
 
+// MARK: - Turn cards
+
+/// How a session's latest turn ended, from its next-step box (Claude's
+/// wrap-up): the question and its buttons, the recap, and the reply written
+/// after it. Only the latest turn counts: once you send anything, its question
+/// is gone.
+struct TurnCard: Equatable {
+    var ask: String?
+    var actions: [String] = []
+    var recap: String?
+    var reply: String?
+    /// The transcript it was read from: answering from the card checks it for your message.
+    var transcript: String? = nil
+
+    /// A question always gets a way to answer, even with no buttons of its own.
+    var buttons: [String] { ask == nil ? [] : (actions.isEmpty ? [Self.answerInClaude] : actions) }
+    /// The button a question with none of its own gets: it always just opens the session.
+    static let answerInClaude = "Answer in Claude"
+    /// What the response button shows.
+    var response: String? { reply ?? recap }
+}
+
+/// The Claude app's names for its own action buttons, which carry no label.
+func appActionLabel(_ action: String) -> String {
+    switch action {
+    case "commit": return "Commit"
+    case "create_pr": return "Create PR"
+    case "merge": return "Merge"
+    case "fix_ci": return "Fix CI"
+    case "resolve_conflicts": return "Resolve conflicts"
+    case "address_comments": return "Address comments"
+    case "verify": return "Verify"
+    case "archive": return "Archive"
+    case "new_session": return "New session"
+    default: return action.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
+/// A reply, ready to show in a few lines: code blocks dropped, links to local
+/// files turned into their text (web links stay), cut at a word near 900 characters.
+func cleanReply(_ parts: [String]) -> String? {
+    var t = parts.joined(separator: "\n\n")
+    t = t.replacingOccurrences(of: "```[\\s\\S]*?(```|$)", with: "", options: .regularExpression)
+    t = t.replacingOccurrences(of: "\\[([^\\]\\n]+)\\]\\((?!https?://)[^)\\n]*\\)", with: "$1",
+                               options: .regularExpression)
+    t = t.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+    t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !t.isEmpty else { return nil }
+    if t.count > 900 {
+        var cut = String(t.prefix(900))
+        if let space = cut.lastIndex(where: { $0 == " " || $0 == "\n" }) { cut = String(cut[..<space]) }
+        t = cut.trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+    return t
+}
+
+/// The latest turn's card, from the last 256 KB of a transcript. Walking back
+/// from the end: the closing reply (text after the last tool call), then the
+/// latest wrap-up that did not fail. A message from you before either means
+/// the latest turn has no question; the reply alone is kept.
+func turnCard(transcript path: String) -> TurnCard? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+    guard let size = try? handle.seekToEnd() else { return nil }
+    let window: UInt64 = 256 * 1024
+    let start = size > window ? size - window : 0
+    try? handle.seek(toOffset: start)
+    guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
+    var lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
+    if start > 0, !lines.isEmpty { lines.removeFirst() }    // a partial line
+    var reply: [String] = []
+    var replyDone = false
+    var failed = Set<String>()      // tool calls whose result was an error
+    var parses = 0
+    func replyOnly() -> TurnCard? { cleanReply(reply).map { TurnCard(reply: $0) } }
+    for raw in lines.reversed() {
+        guard raw.starts(with: Array(#"{"parentUuid""#.utf8)) else { continue }
+        parses += 1
+        guard parses <= 400 else { break }
+        guard let o = (try? JSONSerialization.jsonObject(with: Data(raw))) as? [String: Any],
+              (o["isSidechain"] as? Bool) != true else { continue }
+        let content = (o["message"] as? [String: Any])?["content"]
+        switch o["type"] as? String {
+        case "user":
+            if (o["isMeta"] as? Bool) == true { continue }
+            if let blocks = content as? [[String: Any]], !blocks.isEmpty,
+               blocks.allSatisfy({ ($0["type"] as? String) == "tool_result" }) {
+                for block in blocks where (block["is_error"] as? Bool) == true {
+                    if let id = block["tool_use_id"] as? String { failed.insert(id) }
+                }
+                replyDone = true
+                continue
+            }
+            return replyOnly()      // a message from you: the latest turn starts after it
+        case "assistant":
+            for block in ((content as? [[String: Any]]) ?? []).reversed() {
+                switch block["type"] as? String {
+                case "text":
+                    if !replyDone, let text = block["text"] as? String { reply.insert(text, at: 0) }
+                case "tool_use":
+                    replyDone = true
+                    guard (block["name"] as? String) == "mcp__ccd_turn__wrap_up",
+                          !failed.contains(block["id"] as? String ?? "") else { continue }
+                    let input = block["input"] as? [String: Any] ?? [:]
+                    let actions = (input["actions"] as? [[String: Any]] ?? []).compactMap { item -> String? in
+                        if let action = item["action"] as? String, !action.isEmpty { return appActionLabel(action) }
+                        return plainLine(item["label"] as? String, max: 40)
+                    }
+                    return TurnCard(ask: plainLine(input["ask"] as? String, max: 200, sentence: true),
+                                    actions: Array(actions.prefix(3)),
+                                    recap: plainLine(input["recap"] as? String, max: 400, sentence: true),
+                                    reply: cleanReply(reply))
+                default: break
+                }
+            }
+        default: continue
+        }
+    }
+    return replyOnly()
+}
+
 /// What a running session is doing, and when it last wrote anything.
 struct Activity: Equatable {
     var text: String?
@@ -559,6 +702,7 @@ struct Row: Identifiable, Equatable {
     var terminal = false
     var activity: String? = nil // what a running session is doing now
     var lastOutput: Date? = nil // when a running session last wrote anything
+    var card: TurnCard? = nil   // how its latest turn ended: question, buttons, reply
 
     /// How long a running session has written nothing, once that passes
     /// `quietAfter`: possibly stuck, or in one long command.
@@ -595,7 +739,7 @@ let dataWindow: TimeInterval = 8 * 86400
 ///  input; failed or an error in the last 7 days = failed).
 ///  7. terminal session (no desktop id), idle          -> Terminal
 func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
-              activities: [Int32: Activity] = [:]) -> [Row] {
+              activities: [Int32: Activity] = [:], cards: [String: TurnCard] = [:]) -> [Row] {
     var bySession: [String: DeskRecord] = [:]
     for d in desk {
         // The same session can sit under several account folders; keep the newest copy.
@@ -636,7 +780,7 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
         if let errorAt = d.errorAt, now.timeIntervalSince(errorAt) < 7 * 86400 {
             rows.append(Row(id: d.sessionId, group: .yourTurn, title: d.title,
                             ask: "Stopped with an error" + (d.errorText.map { ": \($0)" } ?? ""),
-                            context: context, since: errorAt, link: link))
+                            context: context, since: errorAt, link: link, card: cards[d.sessionId]))
             continue
         }
 
@@ -650,7 +794,8 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
         }
         if lagging || (!fresh && now.timeIntervalSince(anchor) < 600) {
             rows.append(Row(id: d.sessionId, group: .justFinished, title: d.title, context: context,
-                            since: lagging ? (l?.statusSince ?? anchor) : anchor, link: link))
+                            since: lagging ? (l?.statusSince ?? anchor) : anchor, link: link,
+                            card: cards[d.sessionId]))
             continue
         }
         // After the first minutes, an older summary is used as it stands; the
@@ -660,14 +805,14 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
             let ask = d.needsAction ?? d.statusDetail ?? "Waiting for your answer"
             rows.append(Row(id: d.sessionId, group: .yourTurn, title: d.title, ask: ask,
                             detail: d.statusDetail == ask ? nil : d.statusDetail,
-                            context: context, since: anchor, link: link))
+                            context: context, since: anchor, link: link, card: cards[d.sessionId]))
         case "review_ready":
             rows.append(Row(id: d.sessionId, group: .review, title: d.title,
-                            detail: d.statusDetail ?? d.wrapUp, context: context, since: anchor, link: link))
+                            detail: d.statusDetail ?? d.wrapUp, context: context, since: anchor, link: link, card: cards[d.sessionId]))
         default:
             rows.append(Row(id: d.sessionId, group: .done, title: d.title,
                             detail: d.statusDetail ?? d.wrapUp ?? d.lastReport,
-                            context: context, since: anchor, link: link))
+                            context: context, since: anchor, link: link, card: cards[d.sessionId]))
         }
     }
 
@@ -754,6 +899,13 @@ final class SessionEngine {
     private var activities: [Int32: Activity] = [:]
     private var eventBatches = 0
     private var fileParses = 0
+    /// Each recent finished session's turn card, by transcript path: read only
+    /// while the window or panel shows, and again only when the transcript changes.
+    private var cardCache: [String: (stamp: FileStamp, card: TurnCard?)] = [:]
+    private var cardReads = 0
+    /// A record is written about 2 s after its transcript ends, which triggers a
+    /// look; this also looks every 30 s in case a transcript ends later.
+    private var cardCheck: DispatchSourceTimer?
 
     func start() {
         queue.async {
@@ -784,8 +936,9 @@ final class SessionEngine {
                     activities[pid] = Activity(transcript: transcriptPath(cwd: record.cwd, cliSessionId: id))
                 }
             }
+            engine.activityWanted = true
             return classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
-                            activities: activities)
+                            activities: activities, cards: engine.currentCards())
         }
     }
 
@@ -818,6 +971,15 @@ final class SessionEngine {
         queue.async {
             guard self.activityWanted != wanted else { return }
             self.activityWanted = wanted
+            self.cardCheck?.cancel()
+            self.cardCheck = nil
+            if wanted {
+                let timer = DispatchSource.makeTimerSource(queue: self.queue)
+                timer.schedule(deadline: .now() + 30, repeating: 30, leeway: .seconds(5))
+                timer.setEventHandler { [weak self] in self?.publishIfChanged() }
+                timer.resume()
+                self.cardCheck = timer
+            }
             self.syncActivityWatchers()
             self.publishIfChanged()
         }
@@ -843,6 +1005,38 @@ final class SessionEngine {
                 self.publishIfChanged()
             }
         }
+    }
+
+    /// The turn cards of recent sessions that are not running, by session id.
+    /// A stat per session; a transcript is read again only when it changed.
+    private func currentCards() -> [String: TurnCard] {
+        guard activityWanted else { return [:] }
+        let now = Date()
+        let busy = Set(live.values.filter(\.isBusy).compactMap(\.hostId))
+        var cards: [String: TurnCard] = [:]
+        var kept = Set<String>()
+        for record in desk.values.compactMap(\.record) {
+            guard !record.isArchived, !busy.contains(record.sessionId), let id = record.transcriptId,
+                  now.timeIntervalSince(record.lastTurnEdge ?? record.lastActivity ?? record.fileTime) <= Board.recentLimit
+            else { continue }
+            let path = transcriptPath(cwd: record.cwd, cliSessionId: id)
+            kept.insert(path)
+            guard let stamp = fileStamp(path) else { continue }
+            let card: TurnCard?
+            if let cached = cardCache[path], cached.stamp == stamp {
+                card = cached.card
+            } else {
+                card = autoreleasepool { turnCard(transcript: path) }
+                cardReads += 1
+                cardCache[path] = (stamp, card)
+            }
+            if var card {
+                card.transcript = path
+                cards[record.sessionId] = card
+            }
+        }
+        for path in Array(cardCache.keys) where !kept.contains(path) { cardCache[path] = nil }
+        return cards
     }
 
     private func refreshDesk(path: String, cutoff: TimeInterval) {
@@ -899,6 +1093,7 @@ final class SessionEngine {
             "terminal": board.terminal.count, "deskFilesTracked": desk.count,
             "deskRecordsParsed": desk.values.filter { $0.record != nil }.count, "liveRecords": live.count,
             "eventBatches": eventBatches, "fileParses": fileParses,
+            "cardReads": cardReads, "cardsCached": cardCache.count,
             "footprintMB": (footprintMB().now * 10).rounded() / 10, "cpuSeconds": (cpu * 1000).rounded() / 1000,
         ].merging(spinStats.snapshot()) { a, _ in a }
         let url = Paths.home.appendingPathComponent("Library/Caches/\(LoginItem.label).stats.json")
@@ -908,7 +1103,8 @@ final class SessionEngine {
     }
 
     private func publishIfChanged() {
-        let rows = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities)
+        let rows = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
+                            cards: currentCards())
         guard rows != lastRows else { return }
         lastRows = rows
         DispatchQueue.main.async { [weak self] in self?.onRows?(rows) }
@@ -1956,14 +2152,42 @@ struct CompactRow: View {
     let row: Row
     let now: Date
     let open: (Row) -> Void
+    /// The response button, on rows that have a reply to show; the reply opens under the row.
+    var responseShown = false
+    var toggleResponse: (() -> Void)? = nil
     @State private var hovering = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.highContrast) private var contrast
 
+    private var response: String? { toggleResponse == nil ? nil : row.card?.response }
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            line
+                // Beside the row's own button, not inside it, so a click here never opens the session.
+                .overlay(alignment: .topTrailing) {
+                    if let toggleResponse, response != nil {
+                        ResponseToggle(shown: responseShown, action: toggleResponse)
+                            .testFrame("response:\(row.id)")
+                            .padding(.top, 2)
+                            .padding(.trailing, 4)
+                    }
+                }
+            if responseShown, let response {
+                ResponseDrawer(text: response, open: { open(row) })
+                    .padding(.leading, 32)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 6)
+            }
+        }
+    }
+
+    private var line: some View {
         let quiet = row.quiet(now: now)
         let p = Palette(scheme, contrast: contrast)
-        Button { if row.link != nil { open(row) } } label: {
+        // A question from the session's next-step box, when it is not shown as a card.
+        let question = row.group == .running ? nil : row.card?.ask
+        return Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
                 Indicator(group: row.group, quiet: quiet != nil)
                 VStack(alignment: .leading, spacing: 1) {
@@ -1984,18 +2208,19 @@ struct CompactRow: View {
                                 .font(.system(size: 10).monospacedDigit())
                                 .foregroundStyle(p.time)
                         }
+                        if response != nil { Color.clear.frame(width: 18, height: 1) }   // room for the response button
                     }
                     if let quiet {
                         Text([quietPhrase(quiet, compact: true), row.activity].compactMap { $0 }.joined(separator: " · "))
                             .font(.system(size: 11)).foregroundStyle(p.quiet).lineLimit(1).truncationMode(.tail)
-                    } else if let line = row.group == .yourTurn ? row.ask
-                        : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil)) {
+                    } else if let line = question ?? (row.group == .yourTurn ? row.ask
+                        : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil))) {
                         if row.group == .running && !staticIndicators {
                             ShimmerText(text: line, base: p.shimmerBase, bright: p.shimmer)
                                 .accessibilityLabel(line)
                         } else {
                             Text(line).font(.system(size: 11))
-                                .foregroundStyle(row.group == .yourTurn ? Color.primary
+                                .foregroundStyle(row.group == .yourTurn || question != nil ? Color.primary
                                                  : row.group == .running ? p.shimmerBase : p.text2)
                                 .lineLimit(1).truncationMode(.tail)
                         }
@@ -2012,9 +2237,255 @@ struct CompactRow: View {
         .buttonStyle(.plain)
         .pointerStyle(row.link != nil ? .link : nil)
         .onHover { hovering = $0 }
-        .help([row.title, row.ask ?? row.detail,
+        .help([row.title, question ?? row.ask ?? row.detail,
                quiet.map { quietPhrase($0) + ": it may be stuck, or in one long command" }]
             .compactMap { $0 }.joined(separator: "\n\n"))
+    }
+}
+
+/// --gesture-check: where some controls sit, so it can click them. Off in the app.
+var recordTestFrames = false
+var testFrames: [String: CGRect] = [:]
+
+extension View {
+    @ViewBuilder func testFrame(_ name: String) -> some View {
+        if recordTestFrames {
+            background(GeometryReader { proxy in
+                Color.clear
+                    .onAppear { testFrames[name] = proxy.frame(in: .global) }
+                    .onChange(of: proxy.frame(in: .global)) { _, frame in testFrames[name] = frame }
+            })
+        } else {
+            self
+        }
+    }
+}
+
+/// The response button on a row or card: shows the session's latest reply in place.
+struct ResponseToggle: View {
+    let shown: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "text.bubble")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(shown ? Color.primary : Color.secondary)
+                .frame(width: 20, height: 18)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.primary.opacity(shown ? 0.14 : 0)))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .help(shown ? "Hide the latest response" : "Show the latest response")
+        .accessibilityLabel(shown ? "Hide the latest response" : "Show the latest response")
+    }
+}
+
+/// A session's latest reply, a dozen lines of it at most, and a way to open the
+/// rest in Claude.
+struct ResponseDrawer: View {
+    let text: String
+    let open: () -> Void
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.highContrast) private var contrast
+
+    var body: some View {
+        let p = Palette(scheme, contrast: contrast)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(Self.markdown(text))
+                .font(.system(size: 11))
+                .foregroundStyle(p.text2)
+                .lineLimit(12)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: open) {
+                HStack(spacing: 3) {
+                    Text("Open in Claude")
+                    Image(systemName: "arrow.up.right").font(.system(size: 7, weight: .bold))
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(p.review)
+            }
+            .buttonStyle(.plain)
+            .pointerStyle(.link)
+            .accessibilityLabel("Open the session in Claude")
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.primary.opacity(contrast ? 0.1 : 0.06)))
+    }
+
+    /// Bold, italics, code and web links; the reply's line breaks are kept.
+    static func markdown(_ s: String) -> AttributedString {
+        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(s)
+    }
+}
+
+/// A session waiting on your answer: its question and the buttons from its
+/// next-step box. Each button opens the session in Claude, where you answer:
+/// Claude has no way to take an answer from another app.
+struct AnswerCard: View {
+    let row: Row
+    let card: TurnCard
+    let now: Date
+    let open: (Row) -> Void
+    var responseShown = false
+    var toggleResponse: () -> Void = {}
+    /// With "Answer from Cards" on: presses the button in Claude for you.
+    var answer: ((String) -> Void)? = nil
+    /// The button being pressed right now, and why the last click only opened the session.
+    var answering: String? = nil
+    var note: String? = nil
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.highContrast) private var contrast
+
+    var body: some View {
+        let p = Palette(scheme, contrast: contrast)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Button { open(row) } label: {
+                    HStack(spacing: 6) {
+                        Indicator(group: row.group)
+                        Text(row.title)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(p.text2)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 4)
+                        Text(compactAge(since: row.since, now: now))
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundStyle(p.time)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .pointerStyle(.link)
+                .help("Open in Claude")
+                if card.response != nil {
+                    ResponseToggle(shown: responseShown, action: toggleResponse).testFrame("response:\(row.id)")
+                }
+            }
+            if responseShown, let response = card.response {
+                ResponseDrawer(text: response, open: { open(row) })
+            }
+            if let ask = card.ask {
+                Text(ask)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            WrapRow { buttons }
+            if let note {
+                Text(note)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(p.time)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 7)
+        .padding(.bottom, 10)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(Color.primary.opacity(contrast ? 0.1 : 0.06)))
+        .overlay {
+            if contrast {
+                RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.5))
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.bottom, 6)
+    }
+
+    @ViewBuilder private var buttons: some View {
+        ForEach(Array(card.buttons.enumerated()), id: \.offset) { index, label in
+            let inPlace = answer != nil && label != TurnCard.answerInClaude
+            AnswerButton(label: label, primary: index == 0, answersHere: inPlace, busy: answering == label) {
+                if inPlace, let answer { answer(label) } else { open(row) }
+            }
+            .disabled(answering != nil)
+            .testFrame("answer:\(row.id):\(index)")
+        }
+    }
+}
+
+/// Buttons side by side, moving to a new line when the next one doesn't fit.
+/// Each is measured once.
+struct WrapRow: Layout {
+    var spacing: CGFloat = 6
+
+    private func rows(_ subviews: Subviews, width: CGFloat) -> [[(index: Int, size: CGSize)]] {
+        var rows: [[(index: Int, size: CGSize)]] = [[]]
+        var x: CGFloat = 0
+        for (index, view) in subviews.enumerated() {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > width {
+                rows.append([])
+                x = 0
+            }
+            rows[rows.count - 1].append((index, size))
+            x += size.width + spacing
+        }
+        return rows
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let lines = rows(subviews, width: proposal.width ?? .infinity)
+        let width = lines.map { line in line.reduce(0) { $0 + $1.size.width } + spacing * CGFloat(max(0, line.count - 1)) }.max() ?? 0
+        let height = lines.reduce(0) { $0 + ($1.map(\.size.height).max() ?? 0) } + spacing * CGFloat(max(0, lines.count - 1))
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for line in rows(subviews, width: bounds.width) {
+            var x = bounds.minX
+            for item in line {
+                subviews[item.index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(item.size))
+                x += item.size.width + spacing
+            }
+            y += (line.map(\.size.height).max() ?? 0) + spacing
+        }
+    }
+}
+
+/// One of a card's buttons, drawn like the next-step box's, the first one solid.
+/// The arrow says it goes to Claude.
+struct AnswerButton: View {
+    let label: String
+    let primary: Bool
+    /// Presses this button in Claude for you; otherwise it opens the session (the arrow).
+    var answersHere = false
+    var busy = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Text(label).lineLimit(1)
+                if busy {
+                    ProgressView().controlSize(.mini).scaleEffect(0.7).frame(width: 9, height: 9)
+                } else if !answersHere {
+                    Image(systemName: "arrow.up.right").font(.system(size: 7, weight: .bold)).opacity(0.7)
+                }
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(primary ? Color(nsColor: .windowBackgroundColor) : Color.primary)
+            .padding(.leading, 9)
+            .padding(.trailing, 7)
+            .padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(primary ? Color.primary : Color.primary.opacity(0.12)))
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .fixedSize()
+        .help(answersHere ? "Answers “\(label)” in Claude" : "Opens the session in Claude, where you answer")
+        .accessibilityLabel(answersHere ? "\(label). Answers in Claude" : "\(label). Opens the session in Claude")
     }
 }
 
@@ -2120,7 +2591,13 @@ struct FloatingView: View {
     var forceContrast: Bool? = nil
     var forceSolid: Bool? = nil
     var initialFilter: RowFilter? = nil
+    var initialResponse: String? = nil
+    /// Answering from a card: presses its button in Claude (when the switch is on).
+    var answer: ((Row, String) -> Void)? = nil
+    @ObservedObject var answers = AnswerStatus()
     @State private var filter: RowFilter?
+    /// The row or card whose latest reply is showing; one at a time.
+    @State private var openResponse: String?
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -2129,7 +2606,10 @@ struct FloatingView: View {
     @AppStorage(GlowColor.key) private var glowColor = GlowColor.red.rawValue
     @AppStorage(GlowSignal.needsYouKey) private var needsYouGlow = true
     @AppStorage(GlowSignal.doneFlashKey) private var doneFlash = true
+    @AppStorage(ClaudeAnswerer.enabledKey) private var answerFromCards = false
     static let maxRows = 8
+    /// Questions shown as cards; any more stay rows, the question as their second line.
+    static let maxCards = 3
     /// Finished sessions stay listed, with a green check, for this long.
     static let doneShownFor: TimeInterval = 2 * 3600
 
@@ -2146,13 +2626,19 @@ struct FloatingView: View {
             if layout.mini { pill(list) } else { full(list) }
         }
         .environment(\.highContrast, contrast)
-        .onAppear { if let initialFilter { filter = initialFilter } }
+        .onAppear {
+            if let initialFilter { filter = initialFilter }
+            if let initialResponse { openResponse = initialResponse }
+        }
         .onChange(of: waitingHours) { refit() }
         .onChange(of: layout.width) { refit() }
         .onChange(of: layout.height) { refit() }
         .onChange(of: layout.mini) { refit() }
         .onChange(of: filter) { refit() }
         .onChange(of: showGotIt) { refit() }
+        .onChange(of: openResponse) { refit() }
+        .onChange(of: answers.notes) { refit() }
+        .onChange(of: answerFromCards) { _, on in if on { ClaudeAnswerer.requestPermission() } }
         .onChange(of: glowStyle) { glowChanged(.running) }
         .onChange(of: glowColor) { glowChanged(.running) }
         .onChange(of: needsYouGlow) { glowChanged(needsYouGlow ? .needsYou : .none) }
@@ -2164,9 +2650,14 @@ struct FloatingView: View {
     private func full(_ list: FloatingRows) -> some View {
         let active = list.effective(filter)
         let rows = list.rows(active)
+        // Sessions whose latest turn asked you something: cards on top, newest first.
+        let carded = Array(rows.filter { $0.group != .running && $0.card?.ask != nil }
+            .sorted { $0.since > $1.since }.prefix(Self.maxCards))
+        let cardIds = Set(carded.map(\.id))
+        let listRows = rows.filter { !cardIds.contains($0.id) }
         // With a height you set, every row shows and the list scrolls.
         let fixedHeight = layout.height != nil
-        let shown = fixedHeight ? rows : Array(rows.prefix(Self.maxRows))
+        let shown = fixedHeight ? listRows : Array(listRows.prefix(Self.maxRows))
         return VStack(alignment: .leading, spacing: 0) {
             header(list, filter: active)
             if rows.isEmpty {
@@ -2177,11 +2668,11 @@ struct FloatingView: View {
                     .padding(.horizontal, 12)
                     .padding(.bottom, 10)
             } else if fixedHeight {
-                ScrollView { rowStack(shown) }
-                    .background { scrim }
+                ScrollView { content(carded, shown) }
+                    .background { if carded.isEmpty { scrim } }
             } else {
-                rowStack(shown)
-                    .background { scrim }
+                content(carded, shown)
+                    .background { if carded.isEmpty { scrim } }
             }
             if active != nil {
                 HStack(spacing: 6) {
@@ -2196,8 +2687,8 @@ struct FloatingView: View {
                 .font(.system(size: 11))
                 .padding(.leading, 36)
                 .padding(.bottom, 8)
-            } else if rows.count > shown.count {
-                Text("\(rows.count - shown.count) more in the menu bar panel")
+            } else if listRows.count > shown.count {
+                Text("\(listRows.count - shown.count) more in the menu bar panel")
                     .font(.system(size: 10))
                     .foregroundStyle(palette.time)
                     .padding(.leading, 36)
@@ -2211,9 +2702,47 @@ struct FloatingView: View {
             .strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
     }
 
+    /// The cards ("Waiting on you"), then the other sessions.
+    private func content(_ carded: [Row], _ rows: [Row]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if !carded.isEmpty {
+                sectionTitle("Waiting on you")
+                ForEach(carded) { row in
+                    if let card = row.card {
+                        AnswerCard(row: row, card: card, now: model.now, open: open,
+                                   responseShown: openResponse == row.id,
+                                   toggleResponse: { toggleResponse(row.id) },
+                                   answer: answerFromCards && answer != nil ? { label in answer?(row, label) } : nil,
+                                   answering: answers.answering?.row == row.id ? answers.answering?.label : nil,
+                                   note: answers.notes[row.id])
+                    }
+                }
+                if !rows.isEmpty { sectionTitle("Sessions") }
+            }
+            // With cards, the band sits behind the rows only: the cards have their own fill.
+            if !rows.isEmpty { rowStack(rows).background { if !carded.isEmpty { scrim } } }
+        }
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(palette.time)
+            .padding(.leading, 12)
+            .padding(.bottom, 4)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private func toggleResponse(_ id: String) {
+        openResponse = openResponse == id ? nil : id
+    }
+
     private func rowStack(_ rows: [Row]) -> some View {
         VStack(spacing: 0) {
-            ForEach(rows) { CompactRow(row: $0, now: model.now, open: open) }
+            ForEach(rows) { row in
+                CompactRow(row: row, now: model.now, open: open, responseShown: openResponse == row.id,
+                           toggleResponse: row.group == .running ? nil : { toggleResponse(row.id) })
+            }
         }
         .padding(.horizontal, 4)
         .padding(.bottom, 6)
@@ -2312,6 +2841,8 @@ struct FloatingView: View {
                 .disabled(layout.height == nil)
             Button("Default Size") { layout.width = FloatingLayout.defaultWidth; layout.height = nil; layout.save() }
                 .disabled(layout.height == nil && layout.width == FloatingLayout.defaultWidth)
+            Divider()
+            Toggle("Answer from Cards (uses Accessibility)", isOn: $answerFromCards)
         }
     }
 
@@ -3380,6 +3911,8 @@ final class FloatingController {
     private var finished = false
     private let layout = FloatingLayout.saved()
     private let status = GlowStatus()
+    private let answerer = ClaudeAnswerer()
+    private let answers = AnswerStatus()
     private var edges: ResizeEdgesView?
     /// While an edge is being dragged, the window follows the mouse, not the rows.
     private var resizing = false
@@ -3517,6 +4050,19 @@ final class FloatingController {
         fitToContent()
     }
 
+    /// A card's button with "Answer from Cards" on: pressed in Claude for you.
+    private func answer(_ row: Row, _ label: String) {
+        guard let ask = row.card?.ask, let session = row.link, !answerer.busy else { return }
+        model.markOpened(row)
+        answers.answering = AnswerStatus.Answering(row: row.id, label: label)
+        answerer.answer(session: session, title: row.title, ask: ask, button: label,
+                        transcript: row.card?.transcript) { [weak self] outcome in
+            guard let self else { return }
+            self.answers.answering = nil
+            if case .opened(let why) = outcome { self.answers.note(row.id, "Opened in Claude: \(why)") }
+        }
+    }
+
     private func makePanel() -> KeepOnTopPanel {
         let view = FloatingView(model: model,
                                 open: { [weak self] row in
@@ -3531,7 +4077,9 @@ final class FloatingController {
                                 acknowledge: { [weak self] in self?.acknowledgeGlow() },
                                 glow: glow,
                                 layout: layout,
-                                status: status)
+                                status: status,
+                                answer: { [weak self] row, label in self?.answer(row, label) },
+                                answers: answers)
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
         let panel = KeepOnTopPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -3563,6 +4111,258 @@ final class FloatingController {
         panel.setFrameAutosaveName(Self.frameName)
         self.host = host
         return panel
+    }
+}
+
+// MARK: - Answering from a card (Accessibility)
+
+/// What answering from a card is doing, for the cards to show.
+final class AnswerStatus: ObservableObject {
+    struct Answering: Equatable { let row: String; let label: String }
+    @Published var answering: Answering?
+    /// Why a click only opened the session, shown on its card for a few seconds.
+    @Published var notes: [String: String] = [:]
+
+    func note(_ row: String, _ text: String) {
+        notes[row] = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            if self?.notes[row] == text { self?.notes[row] = nil }
+        }
+    }
+}
+
+/// Presses a card's button in the Claude app, so you can answer from here.
+/// Off unless "Answer from Cards" is on (the window header's right-click menu),
+/// and it needs the Accessibility permission. Claude offers no other way in:
+/// its session links carry no message and it runs no local API. So this opens
+/// the session in Claude, waits for its next-step box, and presses a button
+/// only when the question on screen matches the card word for word and the
+/// button right after it has exactly that label. On any doubt it presses
+/// nothing and leaves the session open. After an answer it brings back the app
+/// you were in.
+final class ClaudeAnswerer {
+    enum Outcome: Equatable {
+        case answered
+        case opened(String)     // only opened the session, and why
+    }
+
+    static let enabledKey = "answerFromCards"
+    static let claudeBundleId = "com.anthropic.claudefordesktop"
+    private struct Node { let role: String; let label: String; let element: AXUIElement }
+    private let queue = DispatchQueue(label: "com.maheshauti.limbo-tasks.answer", qos: .userInitiated)
+    private(set) var busy = false
+
+    /// Shows the system's request for the permission when it is missing.
+    @discardableResult static func requestPermission() -> Bool {
+        AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+    }
+
+    /// Calls `done` on the main queue.
+    func answer(session: String, title: String, ask: String, button: String, transcript: String?,
+                done: @escaping (Outcome) -> Void) {
+        guard !busy, isSessionId(session), let url = URL(string: "claude://claude.ai/epitaxy/\(session)") else { return }
+        guard AXIsProcessTrusted() else {
+            Self.requestPermission()
+            NSWorkspace.shared.open(url)
+            return done(.opened("allow Limbo Tasks in Privacy & Security, Accessibility"))
+        }
+        busy = true
+        let previous = NSWorkspace.shared.frontmostApplication
+        queue.async {
+            var log: [String] = ["\(Date()) answer “\(button)”"]
+            let outcome = self.press(url: url, title: title, ask: ask, button: button, transcript: transcript, log: &log)
+            log.append("outcome: \(outcome)")
+            Self.writeLog(log)
+            DispatchQueue.main.async {
+                self.busy = false
+                // Answered: back to where you were. Not answered: Claude stays in front, for you to answer.
+                if outcome == .answered, let previous, previous.bundleIdentifier != Self.claudeBundleId,
+                   let app = previous.bundleURL {
+                    let configuration = NSWorkspace.OpenConfiguration()
+                    configuration.activates = true
+                    NSWorkspace.shared.openApplication(at: app, configuration: configuration)
+                }
+                done(outcome)
+            }
+        }
+    }
+
+    /// The steps of the last answer, without any message text, for finding out
+    /// why one did not land: ~/Library/Caches/<label>.answer.log.
+    static let logFile = Paths.home.appendingPathComponent("Library/Caches/\(LoginItem.label).answer.log")
+    private static func writeLog(_ lines: [String]) {
+        try? (lines.joined(separator: "\n") + "\n").write(to: logFile, atomically: true, encoding: .utf8)
+    }
+
+    private func press(url: URL, title: String, ask: String, button: String, transcript: String?,
+                       log: inout [String]) -> Outcome {
+        let open = { DispatchQueue.main.sync { _ = NSWorkspace.shared.open(url) } }
+        guard let claude = NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeBundleId).first else {
+            open()
+            return .opened("Claude was not running")
+        }
+        let app = AXUIElementCreateApplication(claude.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 1)
+        // Claude's window content (Chromium) builds its accessibility tree only
+        // when asked, and costs Claude some work while it does: only for now.
+        let before = attribute(app, "AXManualAccessibility") as? Bool
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        defer {
+            if before != true { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanFalse) }
+        }
+        // What Claude shows before switching: another session can ask the very
+        // same question ("Commit and push this change?"), and pressing its box
+        // would answer the wrong session.
+        // Claude builds its tree a moment after being asked: wait until the
+        // window can be read, or this look would see nothing and prove nothing.
+        var onScreen = scan(app)
+        for _ in 0..<8 where onScreen.count < 50 {
+            Thread.sleep(forTimeInterval: 0.5)
+            onScreen = scan(app)
+        }
+        let shownBefore = questions(ask, in: onScreen)
+        log.append("before opening: \(onScreen.count) texts and buttons; question on screen: \(!shownBefore.isEmpty)")
+        guard onScreen.count >= 50 else {
+            open()
+            return .opened("Claude's window could not be read")
+        }
+        open()
+        Thread.sleep(forTimeInterval: 1)      // opening the session already shown redraws it a moment later
+        var last: AXUIElement?
+        for look in 1...12 {                  // up to 7 s
+            Thread.sleep(forTimeInterval: 0.5)
+            let nodes = scan(app)
+            guard let q = questions(ask, in: nodes).last else { last = nil; continue }
+            let redrawn = !shownBefore.contains { CFEqual($0.element, q.element) }
+            let named = windowTitles(app).contains { Self.normal($0).contains(Self.normal(title)) }
+            guard shownBefore.isEmpty || redrawn || named else { continue }   // not sure it switched yet
+            guard let target = buttons(after: q, in: nodes).first(where: { Self.isButton($0.label, button) }) else {
+                log.append("look \(look): question found, button not next to it")
+                return .opened("its button was not next to the question")
+            }
+            // Press only what two looks in a row agree on.
+            guard let previousLook = last, CFEqual(previousLook, target.element) else { last = target.element; continue }
+            log.append("look \(look): settled (redrawn \(redrawn), named in title \(named))")
+            let mark = transcript.flatMap { fileStamp($0)?.size }
+            for attempt in 1...2 {
+                let element = attempt == 1 ? target.element
+                    : (questions(ask, in: scan(app)).last.flatMap { q in
+                        buttons(after: q, in: scan(app)).first { Self.isButton($0.label, button) }?.element })
+                guard let element else {
+                    log.append("attempt \(attempt): the button is gone")
+                    return .answered
+                }
+                let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
+                log.append("attempt \(attempt): press \(result == .success ? "ok" : "error \(result.rawValue)")")
+                guard result == .success else { return .opened("Claude did not take the press") }
+                switch confirm(ask: ask, button: button, app: app, transcript: transcript, mark: mark, log: &log) {
+                case .yes: return .answered
+                case .unknown: return .opened("the box did not change after the press")
+                case .no: continue            // the transcript shows nothing arrived: try once more
+                }
+            }
+            return .opened("Claude did not take the press")
+        }
+        log.append("the question did not show, or Claude did not switch")
+        return .opened("the question did not show in Claude")
+    }
+
+    private enum Confirmation { case yes, no, unknown }
+
+    /// Whether the answer landed, within 6 s: the box's buttons went away, or
+    /// the transcript gained a message from you with the label. `.no` only when
+    /// the transcript says nothing arrived, so a second press can't answer twice.
+    private func confirm(ask: String, button: String, app: AXUIElement, transcript: String?, mark: Int64?,
+                         log: inout [String]) -> Confirmation {
+        for tick in 1...12 {
+            Thread.sleep(forTimeInterval: 0.5)
+            if let transcript, let mark, Self.sent(in: transcript, after: mark).contains(where: { Self.sameText($0, button) }) {
+                log.append("confirmed by the transcript after \(Double(tick) / 2) s")
+                return .yes
+            }
+            let nodes = scan(app)
+            let still = questions(ask, in: nodes).last.map { q in
+                buttons(after: q, in: nodes).contains { Self.isButton($0.label, button) } } ?? false
+            if !still {
+                log.append("confirmed by the box after \(Double(tick) / 2) s")
+                return .yes
+            }
+        }
+        log.append("no change in 6 s")
+        return transcript != nil && mark != nil ? .no : .unknown
+    }
+
+    /// Messages from you written to a transcript after byte `offset`.
+    static func sent(in path: String, after offset: Int64) -> [String] {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return [] }
+        defer { try? handle.close() }
+        try? handle.seek(toOffset: UInt64(max(0, offset)))
+        guard let data = try? handle.read(upToCount: 4 * 1024 * 1024) else { return [] }
+        return data.split(separator: UInt8(ascii: "\n")).compactMap { raw -> String? in
+            guard raw.starts(with: Array(#"{"parentUuid""#.utf8)),
+                  let o = (try? JSONSerialization.jsonObject(with: Data(raw))) as? [String: Any],
+                  (o["type"] as? String) == "user", (o["isMeta"] as? Bool) != true,
+                  (o["isSidechain"] as? Bool) != true else { return nil }
+            let content = (o["message"] as? [String: Any])?["content"]
+            if let text = content as? String { return text }
+            let texts = ((content as? [[String: Any]]) ?? []).compactMap { $0["text"] as? String }
+            return texts.isEmpty ? nil : texts.joined(separator: " ")
+        }
+    }
+
+    private func windowTitles(_ app: AXUIElement) -> [String] {
+        (attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []).compactMap { attribute($0, kAXTitleAttribute) as? String }
+    }
+
+    /// The texts matching the question, in order.
+    private func questions(_ ask: String, in nodes: [Node]) -> [Node] {
+        nodes.filter { $0.role == "AXStaticText" && Self.sameText($0.label, ask) }
+    }
+
+    /// The buttons right after a question.
+    private func buttons(after question: Node, in nodes: [Node]) -> [Node] {
+        guard let q = nodes.firstIndex(where: { CFEqual($0.element, question.element) }) else { return [] }
+        return nodes[(q + 1)...].prefix(12).filter { $0.role == "AXButton" }
+    }
+
+    /// Every window's text and buttons, in order. At most 3 s and 40,000 elements.
+    private func scan(_ app: AXUIElement) -> [Node] {
+        let start = Date()
+        var stack = (attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []).reversed().map { ($0, 0) }
+        var nodes: [Node] = []
+        var visited = 0
+        while let (element, depth) = stack.popLast(), visited < 40_000, Date().timeIntervalSince(start) < 3 {
+            visited += 1
+            let role = attribute(element, kAXRoleAttribute) as? String ?? ""
+            if role == "AXStaticText" || role == "AXButton" {
+                let label = [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute]
+                    .lazy.compactMap { self.attribute(element, $0) as? String }.first { !$0.isEmpty } ?? ""
+                nodes.append(Node(role: role, label: label, element: element))
+            }
+            if depth < 90, let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
+                for child in children.reversed() { stack.append((child, depth + 1)) }
+            }
+        }
+        return nodes
+    }
+
+    private func attribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+        var value: AnyObject?
+        return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+    }
+
+    static func normal(_ s: String) -> String {
+        s.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// The same words, ignoring case and spacing.
+    static func sameText(_ a: String, _ b: String) -> Bool { !a.isEmpty && normal(a) == normal(b) }
+
+    /// A button with exactly this label; a keyboard shortcut drawn after it is allowed.
+    static func isButton(_ label: String, _ wanted: String) -> Bool {
+        let l = normal(label), w = normal(wanted)
+        guard !w.isEmpty, l.hasPrefix(w) else { return false }
+        return l.dropFirst(w.count).allSatisfy { " ⌘⇧⌥⌃↩⏎⎋".contains($0) }
     }
 }
 
@@ -3622,6 +4422,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.floating.fitToContent()
         }
         if floating.wasShown { floating.show() }
+        // Answer from Cards is on but the permission is missing (say, after a reset): ask again.
+        if UserDefaults.standard.bool(forKey: ClaudeAnswerer.enabledKey) && !AXIsProcessTrusted() {
+            ClaudeAnswerer.requestPermission()
+        }
         engine.enableStatsSignal()
         engine.start()
         let workspace = NSWorkspace.shared.notificationCenter
@@ -3770,7 +4574,11 @@ func sampleRows(now: Date) -> [Row] {
         Row(id: "local_s1", group: .yourTurn, title: "Plan the billing export migration",
             ask: "Which of the three migration orders should I use, and is a 20-minute write freeze on Sunday night acceptable?",
             detail: "Migration plan drafted; three options compared", context: "billing-service",
-            since: minutesAgo(6), link: "local_s1"),
+            since: minutesAgo(6), link: "local_s1",
+            card: TurnCard(ask: "Start with the read-only replica on Sunday night?",
+                           actions: ["Yes, start Sunday", "Pick another night"],
+                           recap: "The migration plan compares three orders; replica first needs a 20-minute write freeze.",
+                           reply: "**Recommendation:** replica first. It keeps the export running during the copy and needs only a 20-minute write freeze.\n\n**Other orders:** schema first is faster but blocks writes for about an hour; dual-write needs a code change first.")),
         Row(id: "local_s2", group: .yourTurn, title: "Go-live readiness",
             ask: "Answer plan section 12: first customer tenant date; OK to re-upload the dashboard if prod restarts; Slack channels for prod and dev alerts; OK to create short-lived DNS and load balancers; alert thresholds; who runs the cluster steps. Also: start the dev gate tests, and OK to create embed users on dev?",
             detail: "Cutover plan drafted; 6 decisions needed", context: "web-platform",
@@ -3785,13 +4593,18 @@ func sampleRows(now: Date) -> [Row] {
             since: minutesAgo(31), terminal: true, activity: "Running the nightly export",
             lastOutput: minutesAgo(14)),
         Row(id: "local_s6", group: .justFinished, title: "Fix the flaky checkout test", context: "web-app",
-            since: minutesAgo(0.2), link: "local_s6"),
+            since: minutesAgo(0.2), link: "local_s6",
+            card: TurnCard(ask: "Commit and push this change?", actions: ["Commit and push", "Not yet"],
+                           recap: "The checkout test now waits for the cart total before paying; 20 runs in a row passed.",
+                           reply: "The test clicked Pay before the cart total had loaded. It now waits for the total, and 20 runs in a row passed locally. Nothing is committed yet.")),
         Row(id: "local_s7", group: .review, title: "Move dashboards to the new BI tool",
             detail: "Two schema PRs open; will validate after they merge", context: "analytics",
-            since: minutesAgo(19 * 60), link: "local_s7"),
+            since: minutesAgo(19 * 60), link: "local_s7",
+            card: TurnCard(reply: "Both schema PRs are open. Once they merge, I'll point the dashboards at the new tables and compare a week of numbers.")),
         Row(id: "local_s8", group: .done, title: "Chrome tabs cleanup",
             detail: "Closed 5 tabs for merged PRs; one PR still open", context: "Scratch",
-            since: minutesAgo(215), link: "local_s8"),
+            since: minutesAgo(215), link: "local_s8",
+            card: TurnCard(reply: "Closed five tabs for merged PRs. One PR is still open, so its tab stays.")),
         Row(id: "local_s9", group: .done, title: "Draft the release notes for 4.2",
             detail: "Notes drafted; screenshots still needed", context: "web-app",
             since: minutesAgo(1500), link: "local_s9"),
@@ -3835,7 +4648,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
         ? NSHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {}, glow: glow,
                                                layout: snapshotLayout(), status: status,
                                                forceContrast: contrast, forceSolid: arguments.contains("--solid"),
-                                               initialFilter: argument(after: "--filter").flatMap(RowFilter.init(rawValue:)))
+                                               initialFilter: argument(after: "--filter").flatMap(RowFilter.init(rawValue:)),
+                                               initialResponse: argument(after: "--response"))
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
             .background(Color(nsColor: .windowBackgroundColor)))
@@ -4091,6 +4905,61 @@ func runSelfTest() {
     check("never past the screen", resizedFrame(start, edges: .right, delta: NSPoint(x: 5000, y: 0), minSize: minimum,
                                                 limit: screen).maxX == 1440)
 
+    // Turn cards, read from a transcript's tail (a big first line makes the read start mid-file).
+    let cardFile = NSTemporaryDirectory() + "limbo-card-\(getpid()).jsonl"
+    func transcriptFile(_ lines: [String]) -> String {
+        let filler = #"{"type":"summary","pad":""# + String(repeating: "x", count: 300_000) + #""}"#
+        try? (([filler] + lines).joined(separator: "\n") + "\n").write(toFile: cardFile, atomically: true, encoding: .utf8)
+        return cardFile
+    }
+    func saidLine(_ text: String) -> String {
+        #"{"parentUuid":"p","type":"user","message":{"role":"user","content":"\#(text)"}}"#
+    }
+    func wrapLine(_ id: String, _ input: String, sidechain: Bool = false) -> String {
+        #"{"parentUuid":"p","isSidechain":\#(sidechain),"type":"assistant","message":{"content":[{"type":"tool_use","id":"\#(id)","name":"mcp__ccd_turn__wrap_up","input":\#(input)}]}}"#
+    }
+    func resultLine(_ id: String, error: Bool = false) -> String {
+        #"{"parentUuid":"p","type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"\#(id)","is_error":\#(error),"content":"ok"}]}}"#
+    }
+    func replyLine(_ text: String) -> String {
+        #"{"parentUuid":"p","type":"assistant","message":{"content":[{"type":"text","text":"\#(text)"}]}}"#
+    }
+    let shipIt = #"{"recap":"All set.","ask":"Ship it?","actions":[{"label":"Yes"},{"action":"commit"}]}"#
+    let ended = [saidLine("do it"), wrapLine("w1", shipIt), resultLine("w1"), replyLine("Done. **All** good: [main.swift](src/main.swift).")]
+    let turn = turnCard(transcript: transcriptFile(ended))
+    check("a turn card has the question and buttons", turn?.ask == "Ship it?" && turn?.actions == ["Yes", "Commit"])
+    check("its reply keeps bold and drops local file links", turn?.reply == "Done. **All** good: main.swift.")
+    check("its recap", turn?.recap == "All set.")
+    check("a message after it means no question", turnCard(transcript: transcriptFile(ended + [saidLine("thanks")])) == nil)
+    let retried = [saidLine("go"), wrapLine("a", #"{"ask":"Good?"}"#), resultLine("a"),
+                   wrapLine("b", #"{"ask":"Bad?"}"#), resultLine("b", error: true), replyLine("Bye")]
+    check("a wrap-up that failed is skipped", turnCard(transcript: transcriptFile(retried))?.ask == "Good?")
+    check("agent lines are ignored",
+          turnCard(transcript: transcriptFile(ended + [wrapLine("s", #"{"ask":"An agent's?"}"#, sidechain: true)]))?.ask == "Ship it?")
+    check("a turn without a wrap-up keeps its reply",
+          turnCard(transcript: transcriptFile([saidLine("hi"), replyLine("Hello")])) == TurnCard(reply: "Hello"))
+    check("a question with no buttons gets one", TurnCard(ask: "Go?").buttons == ["Answer in Claude"])
+    // Answering from a card presses only an exact match.
+    check("the same question, ignoring case and spacing",
+          ClaudeAnswerer.sameText("Commit and push  this change?", "commit and push this change?"))
+    check("a button with exactly the label", ClaudeAnswerer.isButton("Yes, post it", "Yes, post it"))
+    check("a button with its shortcut drawn after it", ClaudeAnswerer.isButton("Yes, post it ⌘↩", "Yes, post it"))
+    check("not a button whose label only starts the same", !ClaudeAnswerer.isButton("Yes, post it later", "Yes, post it"))
+    check("not an empty label", !ClaudeAnswerer.isButton("Send", ""))
+    // An answer is confirmed by the transcript: a message from you after the press.
+    let sentFile = NSTemporaryDirectory() + "limbo-sent-\(getpid()).jsonl"
+    try? (replyLine("Commit and push this change?") + "\n").write(toFile: sentFile, atomically: true, encoding: .utf8)
+    let mark = fileStamp(sentFile)?.size ?? 0
+    if let handle = FileHandle(forWritingAtPath: sentFile) {
+        handle.seekToEndOfFile()
+        handle.write(Data((saidLine("Commit and push") + "\n" + resultLine("x") + "\n").utf8))
+        try? handle.close()
+    }
+    check("a message from you after the press is found", ClaudeAnswerer.sent(in: sentFile, after: mark) == ["Commit and push"])
+    check("nothing before the press counts", ClaudeAnswerer.sent(in: sentFile, after: fileStamp(sentFile)?.size ?? 0).isEmpty)
+    try? FileManager.default.removeItem(atPath: sentFile)
+    try? FileManager.default.removeItem(atPath: cardFile)
+
     check("short ages", [30.0, 360, 18 * 3600, 3 * 86400].map { compactAge(since: now.addingTimeInterval(-$0), now: now) }
                         == ["now", "6m", "18h", "3d"])
     let waitingRow = Row(id: "w1", group: .yourTurn, title: "w", context: "", since: now.addingTimeInterval(-300))
@@ -4242,13 +5111,18 @@ func runResizeCheck() {
 /// synthetic clicks in an off-screen window, and reports the mini setting.
 func runGestureCheck() {
     _ = NSApplication.shared
+    recordTestFrames = true
     let model = SessionModel()
     model.rows = sampleRows(now: Date())
     let layout = FloatingLayout()
     let glow = RunningGlowView(frame: .zero)
     var unpinned = false
-    let host = FirstClickHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: { unpinned = true },
-                                                            glow: glow, layout: layout))
+    var opened: [String] = []
+    var answered: [String] = []
+    let host = FirstClickHostingView(rootView: FloatingView(model: model, open: { opened.append($0.id) },
+                                                            unpin: { unpinned = true },
+                                                            glow: glow, layout: layout,
+                                                            answer: { row, label in answered.append("\(row.id):\(label)") }))
     host.frame = NSRect(origin: .zero, size: host.fittingSize)
     let panel = KeepOnTopPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel],
                                backing: .buffered, defer: false)
@@ -4309,6 +5183,43 @@ func runGestureCheck() {
     check("double-clicking the pill expands it", !layout.mini)
     check("the glow comes back to the window", glow.window != nil && glow.bounds.height == host.frame.height
               && glow.bounds.height > 100, glowState())
+    // A card's button opens its session; the response button shows the reply
+    // without opening anything. Their places are recorded as they are laid out.
+    func place(of name: String) -> NSPoint? {
+        testFrames[name].map { NSPoint(x: $0.midX, y: host.frame.height - $0.midY) }   // SwiftUI's y runs down
+    }
+    if let point = place(of: "answer:local_s6:0") {
+        click(at: point)
+        check("a card's button opens its session", opened.last == "local_s6", "(opened \(opened))")
+    } else {
+        check("a card's button opens its session", false, "(button not found)")
+    }
+    // With "Answer from Cards" on (this binary's own settings, put back after),
+    // the same button answers in place and opens nothing.
+    let wasOn = UserDefaults.standard.bool(forKey: ClaudeAnswerer.enabledKey)
+    UserDefaults.standard.set(true, forKey: ClaudeAnswerer.enabledKey)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    opened.removeAll()
+    if let point = place(of: "answer:local_s6:0") {
+        click(at: point)
+        check("with Answer from Cards on, the button answers instead of opening",
+              answered == ["local_s6:Commit and push"] && opened.isEmpty, "(answered \(answered), opened \(opened))")
+    }
+    UserDefaults.standard.set(wasOn, forKey: ClaudeAnswerer.enabledKey)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    opened.removeAll()
+    let closedHeight = host.frame.height
+    if let point = place(of: "response:local_s7") {
+        click(at: point)
+        refit()
+        check("the response button shows the reply without opening the session",
+              host.frame.height > closedHeight && opened.isEmpty,
+              "(height \(Int(closedHeight)) -> \(Int(host.frame.height)), opened \(opened))")
+        if let again = place(of: "response:local_s7") { click(at: again); refit() }
+        check("and hides it again", host.frame.height == closedHeight && opened.isEmpty)
+    } else {
+        check("the response button shows the reply without opening the session", false, "(button not found)")
+    }
     // A single click on the close button still works.
     click(at: NSPoint(x: host.frame.width - 20, y: host.frame.height - 18))
     check("the close button takes a single click", unpinned)
