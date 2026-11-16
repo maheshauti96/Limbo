@@ -3024,9 +3024,9 @@ struct ResizeEdges: OptionSet {
     static let top = ResizeEdges(rawValue: 4)
     static let bottom = ResizeEdges(rawValue: 8)
 
-    /// The edges a point (y up) is on: within 5 pt of an edge, or within 14 pt
+    /// The edges a point (y up) is on: within 6 pt of an edge, or within 14 pt
     /// of a corner along either side, so corners are easy to grab.
-    init(at p: NSPoint, in size: NSSize, band: CGFloat = 5, corner: CGFloat = 14) {
+    init(at p: NSPoint, in size: NSSize, band: CGFloat = 6, corner: CGFloat = 14) {
         let nearLeft = p.x <= band, nearRight = p.x >= size.width - band
         let nearBottom = p.y <= band, nearTop = p.y >= size.height - band
         let alongSide = nearLeft || nearRight, alongEnd = nearTop || nearBottom
@@ -3077,16 +3077,48 @@ func resizedFrame(_ start: NSRect, edges: ResizeEdges, delta: NSPoint, minSize: 
     return f
 }
 
+/// Lets this app's cursor show while another app is in front, through the
+/// window server's private SetsCursorInBackground setting (looked up at run
+/// time; if it's missing, the cursor just stays as macOS leaves it). macOS
+/// otherwise ignores NSCursor.set() from a background app, and the
+/// keep-on-top window never makes Limbo Tasks frontmost. Kept on only while
+/// the pointer is on a resize edge, so the app never overrides other apps'
+/// cursors. Turn it off only after setting the arrow: a set made while it is
+/// off is ignored, which would leave a resize cursor stuck over the next app.
+enum BackgroundCursor {
+    private typealias SetProperty = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32
+    private typealias MainConnection = @convention(c) () -> Int32
+    private static let apply: ((Bool) -> Void)? = {
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let setSymbol = dlsym(handle, "CGSSetConnectionProperty"),
+              let mainSymbol = dlsym(handle, "CGSMainConnectionID") else { return nil }
+        let setProperty = unsafeBitCast(setSymbol, to: SetProperty.self)
+        let connection = unsafeBitCast(mainSymbol, to: MainConnection.self)()
+        return { on in
+            _ = setProperty(connection, connection, "SetsCursorInBackground" as CFString,
+                            on ? kCFBooleanTrue : kCFBooleanFalse)
+        }
+    }()
+    private(set) static var allowed = false
+    static var available: Bool { apply != nil }
+
+    static func allow(_ on: Bool) {
+        guard on != allowed, let apply else { return }
+        allowed = on
+        apply(on)
+    }
+}
+
 /// Resizing for the borderless keep-on-top window: a thin band inside each
-/// edge takes the drag; anywhere else clicks fall through to the rows. It
-/// asks for the resize cursor, but macOS shows cursor changes only from the
-/// frontmost app, and this window never makes Limbo Tasks frontmost (so it
-/// never takes focus from a game or video): the cursor appears only when the
-/// app happens to be frontmost, for example right after using its panel.
+/// edge takes the drag; anywhere else clicks fall through to the rows. On the
+/// band the pointer becomes the resize cursor, even while another app is in
+/// front (see BackgroundCursor), without making Limbo Tasks frontmost.
 final class ResizeEdgesView: NSView {
     var minSize = FloatingLayout.minSize
     var onResize: (NSRect, ResizeEdges) -> Void = { _, _ in }
     var onResizeEnd: () -> Void = {}
+    /// The pointer in screen points; a check can stand in for the real mouse.
+    var mouseLocation: () -> NSPoint = { NSEvent.mouseLocation }
     private var drag: (edges: ResizeEdges, frame: NSRect, mouse: NSPoint)?
     private var showingResizeCursor = false
 
@@ -3107,36 +3139,47 @@ final class ResizeEdgesView: NSView {
         ResizeEdges(at: convert(event.locationInWindow, from: nil), in: bounds.size)
     }
 
-    override func mouseEntered(with event: NSEvent) { updateCursor(event) }
-    override func mouseMoved(with event: NSEvent) { updateCursor(event) }
+    override func mouseEntered(with event: NSEvent) { hover(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseMoved(with event: NSEvent) { hover(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseExited(with event: NSEvent) { hover(at: nil) }
 
-    override func mouseExited(with event: NSEvent) {
-        guard drag == nil, showingResizeCursor else { return }
-        showingResizeCursor = false
-        NSCursor.arrow.set()
+    /// The pointer is at `point` (this view's coordinates), or has left (nil):
+    /// the resize cursor on an edge, the arrow again off it.
+    func hover(at point: NSPoint?) {
+        guard drag == nil else { return }
+        let edges = point.map { ResizeEdges(at: $0, in: bounds.size) } ?? []
+        if edges.isEmpty { endResizeCursor() } else { showResizeCursor(edges) }
     }
 
-    private func updateCursor(_ event: NSEvent) {
-        guard drag == nil else { return }
-        let edges = edges(event)
-        if !edges.isEmpty {
-            edges.cursor.set()
-            showingResizeCursor = true
-        } else if showingResizeCursor {
-            showingResizeCursor = false
-            NSCursor.arrow.set()
-        }
+    private func showResizeCursor(_ edges: ResizeEdges) {
+        BackgroundCursor.allow(true)
+        edges.cursor.set()
+        showingResizeCursor = true
+    }
+
+    /// Back to the arrow, then the background setting off (in that order).
+    func endResizeCursor() {
+        guard showingResizeCursor else { return }
+        showingResizeCursor = false
+        NSCursor.arrow.set()
+        BackgroundCursor.allow(false)
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        endResizeCursor()
     }
 
     override func mouseDown(with event: NSEvent) {
         let edges = edges(event)
         guard let window, !edges.isEmpty else { return }
-        drag = (edges, window.frame, NSEvent.mouseLocation)
+        showResizeCursor(edges)
+        drag = (edges, window.frame, mouseLocation())
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard let drag, let window else { return }
-        let mouse = NSEvent.mouseLocation
+        let mouse = mouseLocation()
         let limit = window.screen?.frame ?? NSScreen.main?.frame ?? .infinite
         let frame = resizedFrame(drag.frame, edges: drag.edges,
                                  delta: NSPoint(x: mouse.x - drag.mouse.x, y: mouse.y - drag.mouse.y),
@@ -3149,6 +3192,7 @@ final class ResizeEdgesView: NSView {
         guard drag != nil else { return }
         drag = nil
         onResizeEnd()
+        hover(at: convert(event.locationInWindow, from: nil))   // still on an edge: keep the resize cursor
     }
 }
 
@@ -3272,6 +3316,7 @@ final class FloatingController {
         previewing = nil
         wasRunning = 0
         glow.setMode(.off)
+        edges?.endResizeCursor()
         panel?.orderOut(nil)
         model.pinned = false
         UserDefaults.standard.set(false, forKey: Self.shownKey)
@@ -3851,6 +3896,9 @@ func runSelfTest() {
     check("bottom edge", ResizeEdges(at: NSPoint(x: 150, y: 3), in: size) == .bottom)
     check("top-right corner from 12 pt along the top", ResizeEdges(at: NSPoint(x: 288, y: 118), in: size) == [.top, .right])
     check("inside: no edge", ResizeEdges(at: NSPoint(x: 150, y: 60), in: size).isEmpty)
+    check("right edge from 6 pt in", ResizeEdges(at: NSPoint(x: 294, y: 60), in: size) == .right)
+    check("7 pt in is still the rows", ResizeEdges(at: NSPoint(x: 293, y: 60), in: size).isEmpty)
+    check("bottom edge from 6 pt up", ResizeEdges(at: NSPoint(x: 150, y: 6), in: size) == .bottom)
     let start = NSRect(x: 100, y: 100, width: 300, height: 120), screen = NSRect(x: 0, y: 0, width: 1440, height: 900)
     let minimum = FloatingLayout.minSize
     check("right edge widens", resizedFrame(start, edges: .right, delta: NSPoint(x: 50, y: 0), minSize: minimum,
@@ -3913,6 +3961,102 @@ func runGlowCycle(seconds: Int) {
     }
     print(String(format: "cpu %.3f s over %d s", cpu() - start, seconds))
     exit(0)
+}
+
+/// Drags the keep-on-top window's right and bottom edges and its corner with
+/// synthetic clicks on the same views as the real window (rows, resize band
+/// on top), then checks the background cursor setting is on only while on an
+/// edge and the app never becomes frontmost. The window is on screen (a resize
+/// stays inside the screen) but invisible and click-through. Which cursor
+/// macOS shows can only be read with the real pointer resting on the window
+/// (NSCursor.currentSystem); synthetic moves don't drive tracking areas.
+func runResizeCheck() {
+    _ = NSApplication.shared
+    let model = SessionModel()
+    model.rows = sampleRows(now: Date())
+    let layout = FloatingLayout()
+    let host = FirstClickHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {},
+                                                            glow: RunningGlowView(frame: .zero), layout: layout))
+    let size = host.fittingSize
+    let panel = KeepOnTopPanel(contentRect: NSRect(origin: NSPoint(x: 200, y: 200), size: size),
+                               styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    let content = NSView(frame: NSRect(origin: .zero, size: size))
+    host.frame = content.bounds
+    host.autoresizingMask = [.width, .height]
+    let edges = ResizeEdgesView(frame: content.bounds)
+    edges.autoresizingMask = [.width, .height]
+    content.addSubview(host)
+    content.addSubview(edges)
+    panel.contentView = content
+    panel.alphaValue = 0
+    panel.ignoresMouseEvents = true
+    panel.orderFrontRegardless()
+    var mouse = NSPoint.zero
+    edges.mouseLocation = { mouse }
+    edges.onResize = { frame, _ in panel.setFrame(frame, display: true) }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+
+    var failed = 0
+    func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+        print(ok ? "pass" : "FAIL", name, detail)
+        if !ok { failed += 1 }
+    }
+    func send(_ type: NSEvent.EventType, at point: NSPoint) {
+        let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                       timestamp: ProcessInfo.processInfo.systemUptime,
+                                       windowNumber: panel.windowNumber, context: nil, eventNumber: 0,
+                                       clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+        panel.sendEvent(event)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    /// Presses at `point` (window coordinates) and drags by `delta`.
+    func drag(from point: NSPoint, by delta: NSPoint) -> (before: NSRect, after: NSRect) {
+        let before = panel.frame
+        mouse = panel.convertPoint(toScreen: point)
+        send(.leftMouseDown, at: point)
+        mouse = NSPoint(x: mouse.x + delta.x, y: mouse.y + delta.y)
+        let to = NSPoint(x: point.x + delta.x, y: point.y + delta.y)
+        send(.leftMouseDragged, at: to)
+        send(.leftMouseUp, at: to)
+        return (before, panel.frame)
+    }
+
+    let w = size.width, h = size.height
+    check("the right edge takes the click", content.hitTest(NSPoint(x: w - 2, y: h / 2)) === edges)
+    check("the bottom edge takes the click", content.hitTest(NSPoint(x: w / 2, y: 2)) === edges)
+    check("inside, clicks reach the rows", content.hitTest(NSPoint(x: w / 2, y: h / 2)) !== edges)
+    var moved = drag(from: NSPoint(x: w - 2, y: h / 2), by: NSPoint(x: 60, y: 0))
+    check("dragging the right edge widens", moved.after.width == moved.before.width + 60
+              && moved.after.minX == moved.before.minX && moved.after.height == moved.before.height,
+          "(\(NSStringFromRect(moved.before)) -> \(NSStringFromRect(moved.after)))")
+    moved = drag(from: NSPoint(x: panel.frame.width / 2, y: 2), by: NSPoint(x: 0, y: -50))
+    check("dragging the bottom edge down makes it taller, top fixed", moved.after.height == moved.before.height + 50
+              && moved.after.maxY == moved.before.maxY && moved.after.width == moved.before.width,
+          "(\(NSStringFromRect(moved.before)) -> \(NSStringFromRect(moved.after)))")
+    moved = drag(from: NSPoint(x: panel.frame.width - 2, y: 2), by: NSPoint(x: -30, y: 20))
+    check("dragging the bottom-right corner does both", moved.after.width == moved.before.width - 30
+              && moved.after.height == moved.before.height - 20 && moved.after.maxY == moved.before.maxY,
+          "(\(NSStringFromRect(moved.before)) -> \(NSStringFromRect(moved.after)))")
+
+    let me = ProcessInfo.processInfo.processIdentifier
+    func frontmostIsMe() -> Bool { NSWorkspace.shared.frontmostApplication?.processIdentifier == me }
+    let w2 = panel.frame.width, h2 = panel.frame.height
+    check("the background cursor setting is available", BackgroundCursor.available)
+    edges.hover(at: NSPoint(x: w2 - 2, y: h2 / 2))
+    check("on the right edge the background cursor setting is on", BackgroundCursor.allowed)
+    edges.hover(at: NSPoint(x: w2 / 2, y: h2 / 2))
+    check("moving inside turns it off", !BackgroundCursor.allowed)
+    edges.hover(at: NSPoint(x: w2 - 3, y: 4))
+    check("on the corner it is on", BackgroundCursor.allowed)
+    edges.hover(at: nil)
+    check("leaving turns it off", !BackgroundCursor.allowed)
+    _ = drag(from: NSPoint(x: w2 / 2, y: 2), by: NSPoint(x: 0, y: 30))
+    check("a drag that ends off the edges leaves it off", !BackgroundCursor.allowed)
+    check("Limbo Tasks never became the frontmost app", !frontmostIsMe(),
+          "(in front: \(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"))")
+    panel.orderOut(nil)
+    print(failed == 0 ? "all passed" : "\(failed) failed")
+    exit(failed == 0 ? 0 : 1)
 }
 
 /// Double-clicks the keep-on-top window's header, then the pill, with
@@ -3995,6 +4139,9 @@ func runGestureCheck() {
 
 if arguments.contains("--gesture-check") {
     runGestureCheck()
+}
+if arguments.contains("--resize-check") {
+    runResizeCheck()
 }
 if arguments.contains("--self-test") {
     runSelfTest()
