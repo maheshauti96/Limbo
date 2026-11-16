@@ -1848,7 +1848,7 @@ struct SessionRow: View {
                             .foregroundStyle(row.group == .yourTurn ? AnyShapeStyle(.primary)
                                              : quiet != nil ? AnyShapeStyle(Palette(scheme, contrast: contrast).quiet)
                                              : AnyShapeStyle(.secondary))
-                            .lineLimit(row.group == .done ? 1 : 2)
+                            .lineLimit(row.group == .running ? 2 : nil)
                             .truncationMode(.tail)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -2277,10 +2277,13 @@ struct CompactRow: View {
                             ShimmerText(text: line, base: p.shimmerBase, bright: p.shimmer)
                                 .accessibilityLabel(line)
                         } else {
+                            // Questions and summaries wrap in full (at most a few lines);
+                            // a running line stays on one, so the row doesn't jump as it changes.
                             Text(line).font(.system(size: 11))
                                 .foregroundStyle(row.group == .yourTurn || question != nil ? Color.primary
                                                  : row.group == .running ? p.shimmerBase : p.text2)
-                                .lineLimit(1).truncationMode(.tail)
+                                .lineLimit(row.group == .running ? 1 : nil).truncationMode(.tail)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
