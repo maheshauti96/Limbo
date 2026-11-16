@@ -4223,6 +4223,89 @@ final class AnswerStatus: ObservableObject {
 /// button right after it has exactly that label. On any doubt it presses
 /// nothing and leaves the session open. After an answer it brings back the app
 /// you were in.
+/// Which Space each display shows, and the window in front on it, so a display
+/// that Claude's full-screen Space took over can be put back. The window
+/// server's Space calls are private: read through dlsym, and nothing happens
+/// without them.
+enum DisplaySpaces {
+    private typealias MainConnection = @convention(c) () -> Int32
+    private typealias CurrentSpace = @convention(c) (Int32, CFString) -> UInt64
+    private typealias WindowNumber = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    private static let handle = dlopen(nil, RTLD_NOW)
+    private static let connection: Int32? = dlsym(handle, "CGSMainConnectionID")
+        .map { unsafeBitCast($0, to: MainConnection.self)() }
+    private static let currentSpace: CurrentSpace? = dlsym(handle, "CGSManagedDisplayGetCurrentSpace")
+        .map { unsafeBitCast($0, to: CurrentSpace.self) }
+    private static let windowNumber: WindowNumber? = dlsym(handle, "_AXUIElementGetWindow")
+        .map { unsafeBitCast($0, to: WindowNumber.self) }
+
+    /// One display when you clicked: its Space, and the app and window in front there.
+    struct Shown {
+        let uuid: String
+        let space: UInt64
+        let pid: pid_t?
+        let window: AXUIElement?
+    }
+
+    static func space(of uuid: String) -> UInt64? {
+        guard let connection, let currentSpace else { return nil }
+        let id = currentSpace(connection, uuid as CFString)
+        return id == 0 ? nil : id
+    }
+
+    /// Every display's Space and front window (not Limbo's, not `skip`).
+    static func snapshot(skip: pid_t) -> [Shown] {
+        var count: UInt32 = 0
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        guard CGGetActiveDisplayList(16, &ids, &count) == .success else { return [] }
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        let me = getpid()
+        return ids.prefix(Int(count)).compactMap { display -> Shown? in
+            guard let cfUUID = CGDisplayCreateUUIDFromDisplayID(display)?.takeRetainedValue(),
+                  let uuid = CFUUIDCreateString(nil, cfUUID) as String?,
+                  let space = space(of: uuid) else { return nil }
+            let frame = CGDisplayBounds(display)
+            // The front window filling most of this display (front to back in the list).
+            let front = list.first { w in
+                guard (w[kCGWindowLayer as String] as? Int) == 0,
+                      let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != me, pid != skip,
+                      let bounds = (w[kCGWindowBounds as String] as? NSDictionary)
+                          .flatMap({ CGRect(dictionaryRepresentation: $0 as CFDictionary) })
+                else { return false }
+                return frame.contains(CGPoint(x: bounds.midX, y: bounds.midY))
+                    && bounds.width * bounds.height >= frame.width * frame.height / 4
+            }
+            let pid = front?[kCGWindowOwnerPID as String] as? pid_t
+            let number = front?[kCGWindowNumber as String] as? CGWindowID
+            return Shown(uuid: uuid, space: space, pid: pid, window: pid.flatMap { axWindow(pid: $0, number: number) })
+        }
+    }
+
+    /// The app's accessibility element for a window, while it is on screen.
+    private static func axWindow(pid: pid_t, number: CGWindowID?) -> AXUIElement? {
+        guard let number, let windowNumber else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return nil }
+        return windows.first { window in
+            var id: CGWindowID = 0
+            return windowNumber(window, &id) == .success && id == number
+        }
+    }
+
+    /// Brings a window and its app to the front; macOS shows its Space.
+    static func raise(_ window: AXUIElement, pid: pid_t) {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+}
+
 final class ClaudeAnswerer {
     enum Outcome: Equatable {
         case answered
@@ -4347,6 +4430,15 @@ final class ClaudeAnswerer {
             open()
             return .opened("Claude was not running")
         }
+        // What each display shows, to put back if Claude's Space takes one over.
+        let shown = claudeIsHiddenSnapshot(claude: claude)
+        // The window you were in, to put back in front afterwards.
+        let yourWindow = previous.flatMap { previous -> AXUIElement? in
+            guard previous.bundleIdentifier != Self.claudeBundleId else { return nil }
+            let element = AXUIElementCreateApplication(previous.processIdentifier)
+            AXUIElementSetMessagingTimeout(element, 0.5)
+            return attribute(element, kAXFocusedWindowAttribute).map { $0 as! AXUIElement }
+        }
         var onScreen = scan(app)
         for _ in 0..<30 where onScreen.count < 50 {     // the tree takes a moment to build
             Thread.sleep(forTimeInterval: 0.1)
@@ -4384,12 +4476,13 @@ final class ClaudeAnswerer {
             if claude.isActive && currentSession(app) == session { ready = true; break }
         }
         log.add("Claude in front on the session: \(ready)")
+        let frontSince = Date()
         guard ready else {
             open()
             return .opened("Claude did not switch to the session")
         }
         let outcome = pressShown(session: session, ask: ask, button: button, transcript: transcript, app: app,
-                                 attempts: 2, switched: true, log: log)
+                                 attempts: 2, switched: true, frontSince: frontSince, log: log)
         guard outcome == .answered else {
             open()                                       // in front, on the session, for you to answer
             return outcome
@@ -4402,8 +4495,8 @@ final class ClaudeAnswerer {
                 log.add("switched Claude back to the session it showed")
             }
         } else {
-            giveBack(previous)
-            log.add("brought back the app you were in")
+            restore(shown, log: log)
+            giveBack(previous, window: yourWindow, log: log)
         }
         return .answered
     }
@@ -4442,26 +4535,37 @@ final class ClaudeAnswerer {
     /// With Claude showing the session: wait for its box to settle, press the
     /// button, and confirm the answer landed.
     private func pressShown(session: String, ask: String, button: String, transcript: String?, app: AXUIElement,
-                            attempts: Int, switched: Bool, log: Log) -> Outcome {
+                            attempts: Int, switched: Bool, frontSince: Date? = nil, log: Log) -> Outcome {
         // Press only a button that stays the same element for a moment: right
         // after a switch, or while the tree is new, the page is still being
         // drawn and a press on it can be lost. A look takes about 0.15 s.
-        let settle: TimeInterval = switched ? 0.5 : (Date().timeIntervalSince(treeSince) < 1.5 ? 0.4 : 0.1)
+        // After a switch, Claude ignores a press for a moment after it comes to
+        // the front (seen lost at 0.5 s, taken from 0.8 s): a second in front,
+        // and two looks agreeing. Its page waking up counts toward that.
+        let settle: TimeInterval = switched ? 0.1 : (Date().timeIntervalSince(treeSince) < 1.5 ? 0.4 : 0.1)
+        let inFrontFor: TimeInterval = switched ? 1.0 : 0
         var last: AXUIElement?
         var firstSeen = Date()
         var questionSeen = false
         let deadline = Date().addingTimeInterval(7)
         var look = 0
+        var looks: [String] = []        // per look: when, how long, texts and buttons, and what it found
+        defer { if !looks.isEmpty { log.add("looks: " + looks.joined(separator: ", ")) } }
         while Date() < deadline {
             look += 1
             if look > 1 { Thread.sleep(forTimeInterval: 0.08) }
-            guard currentSession(app) == session else { last = nil; continue }
+            let lookStart = Date()
+            guard currentSession(app) == session else { last = nil; looks.append("\(look) other session"); continue }
             let nodes = scan(app)
+            let found = liveButton(ask, button, in: nodes)
+            looks.append(String(format: "%d @%.2f %dms %dn %@", look, lookStart.timeIntervalSince(log.start),
+                                Int(Date().timeIntervalSince(lookStart) * 1000), nodes.count,
+                                found == nil ? "none" : (last.map { CFEqual($0, found!.element) } == true ? "same" : "new")))
             let asked = questions(ask, in: nodes)
             if !asked.isEmpty { questionSeen = true }
             // Claude keeps the questions of answered boxes in the conversation,
             // without their buttons: the live box is the copy that has the button.
-            guard let target = liveButton(ask, button, in: nodes) else {
+            guard let target = found else {
                 if let q = asked.last, Date().addingTimeInterval(0.3) >= deadline {
                     log.add("look \(look): \(asked.count) copies of the question; buttons after the last: "
                             + buttons(after: q, in: nodes).map { "“\($0.label.prefix(30))”" }.joined(separator: ", "))
@@ -4470,7 +4574,8 @@ final class ClaudeAnswerer {
                 continue
             }
             if let previousLook = last, CFEqual(previousLook, target.element) {
-                guard Date().timeIntervalSince(firstSeen) >= settle else { continue }
+                guard Date().timeIntervalSince(firstSeen) >= settle,
+                      Date().timeIntervalSince(frontSince ?? .distantPast) >= inFrontFor else { continue }
             } else {
                 last = target.element
                 firstSeen = Date()
@@ -4530,13 +4635,64 @@ final class ClaudeAnswerer {
     }
 
     /// Brings back the app you were in.
-    private func giveBack(_ previous: NSRunningApplication?) {
-        guard let previous, previous.bundleIdentifier != Self.claudeBundleId, let app = previous.bundleURL else { return }
-        DispatchQueue.main.sync {
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            NSWorkspace.shared.openApplication(at: app, configuration: configuration)
+    /// The displays' Spaces and front windows, read only when Claude's window
+    /// is not on screen (so it will have to come forward).
+    private func claudeIsHiddenSnapshot(claude: NSRunningApplication) -> [DisplaySpaces.Shown] {
+        Self.windowVisible(pid: claude.processIdentifier) ? [] : DisplaySpaces.snapshot(skip: claude.processIdentifier)
+    }
+
+    /// A display that now shows another Space than when you clicked (Claude's,
+    /// full screen) goes back: its front window then is raised, which makes
+    /// macOS show that window's Space again.
+    private func restore(_ shown: [DisplaySpaces.Shown], log: Log) {
+        for display in shown {
+            guard let now = DisplaySpaces.space(of: display.uuid), now != display.space else { continue }
+            guard let pid = display.pid, let window = display.window else {
+                log.add("a display stays on Claude's Space: no window to bring back there")
+                continue
+            }
+            DisplaySpaces.raise(window, pid: pid)
+            var back = false
+            for _ in 0..<24 {
+                Thread.sleep(forTimeInterval: 0.05)
+                if DisplaySpaces.space(of: display.uuid) == display.space { back = true; break }
+            }
+            log.add(back ? "a display back on its Space" : "a display did not go back to its Space")
         }
+    }
+
+    /// Puts the app and window you were in back in front (macOS switches back
+    /// to its Space), and checks that it is. Through Accessibility first: a
+    /// request from an app in the background to open another can be ignored.
+    private func giveBack(_ previous: NSRunningApplication?, window: AXUIElement?, log: Log) {
+        guard let previous, previous.bundleIdentifier != Self.claudeBundleId else { return }
+        let name = previous.bundleIdentifier ?? "the app"
+        let element = AXUIElementCreateApplication(previous.processIdentifier)
+        AXUIElementSetMessagingTimeout(element, 0.5)
+        let inFront = { DispatchQueue.main.sync { NSWorkspace.shared.frontmostApplication?.processIdentifier } }
+        for attempt in 1...3 {
+            if attempt < 3 {
+                if let window {
+                    DisplaySpaces.raise(window, pid: previous.processIdentifier)
+                } else {
+                    AXUIElementSetAttributeValue(element, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+                }
+            } else if let app = previous.bundleURL {
+                DispatchQueue.main.sync {
+                    let configuration = NSWorkspace.OpenConfiguration()
+                    configuration.activates = true
+                    NSWorkspace.shared.openApplication(at: app, configuration: configuration)
+                }
+            }
+            for _ in 0..<12 {
+                Thread.sleep(forTimeInterval: 0.05)
+                if inFront() == previous.processIdentifier {
+                    log.add("\(name) back in front (try \(attempt)\(window == nil ? ", no window to raise" : ""))")
+                    return
+                }
+            }
+        }
+        log.add("could not bring back \(name); in front: \(DispatchQueue.main.sync { NSWorkspace.shared.frontmostApplication?.bundleIdentifier } ?? "?")")
     }
 
     private enum Confirmation { case yes, no, unknown }
@@ -4648,6 +4804,8 @@ final class ClaudeAnswerer {
         return l.dropFirst(w.count).allSatisfy { " ⌘⇧⌥⌃↩⏎⎋".contains($0) }
     }
 }
+
+
 
 
 
