@@ -172,6 +172,8 @@ struct DeskRecord: Equatable {
     let errorText: String?
     /// The CLI session that wrote the latest reply: names its transcript file.
     var transcriptId: String? = nil
+    /// When the session last came into view in the Claude app.
+    var lastFocused: Date? = nil
 }
 
 // Lenient decoding: a field with an unexpected type is dropped, not fatal.
@@ -228,12 +230,13 @@ private struct RawDesk: Decodable {
     var errorCategory: String?
     var cliSessionId: String?
     var lastAssistantCliSessionId: String?
+    var lastFocusedAt: Double?
 
     enum CodingKeys: String, CodingKey {
         case sessionId, title, cwd, lastActivityAt, lastTurnEdgeAt, isArchived, lastAssistantUuid
         case summary = "postTurnSummary", summaryFor = "postTurnSummaryFor", wrapUp = "turnWrapUp"
         case lastTurnReport, parent = "spawnedFrom", error, errorAt, errorCategory
-        case cliSessionId, lastAssistantCliSessionId
+        case cliSessionId, lastAssistantCliSessionId, lastFocusedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -255,6 +258,7 @@ private struct RawDesk: Decodable {
         errorCategory = try? c.decodeIfPresent(String.self, forKey: .errorCategory)
         cliSessionId = try? c.decodeIfPresent(String.self, forKey: .cliSessionId)
         lastAssistantCliSessionId = try? c.decodeIfPresent(String.self, forKey: .lastAssistantCliSessionId)
+        lastFocusedAt = try? c.decodeIfPresent(Double.self, forKey: .lastFocusedAt)
     }
 }
 
@@ -287,7 +291,8 @@ func parseDeskRecord(path: String, stamp: FileStamp) -> DeskRecord? {
         errorAt: raw.error == nil ? nil : dateFromMillis(raw.errorAt),
         errorText: raw.error == nil ? nil
             : plainLine(raw.errorCategory?.replacingOccurrences(of: "_", with: " ") ?? raw.error, max: 120),
-        transcriptId: [raw.lastAssistantCliSessionId, raw.cliSessionId].compactMap { $0 }.first(where: isTranscriptId))
+        transcriptId: [raw.lastAssistantCliSessionId, raw.cliSessionId].compactMap { $0 }.first(where: isTranscriptId),
+        lastFocused: dateFromMillis(raw.lastFocusedAt))
 }
 
 /// Kernel start time of a running process, nil if there is none.
@@ -736,6 +741,7 @@ struct Row: Identifiable, Equatable {
     var activity: String? = nil // what a running session is doing now
     var lastOutput: Date? = nil // when a running session last wrote anything
     var card: TurnCard? = nil   // how its latest turn ended: question, buttons, reply
+    var seen: Date? = nil       // when it last came into view in the Claude app
 
     /// How long a running session has written nothing, once that passes
     /// `quietAfter`: possibly stuck, or in one long command.
@@ -766,7 +772,8 @@ let dataWindow: TimeInterval = 8 * 86400
 ///  4. stopped with an error in the last 7 days        -> Your turn
 ///  5. turn ended but the app has not written its summary yet -> Just finished
 ///  6. summary: blocked, need_input or failed          -> Your turn
-///     review_ready                                    -> Ready for review
+///     review_ready, not opened in Claude since        -> Ready for review
+///     (opened in Claude since the turn ended: Done)
 ///     anything else, or no summary                    -> Done
 ///  These follow the Claude app's own sidebar rules (blocked/need_input = needs
 ///  input; failed or an error in the last 7 days = failed).
@@ -823,7 +830,8 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
         if let errorAt = d.errorAt, now.timeIntervalSince(errorAt) < 7 * 86400 {
             rows.append(Row(id: d.sessionId, group: .yourTurn, title: d.title,
                             ask: "Stopped with an error" + (d.errorText.map { ": \($0)" } ?? ""),
-                            context: context, since: errorAt, link: link, card: cards[d.sessionId]))
+                            context: context, since: errorAt, link: link, card: cards[d.sessionId],
+                            seen: d.lastFocused))
             continue
         }
 
@@ -848,10 +856,14 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
             let ask = d.needsAction ?? d.statusDetail ?? "Waiting for your answer"
             rows.append(Row(id: d.sessionId, group: .yourTurn, title: d.title, ask: ask,
                             detail: d.statusDetail == ask ? nil : d.statusDetail,
-                            context: context, since: anchor, link: link, card: cards[d.sessionId]))
+                            context: context, since: anchor, link: link, card: cards[d.sessionId],
+                            seen: d.lastFocused))
         case "review_ready":
-            rows.append(Row(id: d.sessionId, group: .review, title: d.title,
-                            detail: d.statusDetail ?? d.wrapUp, context: context, since: anchor, link: link, card: cards[d.sessionId]))
+            // Opening the session in Claude after its turn ended is the review.
+            let reviewed = d.lastFocused.map { $0 >= anchor } ?? false
+            rows.append(Row(id: d.sessionId, group: reviewed ? .done : .review, title: d.title,
+                            detail: d.statusDetail ?? d.wrapUp, context: context, since: anchor, link: link,
+                            card: cards[d.sessionId], seen: d.lastFocused))
         default:
             rows.append(Row(id: d.sessionId, group: .done, title: d.title,
                             detail: d.statusDetail ?? d.wrapUp ?? d.lastReport,
@@ -1254,10 +1266,11 @@ final class SessionModel: ObservableObject {
     }
 
     /// Sessions that started waiting for you in the last hour and have not been
-    /// opened from here since.
+    /// opened since, from here or in the Claude app.
     func freshNeedsYou(_ board: Board) -> [Row] {
         board.yourTurn.filter { row in
-            now.timeIntervalSince(row.since) <= freshFor && (openedAt[row.id].map { $0 < row.since } ?? true)
+            let opened = [openedAt[row.id], row.seen].compactMap { $0 }.max()
+            return now.timeIntervalSince(row.since) <= freshFor && (opened.map { $0 < row.since } ?? true)
         }
     }
     let freshFor: TimeInterval = 3600
@@ -5048,6 +5061,10 @@ func runSelfTest() {
     model.now = now.addingTimeInterval(120)
     check("asks again after being opened: fresh again",
           model.freshNeedsYou(Board(rows: [askedAgain], now: model.now)).map(\.id) == ["a"])
+    var seenInClaude = askedAgain
+    seenInClaude.seen = now.addingTimeInterval(90)
+    check("opened in Claude since it asked: no longer fresh",
+          model.freshNeedsYou(Board(rows: [seenInClaude], now: model.now)).isEmpty)
 
     let running = Row(id: "r", group: .running, title: "r", context: "", since: now.addingTimeInterval(-3600),
                       lastOutput: now.addingTimeInterval(-660))
@@ -5165,6 +5182,13 @@ func runSelfTest() {
           withWork?.group == .running && withWork?.activity == "2 background tasks running")
     check("without it, it is ready for review",
           classify(desk: [reviewDesk], live: [4242: idleLive], now: now).first?.group == .review)
+    var openedDesk = reviewDesk
+    openedDesk.lastFocused = now.addingTimeInterval(-10)
+    check("opened in Claude after the turn ended: done, not ready for review",
+          classify(desk: [openedDesk], live: [4242: idleLive], now: now).first?.group == .done)
+    openedDesk.lastFocused = now.addingTimeInterval(-300)
+    check("opened only before the turn ended: still ready for review",
+          classify(desk: [openedDesk], live: [4242: idleLive], now: now).first?.group == .review)
 
     // Answering from a card presses only an exact match.
     check("the same question, ignoring case and spacing",
