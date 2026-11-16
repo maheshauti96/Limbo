@@ -4055,7 +4055,7 @@ final class FloatingController {
         guard let ask = row.card?.ask, let session = row.link, !answerer.busy else { return }
         model.markOpened(row)
         answers.answering = AnswerStatus.Answering(row: row.id, label: label)
-        answerer.answer(session: session, title: row.title, ask: ask, button: label,
+        answerer.answer(session: session, ask: ask, button: label,
                         transcript: row.card?.transcript) { [weak self] outcome in
             guard let self else { return }
             self.answers.answering = nil
@@ -4158,7 +4158,7 @@ final class ClaudeAnswerer {
     }
 
     /// Calls `done` on the main queue.
-    func answer(session: String, title: String, ask: String, button: String, transcript: String?,
+    func answer(session: String, ask: String, button: String, transcript: String?,
                 done: @escaping (Outcome) -> Void) {
         guard !busy, isSessionId(session), let url = URL(string: "claude://claude.ai/epitaxy/\(session)") else { return }
         guard AXIsProcessTrusted() else {
@@ -4170,18 +4170,12 @@ final class ClaudeAnswerer {
         let previous = NSWorkspace.shared.frontmostApplication
         queue.async {
             var log: [String] = ["\(Date()) answer “\(button)”"]
-            let outcome = self.press(url: url, title: title, ask: ask, button: button, transcript: transcript, log: &log)
+            let outcome = self.press(session: session, url: url, ask: ask, button: button, transcript: transcript,
+                                     previous: previous, log: &log)
             log.append("outcome: \(outcome)")
             Self.writeLog(log)
             DispatchQueue.main.async {
                 self.busy = false
-                // Answered: back to where you were. Not answered: Claude stays in front, for you to answer.
-                if outcome == .answered, let previous, previous.bundleIdentifier != Self.claudeBundleId,
-                   let app = previous.bundleURL {
-                    let configuration = NSWorkspace.OpenConfiguration()
-                    configuration.activates = true
-                    NSWorkspace.shared.openApplication(at: app, configuration: configuration)
-                }
                 done(outcome)
             }
         }
@@ -4194,8 +4188,17 @@ final class ClaudeAnswerer {
         try? (lines.joined(separator: "\n") + "\n").write(to: logFile, atomically: true, encoding: .utf8)
     }
 
-    private func press(url: URL, title: String, ask: String, button: String, transcript: String?,
-                       log: inout [String]) -> Outcome {
+    /// Claude's page says which session it shows (https://claude.ai/epitaxy/<id>):
+    /// a press happens only while that is the session being answered. Claude
+    /// acts on a press only while its window is visible (behind other windows,
+    /// or on a hidden full-screen Space, its page is paused). So: if it already
+    /// shows the session and some of its window is on screen, the press happens
+    /// in the background and nothing moves. Otherwise Claude comes to the front
+    /// (switching sessions through its link if needed), the press happens, and
+    /// the app you were in comes back. Anything unexpected leaves Claude in
+    /// front on that session, for you to answer.
+    private func press(session: String, url: URL, ask: String, button: String, transcript: String?,
+                       previous: NSRunningApplication?, log: inout [String]) -> Outcome {
         let open = { DispatchQueue.main.sync { _ = NSWorkspace.shared.open(url) } }
         guard let claude = NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeBundleId).first else {
             open()
@@ -4210,71 +4213,186 @@ final class ClaudeAnswerer {
         defer {
             if before != true { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanFalse) }
         }
-        // What Claude shows before switching: another session can ask the very
-        // same question ("Commit and push this change?"), and pressing its box
-        // would answer the wrong session.
-        // Claude builds its tree a moment after being asked: wait until the
-        // window can be read, or this look would see nothing and prove nothing.
         var onScreen = scan(app)
-        for _ in 0..<8 where onScreen.count < 50 {
+        for _ in 0..<8 where onScreen.count < 50 {      // the tree takes a moment to build
             Thread.sleep(forTimeInterval: 0.5)
             onScreen = scan(app)
         }
-        let shownBefore = questions(ask, in: onScreen)
-        log.append("before opening: \(onScreen.count) texts and buttons; question on screen: \(!shownBefore.isEmpty)")
-        guard onScreen.count >= 50 else {
-            open()
-            return .opened("Claude's window could not be read")
+        let claudeInFront = previous?.bundleIdentifier == Self.claudeBundleId
+        let shownBefore = onScreen.count >= 50 ? currentSession(app) : nil
+        let visible = claudeInFront || Self.windowVisible(pid: claude.processIdentifier)
+        log.append("before: \(onScreen.count) texts and buttons; Claude in front: \(claudeInFront); visible: \(visible); showing it already: \(shownBefore == session)")
+
+        // Quietly: shown already and visible, Claude stays where it is.
+        if shownBefore == session && visible {
+            let outcome = pressShown(session: session, ask: ask, button: button, transcript: transcript, app: app,
+                                     attempts: claudeInFront ? 2 : 1, log: &log)
+            if outcome == .answered || claudeInFront || outcome != .opened(Self.notTaken) {
+                if outcome != .answered { open() }
+                return outcome
+            }
+            log.append("the background press did not land: bringing Claude forward")
         }
-        open()
-        Thread.sleep(forTimeInterval: 1)      // opening the session already shown redraws it a moment later
+
+        // Claude has to be in front for the press to count.
+        if currentSession(app) != session {
+            open()                                       // switches the session and brings Claude forward
+        } else if !claude.isActive, let bundle = claude.bundleURL {
+            DispatchQueue.main.sync {
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = true
+                NSWorkspace.shared.openApplication(at: bundle, configuration: configuration)
+            }
+        }
+        var ready = false
+        for _ in 0..<40 {                                // up to 6 s, including a Space switch
+            Thread.sleep(forTimeInterval: 0.15)
+            if claude.isActive && currentSession(app) == session { ready = true; break }
+        }
+        log.append("Claude in front on the session: \(ready)")
+        guard ready else {
+            open()
+            return .opened("Claude did not switch to the session")
+        }
+        Thread.sleep(forTimeInterval: 1)                 // the page is still loading: a press now can be lost
+        let outcome = pressShown(session: session, ask: ask, button: button, transcript: transcript, app: app,
+                                 attempts: 2, log: &log)
+        guard outcome == .answered else {
+            open()                                       // in front, on the session, for you to answer
+            return outcome
+        }
+        if claudeInFront {
+            // You were reading another session in Claude: back to it.
+            if let shownBefore, shownBefore != session, isSessionId(shownBefore),
+               let back = URL(string: "claude://claude.ai/epitaxy/\(shownBefore)") {
+                DispatchQueue.main.sync { _ = NSWorkspace.shared.open(back) }
+                log.append("switched Claude back to the session it showed")
+            }
+        } else {
+            giveBack(previous)
+            log.append("brought back the app you were in")
+        }
+        return .answered
+    }
+
+    static let notTaken = "Claude did not take the press"
+
+    /// Whether some of Claude's main window is on screen and not covered by
+    /// other windows (sampled on a grid). A window on a hidden full-screen
+    /// Space is not on screen at all.
+    static func windowVisible(pid: pid_t) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return false }
+        func bounds(_ w: [String: Any]) -> CGRect? {
+            (w[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        }
+        guard let index = list.firstIndex(where: {
+                  ($0[kCGWindowOwnerPID as String] as? pid_t) == pid && ($0[kCGWindowLayer as String] as? Int) == 0
+                      && (bounds($0)?.width ?? 0) > 300 && (bounds($0)?.height ?? 0) > 200 }),
+              let main = bounds(list[index]) else { return false }
+        let me = getpid()
+        let above = list[..<index].filter {
+            let owner = $0[kCGWindowOwnerPID as String] as? pid_t
+            return owner != pid && owner != me && (($0[kCGWindowAlpha as String] as? Double) ?? 1) > 0.05
+        }.compactMap(bounds)
+        var uncovered = 0
+        for i in 0..<16 {
+            for j in 0..<10 {
+                let point = CGPoint(x: main.minX + (CGFloat(i) + 0.5) * main.width / 16,
+                                    y: main.minY + (CGFloat(j) + 0.5) * main.height / 10)
+                if !above.contains(where: { $0.contains(point) }) { uncovered += 1 }
+            }
+        }
+        return uncovered >= 3
+    }
+
+    /// With Claude showing the session: wait for its box to settle, press the
+    /// button, and confirm the answer landed.
+    private func pressShown(session: String, ask: String, button: String, transcript: String?, app: AXUIElement,
+                            attempts: Int, log: inout [String]) -> Outcome {
         var last: AXUIElement?
-        for look in 1...12 {                  // up to 7 s
+        var agreeing = 0
+        for look in 1...14 {                           // up to 7 s
             Thread.sleep(forTimeInterval: 0.5)
+            guard currentSession(app) == session else { last = nil; agreeing = 0; continue }
             let nodes = scan(app)
-            guard let q = questions(ask, in: nodes).last else { last = nil; continue }
-            let redrawn = !shownBefore.contains { CFEqual($0.element, q.element) }
-            let named = windowTitles(app).contains { Self.normal($0).contains(Self.normal(title)) }
-            guard shownBefore.isEmpty || redrawn || named else { continue }   // not sure it switched yet
+            guard let q = questions(ask, in: nodes).last else { last = nil; agreeing = 0; continue }
             guard let target = buttons(after: q, in: nodes).first(where: { Self.isButton($0.label, button) }) else {
                 log.append("look \(look): question found, button not next to it")
                 return .opened("its button was not next to the question")
             }
-            // Press only what two looks in a row agree on.
-            guard let previousLook = last, CFEqual(previousLook, target.element) else { last = target.element; continue }
-            log.append("look \(look): settled (redrawn \(redrawn), named in title \(named))")
+            // Press only what three looks in a row (1 s) agree on: right after a
+            // switch the page is still being drawn, and a press on it can be lost.
+            if let previousLook = last, CFEqual(previousLook, target.element) { agreeing += 1 } else { agreeing = 1 }
+            last = target.element
+            guard agreeing >= 3 else { continue }
+            log.append("look \(look): settled")
             let mark = transcript.flatMap { fileStamp($0)?.size }
-            for attempt in 1...2 {
-                let element = attempt == 1 ? target.element
-                    : (questions(ask, in: scan(app)).last.flatMap { q in
-                        buttons(after: q, in: scan(app)).first { Self.isButton($0.label, button) }?.element })
+            for attempt in 1...attempts {
+                guard currentSession(app) == session else { return .opened("Claude moved to another session") }
+                var element: AXUIElement? = target.element
+                if attempt > 1 {
+                    let fresh = scan(app)
+                    element = questions(ask, in: fresh).last.flatMap { q in
+                        buttons(after: q, in: fresh).first { Self.isButton($0.label, button) }?.element }
+                }
                 guard let element else {
                     log.append("attempt \(attempt): the button is gone")
                     return .answered
                 }
                 let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
                 log.append("attempt \(attempt): press \(result == .success ? "ok" : "error \(result.rawValue)")")
-                guard result == .success else { return .opened("Claude did not take the press") }
-                switch confirm(ask: ask, button: button, app: app, transcript: transcript, mark: mark, log: &log) {
+                guard result == .success else { return .opened(Self.notTaken) }
+                switch confirm(ask: ask, button: button, app: app, transcript: transcript, mark: mark,
+                               ticks: attempt == 1 ? 6 : 12, log: &log) {
                 case .yes: return .answered
                 case .unknown: return .opened("the box did not change after the press")
                 case .no: continue            // the transcript shows nothing arrived: try once more
                 }
             }
-            return .opened("Claude did not take the press")
+            return .opened(Self.notTaken)
         }
-        log.append("the question did not show, or Claude did not switch")
+        log.append("the question did not show")
         return .opened("the question did not show in Claude")
+    }
+
+    /// The session id in Claude's page address, if it shows one.
+    private func currentSession(_ app: AXUIElement) -> String? {
+        var stack = windows(app).reversed().map { ($0, 0) }
+        var visited = 0
+        while let (element, depth) = stack.popLast(), visited < 400 {
+            visited += 1
+            if (attribute(element, kAXRoleAttribute) as? String) == "AXWebArea",
+               let url = attribute(element, "AXURL") as? URL, url.host == "claude.ai",
+               url.pathComponents.count == 3, url.pathComponents[1] == "epitaxy" {
+                let id = url.pathComponents[2]
+                return isSessionId(id) ? id : nil
+            }
+            if depth < 14, let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
+                for child in children.reversed() { stack.append((child, depth + 1)) }
+            }
+        }
+        return nil
+    }
+
+    /// Brings back the app you were in.
+    private func giveBack(_ previous: NSRunningApplication?) {
+        guard let previous, previous.bundleIdentifier != Self.claudeBundleId, let app = previous.bundleURL else { return }
+        DispatchQueue.main.sync {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: app, configuration: configuration)
+        }
     }
 
     private enum Confirmation { case yes, no, unknown }
 
-    /// Whether the answer landed, within 6 s: the box's buttons went away, or
+    /// Whether the answer landed, within `ticks` half-seconds: the box's buttons went away, or
     /// the transcript gained a message from you with the label. `.no` only when
     /// the transcript says nothing arrived, so a second press can't answer twice.
     private func confirm(ask: String, button: String, app: AXUIElement, transcript: String?, mark: Int64?,
-                         log: inout [String]) -> Confirmation {
-        for tick in 1...12 {
+                         ticks: Int, log: inout [String]) -> Confirmation {
+        for tick in 1...ticks {
             Thread.sleep(forTimeInterval: 0.5)
             if let transcript, let mark, Self.sent(in: transcript, after: mark).contains(where: { Self.sameText($0, button) }) {
                 log.append("confirmed by the transcript after \(Double(tick) / 2) s")
@@ -4288,7 +4406,7 @@ final class ClaudeAnswerer {
                 return .yes
             }
         }
-        log.append("no change in 6 s")
+        log.append("no change in \(Double(ticks) / 2) s")
         return transcript != nil && mark != nil ? .no : .unknown
     }
 
@@ -4310,10 +4428,6 @@ final class ClaudeAnswerer {
         }
     }
 
-    private func windowTitles(_ app: AXUIElement) -> [String] {
-        (attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []).compactMap { attribute($0, kAXTitleAttribute) as? String }
-    }
-
     /// The texts matching the question, in order.
     private func questions(_ ask: String, in nodes: [Node]) -> [Node] {
         nodes.filter { $0.role == "AXStaticText" && Self.sameText($0.label, ask) }
@@ -4325,10 +4439,24 @@ final class ClaudeAnswerer {
         return nodes[(q + 1)...].prefix(12).filter { $0.role == "AXButton" }
     }
 
+    /// Claude's windows. macOS lists none for an app whose (full-screen) window
+    /// sits on another Space; its main or focused window may still answer.
+    private func windows(_ app: AXUIElement) -> [AXUIElement] {
+        var found = attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        if found.isEmpty {
+            let extra = [attribute(app, kAXMainWindowAttribute), attribute(app, kAXFocusedWindowAttribute)]
+                .compactMap { $0.map { $0 as! AXUIElement } }
+                + (attribute(app, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+                    .filter { (attribute($0, kAXRoleAttribute) as? String) == "AXWindow" }
+            for window in extra where !found.contains(where: { CFEqual($0, window) }) { found.append(window) }
+        }
+        return found
+    }
+
     /// Every window's text and buttons, in order. At most 3 s and 40,000 elements.
     private func scan(_ app: AXUIElement) -> [Node] {
         let start = Date()
-        var stack = (attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []).reversed().map { ($0, 0) }
+        var stack = windows(app).reversed().map { ($0, 0) }
         var nodes: [Node] = []
         var visited = 0
         while let (element, depth) = stack.popLast(), visited < 40_000, Date().timeIntervalSince(start) < 3 {
