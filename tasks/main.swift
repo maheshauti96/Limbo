@@ -2411,6 +2411,8 @@ struct AnswerCard: View {
     var toggleResponse: () -> Void = {}
     /// With "Answer from Cards" on: presses the button in Claude for you.
     var answer: ((String) -> Void)? = nil
+    /// The pointer reached the card: gets Claude ready for a press.
+    var warm: (() -> Void)? = nil
     /// The button being pressed right now, and why the last click only opened the session.
     var answering: String? = nil
     var note: String? = nil
@@ -2470,6 +2472,7 @@ struct AnswerCard: View {
                 RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.5))
             }
         }
+        .onHover { if $0 { warm?() } }
         .padding(.horizontal, 6)
         .padding(.bottom, 6)
     }
@@ -2668,6 +2671,7 @@ struct FloatingView: View {
     var initialResponse: String? = nil
     /// Answering from a card: presses its button in Claude (when the switch is on).
     var answer: ((Row, String) -> Void)? = nil
+    var warm: (() -> Void)? = nil
     @ObservedObject var answers = AnswerStatus()
     @State private var filter: RowFilter?
     /// The row or card whose latest reply is showing; one at a time.
@@ -2787,6 +2791,7 @@ struct FloatingView: View {
                                    responseShown: openResponse == row.id,
                                    toggleResponse: { toggleResponse(row.id) },
                                    answer: answerFromCards && answer != nil ? { label in answer?(row, label) } : nil,
+                                   warm: answerFromCards ? warm : nil,
                                    answering: answers.answering?.row == row.id ? answers.answering?.label : nil,
                                    note: answers.notes[row.id])
                     }
@@ -4124,6 +4129,9 @@ final class FloatingController {
         fitToContent()
     }
 
+    /// Turns Claude's accessibility tree off now, for quitting.
+    func shutdownAnswerer() { answerer.shutdown() }
+
     /// A card's button with "Answer from Cards" on: pressed in Claude for you.
     private func answer(_ row: Row, _ label: String) {
         guard let ask = row.card?.ask, let session = row.link, !answerer.busy else { return }
@@ -4153,6 +4161,7 @@ final class FloatingController {
                                 layout: layout,
                                 status: status,
                                 answer: { [weak self] row, label in self?.answer(row, label) },
+                                warm: { [weak self] in self?.answerer.warm() },
                                 answers: answers)
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
@@ -4226,6 +4235,63 @@ final class ClaudeAnswerer {
     private let queue = DispatchQueue(label: "com.maheshauti.limbo-tasks.answer", qos: .userInitiated)
     private(set) var busy = false
 
+    /// The steps of one answer, each with the time since the click.
+    final class Log {
+        let start = Date()
+        private(set) var lines: [String] = []
+        func add(_ line: String) { lines.append(String(format: "%5.2f s  ", Date().timeIntervalSince(start)) + line) }
+    }
+
+    // Claude's window content (Chromium) builds its accessibility tree only when
+    // asked, and costs Claude some work while it is on: on from when the pointer
+    // reaches a card, or a click, until a few seconds after. Queue only.
+    private var tree: AXUIElement?
+    private var treePid: pid_t = 0
+    private var treeSince = Date.distantPast
+    private var treeUntil = Date.distantPast
+    private var treeWasOn = false
+    private static let keepTree: TimeInterval = 12
+
+    /// The pointer is over a card: start Claude's tree now, so it has settled
+    /// by the time a button is clicked.
+    func warm() {
+        guard UserDefaults.standard.bool(forKey: Self.enabledKey), AXIsProcessTrusted() else { return }
+        queue.async { _ = self.openTree() }
+    }
+
+    /// Turns the tree off now, for quitting.
+    func shutdown() {
+        queue.sync { self.treeUntil = .distantPast; self.closeTree() }
+    }
+
+    /// Claude's app element, its tree on for `keepTree` seconds more.
+    private func openTree() -> AXUIElement? {
+        guard let claude = NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeBundleId).first
+        else { return nil }
+        if tree == nil || treePid != claude.processIdentifier {
+            let app = AXUIElementCreateApplication(claude.processIdentifier)
+            AXUIElementSetMessagingTimeout(app, 1)
+            treeWasOn = attribute(app, "AXManualAccessibility") as? Bool == true
+            if !treeWasOn { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue) }
+            tree = app
+            treePid = claude.processIdentifier
+            treeSince = Date()
+        }
+        holdTree()
+        return tree
+    }
+
+    private func holdTree() {
+        treeUntil = Date().addingTimeInterval(Self.keepTree)
+        queue.asyncAfter(deadline: .now() + Self.keepTree + 0.2) { self.closeTree() }
+    }
+
+    private func closeTree() {
+        guard let app = tree, Date() >= treeUntil else { return }
+        if !treeWasOn { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanFalse) }
+        tree = nil
+    }
+
     /// Shows the system's request for the permission when it is missing.
     @discardableResult static func requestPermission() -> Bool {
         AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
@@ -4242,12 +4308,14 @@ final class ClaudeAnswerer {
         }
         busy = true
         let previous = NSWorkspace.shared.frontmostApplication
+        let log = Log()
         queue.async {
-            var log: [String] = ["\(Date()) answer “\(button)”"]
+            log.add("\(log.start) answer “\(button)”")
             let outcome = self.press(session: session, url: url, ask: ask, button: button, transcript: transcript,
-                                     previous: previous, log: &log)
-            log.append("outcome: \(outcome)")
-            Self.writeLog(log)
+                                     previous: previous, log: log)
+            self.holdTree()
+            log.add("outcome: \(outcome)")
+            Self.writeLog(log.lines)
             DispatchQueue.main.async {
                 self.busy = false
                 done(outcome)
@@ -4272,40 +4340,32 @@ final class ClaudeAnswerer {
     /// the app you were in comes back. Anything unexpected leaves Claude in
     /// front on that session, for you to answer.
     private func press(session: String, url: URL, ask: String, button: String, transcript: String?,
-                       previous: NSRunningApplication?, log: inout [String]) -> Outcome {
+                       previous: NSRunningApplication?, log: Log) -> Outcome {
         let open = { DispatchQueue.main.sync { _ = NSWorkspace.shared.open(url) } }
-        guard let claude = NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeBundleId).first else {
+        guard let claude = NSRunningApplication.runningApplications(withBundleIdentifier: Self.claudeBundleId).first,
+              let app = openTree() else {
             open()
             return .opened("Claude was not running")
         }
-        let app = AXUIElementCreateApplication(claude.processIdentifier)
-        AXUIElementSetMessagingTimeout(app, 1)
-        // Claude's window content (Chromium) builds its accessibility tree only
-        // when asked, and costs Claude some work while it does: only for now.
-        let before = attribute(app, "AXManualAccessibility") as? Bool
-        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        defer {
-            if before != true { AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanFalse) }
-        }
         var onScreen = scan(app)
-        for _ in 0..<8 where onScreen.count < 50 {      // the tree takes a moment to build
-            Thread.sleep(forTimeInterval: 0.5)
+        for _ in 0..<30 where onScreen.count < 50 {     // the tree takes a moment to build
+            Thread.sleep(forTimeInterval: 0.1)
             onScreen = scan(app)
         }
         let claudeInFront = previous?.bundleIdentifier == Self.claudeBundleId
         let shownBefore = onScreen.count >= 50 ? currentSession(app) : nil
         let visible = claudeInFront || Self.windowVisible(pid: claude.processIdentifier)
-        log.append("before: \(onScreen.count) texts and buttons; Claude in front: \(claudeInFront); visible: \(visible); showing it already: \(shownBefore == session)")
+        log.add("before: \(onScreen.count) texts and buttons; Claude in front: \(claudeInFront); visible: \(visible); showing it already: \(shownBefore == session); tree on for \(String(format: "%.1f", Date().timeIntervalSince(treeSince))) s")
 
         // Quietly: shown already and visible, Claude stays where it is.
         if shownBefore == session && visible {
             let outcome = pressShown(session: session, ask: ask, button: button, transcript: transcript, app: app,
-                                     attempts: claudeInFront ? 2 : 1, log: &log)
+                                     attempts: claudeInFront ? 2 : 1, switched: false, log: log)
             if outcome == .answered || claudeInFront || outcome != .opened(Self.notTaken) {
                 if outcome != .answered { open() }
                 return outcome
             }
-            log.append("the background press did not land: bringing Claude forward")
+            log.add("the background press did not land: bringing Claude forward")
         }
 
         // Claude has to be in front for the press to count.
@@ -4319,18 +4379,17 @@ final class ClaudeAnswerer {
             }
         }
         var ready = false
-        for _ in 0..<40 {                                // up to 6 s, including a Space switch
-            Thread.sleep(forTimeInterval: 0.15)
+        for _ in 0..<120 {                               // up to 6 s, including a Space switch
+            Thread.sleep(forTimeInterval: 0.05)
             if claude.isActive && currentSession(app) == session { ready = true; break }
         }
-        log.append("Claude in front on the session: \(ready)")
+        log.add("Claude in front on the session: \(ready)")
         guard ready else {
             open()
             return .opened("Claude did not switch to the session")
         }
-        Thread.sleep(forTimeInterval: 1)                 // the page is still loading: a press now can be lost
         let outcome = pressShown(session: session, ask: ask, button: button, transcript: transcript, app: app,
-                                 attempts: 2, log: &log)
+                                 attempts: 2, switched: true, log: log)
         guard outcome == .answered else {
             open()                                       // in front, on the session, for you to answer
             return outcome
@@ -4340,11 +4399,11 @@ final class ClaudeAnswerer {
             if let shownBefore, shownBefore != session, isSessionId(shownBefore),
                let back = URL(string: "claude://claude.ai/epitaxy/\(shownBefore)") {
                 DispatchQueue.main.sync { _ = NSWorkspace.shared.open(back) }
-                log.append("switched Claude back to the session it showed")
+                log.add("switched Claude back to the session it showed")
             }
         } else {
             giveBack(previous)
-            log.append("brought back the app you were in")
+            log.add("brought back the app you were in")
         }
         return .answered
     }
@@ -4383,47 +4442,55 @@ final class ClaudeAnswerer {
     /// With Claude showing the session: wait for its box to settle, press the
     /// button, and confirm the answer landed.
     private func pressShown(session: String, ask: String, button: String, transcript: String?, app: AXUIElement,
-                            attempts: Int, log: inout [String]) -> Outcome {
+                            attempts: Int, switched: Bool, log: Log) -> Outcome {
+        // Press only a button that stays the same element for a moment: right
+        // after a switch, or while the tree is new, the page is still being
+        // drawn and a press on it can be lost. A look takes about 0.15 s.
+        let settle: TimeInterval = switched ? 0.5 : (Date().timeIntervalSince(treeSince) < 1.5 ? 0.4 : 0.1)
         var last: AXUIElement?
-        var agreeing = 0
+        var firstSeen = Date()
         var questionSeen = false
-        for look in 1...14 {                           // up to 7 s
-            Thread.sleep(forTimeInterval: 0.5)
-            guard currentSession(app) == session else { last = nil; agreeing = 0; continue }
+        let deadline = Date().addingTimeInterval(7)
+        var look = 0
+        while Date() < deadline {
+            look += 1
+            if look > 1 { Thread.sleep(forTimeInterval: 0.08) }
+            guard currentSession(app) == session else { last = nil; continue }
             let nodes = scan(app)
             let asked = questions(ask, in: nodes)
             if !asked.isEmpty { questionSeen = true }
             // Claude keeps the questions of answered boxes in the conversation,
             // without their buttons: the live box is the copy that has the button.
             guard let target = liveButton(ask, button, in: nodes) else {
-                if let q = asked.last, look == 14 {
-                    log.append("look \(look): \(asked.count) copies of the question; buttons after the last: "
-                               + buttons(after: q, in: nodes).map { "“\($0.label.prefix(30))”" }.joined(separator: ", "))
+                if let q = asked.last, Date().addingTimeInterval(0.3) >= deadline {
+                    log.add("look \(look): \(asked.count) copies of the question; buttons after the last: "
+                            + buttons(after: q, in: nodes).map { "“\($0.label.prefix(30))”" }.joined(separator: ", "))
                 }
                 last = nil
-                agreeing = 0
                 continue
             }
-            // Press only what three looks in a row (1 s) agree on: right after a
-            // switch the page is still being drawn, and a press on it can be lost.
-            if let previousLook = last, CFEqual(previousLook, target.element) { agreeing += 1 } else { agreeing = 1 }
-            last = target.element
-            guard agreeing >= 3 else { continue }
-            log.append("look \(look): settled")
+            if let previousLook = last, CFEqual(previousLook, target.element) {
+                guard Date().timeIntervalSince(firstSeen) >= settle else { continue }
+            } else {
+                last = target.element
+                firstSeen = Date()
+                continue
+            }
+            log.add("look \(look): settled")
             let mark = transcript.flatMap { fileStamp($0)?.size }
             for attempt in 1...attempts {
                 guard currentSession(app) == session else { return .opened("Claude moved to another session") }
                 var element: AXUIElement? = target.element
                 if attempt > 1 { element = liveButton(ask, button, in: scan(app))?.element }
                 guard let element else {
-                    log.append("attempt \(attempt): the button is gone")
+                    log.add("attempt \(attempt): the button is gone")
                     return .answered
                 }
                 let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
-                log.append("attempt \(attempt): press \(result == .success ? "ok" : "error \(result.rawValue)")")
+                log.add("attempt \(attempt): press \(result == .success ? "ok" : "error \(result.rawValue)")")
                 guard result == .success else { return .opened(Self.notTaken) }
                 switch confirm(ask: ask, button: button, app: app, transcript: transcript, mark: mark,
-                               ticks: attempt == 1 ? 6 : 12, log: &log) {
+                               within: attempt == 1 ? 1.5 : 5, log: log) {
                 case .yes: return .answered
                 case .unknown: return .opened("the box did not change after the press")
                 case .no: continue            // the transcript shows nothing arrived: try once more
@@ -4431,7 +4498,7 @@ final class ClaudeAnswerer {
             }
             return .opened(Self.notTaken)
         }
-        log.append(questionSeen ? "the button never showed next to the question" : "the question did not show")
+        log.add(questionSeen ? "the button never showed next to the question" : "the question did not show")
         return .opened(questionSeen ? "its button was not next to the question" : "the question did not show in Claude")
     }
 
@@ -4474,23 +4541,27 @@ final class ClaudeAnswerer {
 
     private enum Confirmation { case yes, no, unknown }
 
-    /// Whether the answer landed, within `ticks` half-seconds: the box's buttons went away, or
-    /// the transcript gained a message from you with the label. `.no` only when
-    /// the transcript says nothing arrived, so a second press can't answer twice.
+    /// Whether the answer landed `within` so many seconds: the transcript gained a
+    /// message from you with the label (checked every 0.1 s), or the box's
+    /// buttons went away (every third check). `.no` only when the transcript
+    /// says nothing arrived, so a second press can't answer twice.
     private func confirm(ask: String, button: String, app: AXUIElement, transcript: String?, mark: Int64?,
-                         ticks: Int, log: inout [String]) -> Confirmation {
-        for tick in 1...ticks {
-            Thread.sleep(forTimeInterval: 0.5)
+                         within: TimeInterval, log: Log) -> Confirmation {
+        let pressed = Date()
+        var tick = 0
+        while Date().timeIntervalSince(pressed) < within {
+            tick += 1
+            Thread.sleep(forTimeInterval: 0.1)
             if let transcript, let mark, Self.sent(in: transcript, after: mark).contains(where: { Self.sameText($0, button) }) {
-                log.append("confirmed by the transcript after \(Double(tick) / 2) s")
+                log.add("confirmed by the transcript")
                 return .yes
             }
-            if liveButton(ask, button, in: scan(app)) == nil {
-                log.append("confirmed by the box after \(Double(tick) / 2) s")
+            if tick % 3 == 0, liveButton(ask, button, in: scan(app)) == nil {
+                log.add("confirmed by the box")
                 return .yes
             }
         }
-        log.append("no change in \(Double(ticks) / 2) s")
+        log.add("no change in \(within) s")
         return transcript != nil && mark != nil ? .no : .unknown
     }
 
@@ -4578,6 +4649,8 @@ final class ClaudeAnswerer {
     }
 }
 
+
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -4597,6 +4670,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var markRect: NSRect?
     private var screensAsleep = false
     private var snapshotSignal: DispatchSourceSignal?
+
+    func applicationWillTerminate(_ note: Notification) {
+        floating?.shutdownAnswerer()
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
