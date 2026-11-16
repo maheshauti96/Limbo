@@ -595,6 +595,39 @@ func latestWrite(transcript path: String) -> Date? {
     return newest.map { Date(timeIntervalSince1970: $0) }
 }
 
+/// How many of a session's background tasks (Bash commands left running,
+/// monitors) are still running: their output files, …/<session>/tasks/<id>.output,
+/// held open by the session's own child shells. Its process can be idle the
+/// whole time, between turns. A few system calls per idle session; no process
+/// is started and nothing is read.
+func runningBackgroundTasks(parent: Int32, session: String) -> Int {
+    var children = [pid_t](repeating: 0, count: 64)
+    let count = Int(proc_listchildpids(parent, &children, Int32(children.count * MemoryLayout<pid_t>.stride)))
+    guard count > 0 else { return 0 }
+    let marker = "/\(session)/tasks/"
+    var files = Set<String>()
+    for child in children.prefix(min(count, children.count)) {
+        let bytes = proc_pidinfo(child, PROC_PIDLISTFDS, 0, nil, 0)
+        guard bytes > 0 else { continue }
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride)
+        let got = proc_pidinfo(child, PROC_PIDLISTFDS, 0, &fds, bytes)
+        guard got > 0 else { continue }
+        for fd in fds.prefix(Int(got) / MemoryLayout<proc_fdinfo>.stride) where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
+            var info = vnode_fdinfowithpath()
+            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+            guard proc_pidfdinfo(child, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size) == size else { continue }
+            let path = withUnsafeBytes(of: &info.pvip.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            if path.hasSuffix(".output"), path.contains(marker) { files.insert(path) }
+        }
+    }
+    return files.count
+}
+
+/// "2 background tasks running"
+func backgroundPhrase(_ tasks: Int) -> String {
+    tasks == 1 ? "1 background task running" : "\(tasks) background tasks running"
+}
+
 /// Re-reads a running session's transcript tail when the file changes, at most
 /// once a second, on the engine queue. Every 30 s it also checks the session's
 /// agent and workflow files, which change while the main transcript is quiet.
@@ -739,7 +772,8 @@ let dataWindow: TimeInterval = 8 * 86400
 ///  input; failed or an error in the last 7 days = failed).
 ///  7. terminal session (no desktop id), idle          -> Terminal
 func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
-              activities: [Int32: Activity] = [:], cards: [String: TurnCard] = [:]) -> [Row] {
+              activities: [Int32: Activity] = [:], cards: [String: TurnCard] = [:],
+              background: [Int32: Int] = [:]) -> [Row] {
     var bySession: [String: DeskRecord] = [:]
     for d in desk {
         // The same session can sit under several account folders; keep the newest copy.
@@ -772,6 +806,15 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
             rows.append(Row(id: d.sessionId, group: .yourTurn, title: d.title,
                             ask: l.waitingFor ?? "Waiting for your input", context: context,
                             since: l.statusSince, link: link))
+            continue
+        }
+        // Between turns, but with background work still going (commands left
+        // running, monitors): not done or ready for review yet, as the Claude
+        // app shows it too. A session asking you something still needs you.
+        if let l, let tasks = background[l.pid], !d.isArchived,
+           !["blocked", "need_input", "failed"].contains(d.category ?? ""), d.errorAt == nil {
+            rows.append(Row(id: d.sessionId, group: .running, title: d.title, context: context,
+                            since: l.statusSince, link: link, activity: backgroundPhrase(tasks)))
             continue
         }
         if d.isArchived { continue }
@@ -818,20 +861,22 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
 
     // A live desktop process whose record is missing or not yet written.
     for (host, l) in liveByHost where bySession[host] == nil {
-        let group: Group = l.isBusy ? .running : (l.isWaiting ? .yourTurn : .done)
+        let tasks = l.isBusy || l.isWaiting ? nil : background[l.pid]
+        let group: Group = l.isBusy || tasks != nil ? .running : (l.isWaiting ? .yourTurn : .done)
         rows.append(Row(id: host, group: group, title: l.name,
                         ask: l.isWaiting ? (l.waitingFor ?? "Waiting for your input") : nil,
                         context: folderLabel(l.cwd), since: l.statusSince, link: host,
-                        activity: l.isBusy ? activities[l.pid]?.text : nil,
+                        activity: l.isBusy ? activities[l.pid]?.text : tasks.map(backgroundPhrase),
                         lastOutput: l.isBusy ? activities[l.pid]?.lastOutput : nil))
     }
     // Sessions started in a terminal: no summary, so idle ones never count as your turn.
     for l in terminalLive {
-        let group: Group = l.isBusy ? .running : (l.isWaiting ? .yourTurn : .terminal)
+        let tasks = l.isBusy || l.isWaiting ? nil : background[l.pid]
+        let group: Group = l.isBusy || tasks != nil ? .running : (l.isWaiting ? .yourTurn : .terminal)
         rows.append(Row(id: "pid:\(l.pid)", group: group, title: l.name,
                         ask: l.isWaiting ? (l.waitingFor ?? "Waiting for your input") : nil,
                         context: folderLabel(l.cwd), since: l.statusSince, terminal: true,
-                        activity: l.isBusy ? activities[l.pid]?.text : nil,
+                        activity: l.isBusy ? activities[l.pid]?.text : tasks.map(backgroundPhrase),
                         lastOutput: l.isBusy ? activities[l.pid]?.lastOutput : nil))
     }
     return rowsInOrder(rows)
@@ -938,7 +983,7 @@ final class SessionEngine {
             }
             engine.activityWanted = true
             return classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
-                            activities: activities, cards: engine.currentCards())
+                            activities: activities, cards: engine.currentCards(), background: engine.backgroundWork())
         }
     }
 
@@ -1005,6 +1050,19 @@ final class SessionEngine {
                 self.publishIfChanged()
             }
         }
+    }
+
+    /// Running background tasks of sessions between turns, by process id. A
+    /// finished task wakes its session, which rewrites its live record, so a
+    /// change is seen without polling (and every 30 s while a panel shows).
+    private func backgroundWork() -> [Int32: Int] {
+        var work: [Int32: Int] = [:]
+        for (pid, record) in live where !record.isBusy && !record.isWaiting {
+            guard let id = record.cliSessionId else { continue }
+            let tasks = runningBackgroundTasks(parent: pid, session: id)
+            if tasks > 0 { work[pid] = tasks }
+        }
+        return work
     }
 
     /// The turn cards of recent sessions that are not running, by session id.
@@ -1104,7 +1162,7 @@ final class SessionEngine {
 
     private func publishIfChanged() {
         let rows = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
-                            cards: currentCards())
+                            cards: currentCards(), background: backgroundWork())
         guard rows != lastRows else { return }
         lastRows = rows
         DispatchQueue.main.async { [weak self] in self?.onRows?(rows) }
@@ -4312,14 +4370,23 @@ final class ClaudeAnswerer {
                             attempts: Int, log: inout [String]) -> Outcome {
         var last: AXUIElement?
         var agreeing = 0
+        var questionSeen = false
         for look in 1...14 {                           // up to 7 s
             Thread.sleep(forTimeInterval: 0.5)
             guard currentSession(app) == session else { last = nil; agreeing = 0; continue }
             let nodes = scan(app)
-            guard let q = questions(ask, in: nodes).last else { last = nil; agreeing = 0; continue }
-            guard let target = buttons(after: q, in: nodes).first(where: { Self.isButton($0.label, button) }) else {
-                log.append("look \(look): question found, button not next to it")
-                return .opened("its button was not next to the question")
+            let asked = questions(ask, in: nodes)
+            if !asked.isEmpty { questionSeen = true }
+            // Claude keeps the questions of answered boxes in the conversation,
+            // without their buttons: the live box is the copy that has the button.
+            guard let target = liveButton(ask, button, in: nodes) else {
+                if let q = asked.last, look == 14 {
+                    log.append("look \(look): \(asked.count) copies of the question; buttons after the last: "
+                               + buttons(after: q, in: nodes).map { "“\($0.label.prefix(30))”" }.joined(separator: ", "))
+                }
+                last = nil
+                agreeing = 0
+                continue
             }
             // Press only what three looks in a row (1 s) agree on: right after a
             // switch the page is still being drawn, and a press on it can be lost.
@@ -4331,11 +4398,7 @@ final class ClaudeAnswerer {
             for attempt in 1...attempts {
                 guard currentSession(app) == session else { return .opened("Claude moved to another session") }
                 var element: AXUIElement? = target.element
-                if attempt > 1 {
-                    let fresh = scan(app)
-                    element = questions(ask, in: fresh).last.flatMap { q in
-                        buttons(after: q, in: fresh).first { Self.isButton($0.label, button) }?.element }
-                }
+                if attempt > 1 { element = liveButton(ask, button, in: scan(app))?.element }
                 guard let element else {
                     log.append("attempt \(attempt): the button is gone")
                     return .answered
@@ -4352,8 +4415,16 @@ final class ClaudeAnswerer {
             }
             return .opened(Self.notTaken)
         }
-        log.append("the question did not show")
-        return .opened("the question did not show in Claude")
+        log.append(questionSeen ? "the button never showed next to the question" : "the question did not show")
+        return .opened(questionSeen ? "its button was not next to the question" : "the question did not show in Claude")
+    }
+
+    /// The button right after a copy of the question, the newest copy first.
+    private func liveButton(_ ask: String, _ button: String, in nodes: [Node]) -> Node? {
+        for q in questions(ask, in: nodes).reversed() {
+            if let hit = buttons(after: q, in: nodes).first(where: { Self.isButton($0.label, button) }) { return hit }
+        }
+        return nil
     }
 
     /// The session id in Claude's page address, if it shows one.
@@ -4398,10 +4469,7 @@ final class ClaudeAnswerer {
                 log.append("confirmed by the transcript after \(Double(tick) / 2) s")
                 return .yes
             }
-            let nodes = scan(app)
-            let still = questions(ask, in: nodes).last.map { q in
-                buttons(after: q, in: nodes).contains { Self.isButton($0.label, button) } } ?? false
-            if !still {
+            if liveButton(ask, button, in: scan(app)) == nil {
                 log.append("confirmed by the box after \(Double(tick) / 2) s")
                 return .yes
             }
@@ -5067,6 +5135,34 @@ func runSelfTest() {
     check("a turn without a wrap-up keeps its reply",
           turnCard(transcript: transcriptFile([saidLine("hi"), replyLine("Hello")])) == TurnCard(reply: "Hello"))
     check("a question with no buttons gets one", TurnCard(ask: "Go?").buttons == ["Answer in Claude"])
+    // Background work: a child shell holding …/<session>/tasks/<id>.output counts.
+    let taskDir = NSTemporaryDirectory() + "limbo-bg-\(getpid())/s-123/tasks"
+    try? FileManager.default.createDirectory(atPath: taskDir, withIntermediateDirectories: true)
+    let shell = Process()
+    shell.executableURL = URL(fileURLWithPath: "/bin/sh")
+    shell.arguments = ["-c", "exec 3>>'\(taskDir)/b1.output'; sleep 5"]
+    try? shell.run()
+    Thread.sleep(forTimeInterval: 0.3)
+    check("a background task holding its output file counts", runningBackgroundTasks(parent: getpid(), session: "s-123") == 1)
+    check("another session's tasks don't", runningBackgroundTasks(parent: getpid(), session: "s-999") == 0)
+    shell.terminate()
+    shell.waitUntilExit()
+    check("a finished task doesn't", runningBackgroundTasks(parent: getpid(), session: "s-123") == 0)
+    try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "limbo-bg-\(getpid())")
+    let reviewDesk = DeskRecord(sessionId: "local_bg1", title: "Watch the deploys", cwd: "/tmp", lastActivity: now,
+                                lastTurnEdge: now.addingTimeInterval(-30), fileTime: now, isArchived: false,
+                                lastAssistantUuid: "u1", category: "review_ready", statusDetail: "Deploys running",
+                                needsAction: nil, summaryFor: "u1", wrapUp: nil, lastReport: nil, parentId: nil,
+                                errorAt: nil, errorText: nil)
+    let idleLive = LiveRecord(pid: 4242, key: "4242:1", name: "Watch the deploys", status: "idle", waitingFor: nil,
+                              started: now.addingTimeInterval(-3600), statusSince: now.addingTimeInterval(-60),
+                              hostId: "local_bg1", cwd: "/tmp", cliSessionId: "c1")
+    let withWork = classify(desk: [reviewDesk], live: [4242: idleLive], now: now, background: [4242: 2]).first
+    check("background work keeps a session running, not ready for review",
+          withWork?.group == .running && withWork?.activity == "2 background tasks running")
+    check("without it, it is ready for review",
+          classify(desk: [reviewDesk], live: [4242: idleLive], now: now).first?.group == .review)
+
     // Answering from a card presses only an exact match.
     check("the same question, ignoring case and spacing",
           ClaudeAnswerer.sameText("Commit and push  this change?", "commit and push this change?"))
