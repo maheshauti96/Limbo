@@ -601,17 +601,23 @@ func latestWrite(transcript path: String) -> Date? {
 }
 
 /// How many of a session's background tasks (Bash commands left running,
-/// monitors) are still running: their output files, …/<session>/tasks/<id>.output,
-/// held open by the session's own child shells. Its process can be idle the
-/// whole time, between turns. A few system calls per idle session; no process
-/// is started and nothing is read.
+/// monitors) are still running. A Bash command holds its output file,
+/// …/<session>/tasks/<id>.output, open; a monitor streams to Claude instead,
+/// so it is a shell Claude started (its command sources one of Claude's
+/// shell snapshots) holding no such file. Either way a child of the session's
+/// own process, which can be idle the whole time, between turns. A few system
+/// calls per idle session; no process is started, and of a shell's command
+/// only whether it has the marker is kept.
 func runningBackgroundTasks(parent: Int32, session: String) -> Int {
     var children = [pid_t](repeating: 0, count: 64)
     let count = Int(proc_listchildpids(parent, &children, Int32(children.count * MemoryLayout<pid_t>.stride)))
     guard count > 0 else { return 0 }
     let marker = "/\(session)/tasks/"
     var files = Set<String>()
+    var shells = 0
     for child in children.prefix(min(count, children.count)) {
+        let before = files.count
+        defer { if files.count == before && isClaudeShell(child) { shells += 1 } }
         let bytes = proc_pidinfo(child, PROC_PIDLISTFDS, 0, nil, 0)
         guard bytes > 0 else { continue }
         var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride)
@@ -625,7 +631,26 @@ func runningBackgroundTasks(parent: Int32, session: String) -> Int {
             if path.hasSuffix(".output"), path.contains(marker) { files.insert(path) }
         }
     }
-    return files.count
+    return files.count + shells
+}
+
+/// A shell started by Claude's Bash or Monitor tool: its command line
+/// sources one of Claude's shell snapshots (~/.claude/shell-snapshots/).
+/// Only shells are looked at (not MCP servers), and nothing of the command
+/// is kept.
+func isClaudeShell(_ pid: pid_t) -> Bool {
+    var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return false }
+    let exe = String(cString: path)
+    guard ["/zsh", "/bash", "/sh"].contains(where: exe.hasSuffix) else { return false }
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return false }
+    var args = [UInt8](repeating: 0, count: size)
+    guard sysctl(&mib, 3, &args, &size, nil, 0) == 0 else { return false }
+    return args.prefix(size).withUnsafeBytes { raw in
+        raw.firstRange(of: Array("/.claude/shell-snapshots/snapshot-".utf8)) != nil
+    }
 }
 
 /// "2 background tasks running"
@@ -743,10 +768,14 @@ struct Row: Identifiable, Equatable {
     var card: TurnCard? = nil   // how its latest turn ended: question, buttons, reply
     var seen: Date? = nil       // when it last came into view in the Claude app
     var tags: [String] = []     // your tags on it, kept by Limbo (SessionTags)
+    var snoozedUntil: Date? = nil // snoozed by you until then (SessionSnoozes)
 
-    /// Tagged On hold: listed apart, not counted, no glow. A running session
-    /// still shows as running, and goes on hold when it stops.
-    var held: Bool { group != .running && tags.contains(SessionTags.onHold) }
+    /// Tagged On hold, or snoozed: listed apart, not counted, no glow. A
+    /// running session still shows as running, and goes on hold when it stops.
+    var held: Bool { group != .running && (snoozedUntil != nil || tags.contains(SessionTags.onHold)) }
+
+    /// Snoozed: held until a time you picked, then back where it was.
+    var snoozed: Bool { group != .running && snoozedUntil != nil }
 
     /// How long a running session has written nothing, once that passes
     /// `quietAfter`: possibly stuck, or in one long command.
@@ -913,10 +942,15 @@ struct Board {
     var done: [Row] = []
     var terminal: [Row] = []
     var onHold: [Row] = []
+    var snoozed: [Row] = []
 
     init(rows: [Row], now: Date) {
         for r in rows {
             let age = now.timeIntervalSince(r.since)
+            if r.snoozed {
+                snoozed.append(r)
+                continue
+            }
             if r.held {
                 if age <= Board.window { onHold.append(r) }
                 continue
@@ -936,7 +970,7 @@ struct Board {
 
     var isEmpty: Bool {
         yourTurn.isEmpty && older.isEmpty && running.isEmpty && justFinished.isEmpty
-            && review.isEmpty && done.isEmpty && terminal.isEmpty && onHold.isEmpty
+            && review.isEmpty && done.isEmpty && terminal.isEmpty && onHold.isEmpty && snoozed.isEmpty
     }
 }
 
@@ -1012,6 +1046,128 @@ struct SessionTags: Equatable {
     /// Only sessions from the Claude app can be tagged: a terminal session
     /// has no lasting id.
     static func taggable(_ row: Row) -> Bool { row.link.map(isSessionId) ?? false }
+}
+
+/// Sessions you snoozed: held (out of the counts and the glow) until the
+/// time you picked, or until the session moves on (you answer it, or it
+/// ends another turn), whichever comes first. Kept in Limbo's settings by
+/// session id, like your tags.
+struct SessionSnoozes: Equatable {
+    static let key = "sessionSnoozes"
+
+    struct Entry: Equatable {
+        var until: Date
+        var at: Date        // when you snoozed it: a turn after this ends the snooze
+    }
+
+    var byId: [String: Entry] = [:]
+
+    static func load(_ defaults: UserDefaults = .standard) -> SessionSnoozes {
+        let raw = defaults.dictionary(forKey: key) as? [String: [String: Double]] ?? [:]
+        var snoozes = SessionSnoozes()
+        for (id, e) in raw {
+            guard let until = e["until"], let at = e["at"] else { continue }
+            snoozes.byId[id] = Entry(until: Date(timeIntervalSince1970: until), at: Date(timeIntervalSince1970: at))
+        }
+        return snoozes
+    }
+
+    func save(_ defaults: UserDefaults = .standard) {
+        defaults.set(byId.mapValues { ["until": $0.until.timeIntervalSince1970, "at": $0.at.timeIntervalSince1970] },
+                     forKey: Self.key)
+    }
+
+    mutating func snooze(_ id: String, until: Date, at: Date) { byId[id] = Entry(until: until, at: at) }
+
+    mutating func wake(_ id: String) { byId[id] = nil }
+
+    /// Ends the snoozes that ran out by `now`: their ids and when each ran out.
+    mutating func expire(now: Date) -> [String: Date] {
+        let ended = byId.filter { $0.value.until <= now }
+        for id in ended.keys { byId[id] = nil }
+        return ended.mapValues(\.until)
+    }
+
+    /// Ends the snoozes of sessions that moved on since (running again, or a
+    /// newer turn); true if any ended.
+    mutating func prune(_ rows: [Row]) -> Bool {
+        let moved = rows.filter { row in byId[row.id].map { row.since > $0.at } ?? false }
+        for row in moved { byId[row.id] = nil }
+        return !moved.isEmpty
+    }
+
+    /// The rows, with the snoozed ones marked.
+    func apply(to rows: [Row], now: Date) -> [Row] {
+        guard !byId.isEmpty else { return rows }
+        return rows.map { row in
+            guard let e = byId[row.id], e.until > now, row.since <= e.at, row.group != .running else { return row }
+            var snoozed = row
+            snoozed.snoozedUntil = e.until
+            return snoozed
+        }
+    }
+
+    /// When the next snooze runs out.
+    var nextEnd: Date? { byId.values.map(\.until).min() }
+
+    /// Drops the snoozes of these sessions (archived in the Claude app); true if any went.
+    mutating func forget(_ ids: Set<String>) -> Bool {
+        let before = byId.count
+        for id in ids { byId[id] = nil }
+        return byId.count != before
+    }
+
+    /// What can be snoozed: a Claude app session that counts or asks you
+    /// something (needs you, to review, just finished), and isn't on hold.
+    static func snoozable(_ row: Row) -> Bool {
+        guard SessionTags.taggable(row), row.group != .running, !row.held else { return false }
+        return row.group == .yourTurn || row.group == .review || row.group == .justFinished || row.card?.ask != nil
+    }
+}
+
+/// How long to snooze: the right-click menu's and the cards' choices.
+enum SnoozeChoice: String, CaseIterable, Identifiable {
+    case hour, threeHours, tomorrow
+    var id: String { rawValue }
+
+    /// For menus.
+    var title: String {
+        switch self {
+        case .hour: return "For 1 Hour"
+        case .threeHours: return "For 3 Hours"
+        case .tomorrow: return "Until Tomorrow Morning"
+        }
+    }
+
+    /// For the small buttons on a card.
+    var short: String {
+        switch self {
+        case .hour: return "1h"
+        case .threeHours: return "3h"
+        case .tomorrow: return "Tomorrow"
+        }
+    }
+
+    /// Tomorrow morning is 9:00 the next day.
+    func until(from now: Date, calendar: Calendar = .current) -> Date {
+        switch self {
+        case .hour: return now.addingTimeInterval(3600)
+        case .threeHours: return now.addingTimeInterval(3 * 3600)
+        case .tomorrow:
+            let start = calendar.startOfDay(for: now)
+            return calendar.date(byAdding: DateComponents(day: 1, hour: 9), to: start) ?? now.addingTimeInterval(86400)
+        }
+    }
+}
+
+/// "until 3:40 PM", "until tomorrow 9:00 AM", "until Fri 9:00 AM".
+func snoozeWhen(_ until: Date, now: Date, calendar: Calendar = .current) -> String {
+    let time = until.formatted(date: .omitted, time: .shortened)
+    if calendar.isDate(until, inSameDayAs: now) { return "until \(time)" }
+    if let next = calendar.date(byAdding: .day, value: 1, to: now), calendar.isDate(until, inSameDayAs: next) {
+        return "until tomorrow \(time)"
+    }
+    return "until " + until.formatted(.dateTime.weekday(.abbreviated)) + " \(time)"
 }
 
 // MARK: - Engine
@@ -1330,15 +1486,78 @@ final class SessionModel: ObservableObject {
     /// The rows as the engine made them, before your tags.
     private var sourceRows: [Row] = []
     private(set) var tags = SessionTags.load()
-    /// After a tag changes: counts, glow and the window's size follow.
+    private(set) var snoozes: SessionSnoozes
+    /// When each snooze ran out on its own: the session glows amber again
+    /// for a while, as if it had just asked.
+    private(set) var wokeAt: [String: Date] = [:]
+    private var wakeTimer: Timer?
+    private let defaults: UserDefaults
+    /// After a tag or a snooze changes: counts, glow and the window's size follow.
     var onTagsChanged: (() -> Void)?
     /// New Tag…: asks for the name.
     var onNewTag: ((Row) -> Void)?
 
-    /// Sets the rows, with your tags on them.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        snoozes = SessionSnoozes.load(defaults)
+    }
+
+    /// Sets the rows, with your tags and snoozes on them.
     func setRows(_ rows: [Row]) {
         sourceRows = rows
-        self.rows = tags.apply(to: rows)
+        let ended = snoozes.expire(now: Date())
+        wokeAt.merge(ended) { $1 }
+        if snoozes.prune(rows) || !ended.isEmpty { snoozes.save(defaults) }
+        self.rows = decorated()
+        scheduleWake()
+    }
+
+    private func decorated() -> [Row] { snoozes.apply(to: tags.apply(to: sourceRows), now: Date()) }
+
+    /// Holds the session until then, or until it moves on.
+    func snooze(_ row: Row, until: Date) {
+        snoozes.snooze(row.id, until: until, at: Date())
+        wokeAt[row.id] = nil
+        snoozesChanged()
+    }
+
+    func wake(_ row: Row) {
+        snoozes.wake(row.id)
+        snoozesChanged()
+    }
+
+    func wakeAll() {
+        snoozes.byId.removeAll()
+        snoozesChanged()
+    }
+
+    /// Ends the snoozes that ran out. The timer calls it, and so does the
+    /// Mac waking from sleep (a timer can run late across sleep).
+    func wakeDue() {
+        let now = Date()
+        let ended = snoozes.expire(now: now)
+        guard !ended.isEmpty else { scheduleWake(); return }
+        wokeAt.merge(ended) { $1 }
+        self.now = now
+        snoozesChanged()
+    }
+
+    private func snoozesChanged() {
+        snoozes.save(defaults)
+        rows = decorated()
+        scheduleWake()
+        onTagsChanged?()
+    }
+
+    private func scheduleWake() {
+        wakeTimer?.invalidate()
+        wakeTimer = nil
+        guard let next = snoozes.nextEnd else { return }
+        let timer = Timer(fire: max(next, Date()).addingTimeInterval(0.5), interval: 0, repeats: false) { [weak self] _ in
+            self?.wakeDue()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        wakeTimer = timer
     }
 
     func toggleTag(_ tag: String, on row: Row) {
@@ -1359,13 +1578,19 @@ final class SessionModel: ObservableObject {
 
     /// A session archived in the Claude app loses its tags.
     func forgetArchived(_ ids: Set<String>) {
-        guard tags.forget(ids) else { return }
-        tagsChanged()
+        let snoozeGone = snoozes.forget(ids)
+        if snoozeGone { snoozes.save(defaults) }
+        if tags.forget(ids) {
+            tagsChanged()
+        } else if snoozeGone {
+            rows = decorated()
+            onTagsChanged?()
+        }
     }
 
     private func tagsChanged() {
         tags.save()
-        rows = tags.apply(to: sourceRows)
+        rows = decorated()
         onTagsChanged?()
     }
 
@@ -1374,7 +1599,9 @@ final class SessionModel: ObservableObject {
         TagActions(enabled: true, known: tags.known(among: Set(sourceRows.map(\.id))),
                    toggle: { [weak self] row, tag in self?.toggleTag(tag, on: row) },
                    newTag: { [weak self] row in self?.onNewTag?(row) },
-                   clear: { [weak self] row in self?.clearTags(on: row) })
+                   clear: { [weak self] row in self?.clearTags(on: row) },
+                   snooze: { [weak self] row, until in self?.snooze(row, until: until) },
+                   wake: { [weak self] row in self?.wake(row) })
     }
     /// Drives the "3 min ago" labels. Ticks only while a panel is showing.
     @Published var now = Date()
@@ -1409,7 +1636,9 @@ final class SessionModel: ObservableObject {
     func freshNeedsYou(_ board: Board) -> [Row] {
         board.yourTurn.filter { row in
             let opened = [openedAt[row.id], row.seen].compactMap { $0 }.max()
-            return now.timeIntervalSince(row.since) <= freshFor && (opened.map { $0 < row.since } ?? true)
+            // A snooze that ran out counts as asking again then.
+            let asked = max(row.since, wokeAt[row.id] ?? .distantPast)
+            return now.timeIntervalSince(asked) <= freshFor && (opened.map { $0 < asked } ?? true)
         }
     }
     let freshFor: TimeInterval = 3600
@@ -1880,13 +2109,15 @@ func compactAge(since d: Date, now: Date) -> String {
     return "\(s / 86400)d"
 }
 
-/// A row's right-click menu: your tags, New Tag… and Remove Tags.
+/// A row's right-click menu: Snooze, your tags, New Tag… and Remove Tags.
 struct TagActions {
     var enabled = false
     var known: [String] = []
     var toggle: (Row, String) -> Void = { _, _ in }
     var newTag: (Row) -> Void = { _ in }
     var clear: (Row) -> Void = { _ in }
+    var snooze: (Row, Date) -> Void = { _, _ in }
+    var wake: (Row) -> Void = { _ in }
 }
 
 private struct TagActionsKey: EnvironmentKey { static let defaultValue = TagActions() }
@@ -1909,6 +2140,20 @@ struct TagMenu: ViewModifier {
     func body(content: Content) -> some View {
         if actions.enabled && SessionTags.taggable(row) {
             content.contextMenu {
+                if let until = row.snoozedUntil, row.snoozed {
+                    Section("Snoozed " + snoozeWhen(until, now: Date())) {
+                        Button("Wake Now") { actions.wake(row) }
+                    }
+                } else if SessionSnoozes.snoozable(row) {
+                    Menu {
+                        ForEach(SnoozeChoice.allCases) { choice in
+                            Button(choice.title) { actions.snooze(row, choice.until(from: Date())) }
+                        }
+                    } label: {
+                        Label("Snooze", systemImage: "moon.zzz")
+                    }
+                    Divider()
+                }
                 Section("Tags") {
                     ForEach(actions.known, id: \.self) { tag in
                         Toggle(tag, isOn: Binding(get: { row.tags.contains(tag) },
@@ -1984,23 +2229,58 @@ struct TagPill: View {
     }
 }
 
-/// Up to two tags, then "+1" for the rest.
+/// When a snooze ends, then up to two tags, then "+1" for the rest.
 struct TagPills: View {
     let tags: [String]
+    var snoozedUntil: Date? = nil
     @AppStorage(TagStyle.key) private var style = TagStyle.outline.rawValue
 
     var body: some View {
-        if !tags.isEmpty {
+        if !tags.isEmpty || snoozedUntil != nil {
             HStack(spacing: style == TagStyle.dot.rawValue ? 9 : 4) {
+                if let snoozedUntil { SnoozePill(until: snoozedUntil) }
                 ForEach(tags.prefix(2), id: \.self) { TagPill(tag: $0) }
                 if tags.count > 2 {
                     Text("+\(tags.count - 2)").font(.system(size: 9.5, weight: .semibold)).foregroundStyle(.secondary)
                 }
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Tags: " + tags.joined(separator: ", "))
+            .accessibilityLabel(([snoozedUntil.map { "Snoozed " + snoozeWhen($0, now: Date()) }].compactMap { $0 }
+                                 + (tags.isEmpty ? [] : ["Tags: " + tags.joined(separator: ", ")])).joined(separator: ", "))
         }
     }
+}
+
+/// "Snoozed until 3:40 PM", grey, in the style you chose for tags.
+struct SnoozePill: View {
+    let until: Date
+    @Environment(\.highContrast) private var contrast
+    @AppStorage(TagStyle.key) private var style = TagStyle.outline.rawValue
+
+    var body: some View {
+        let label = HStack(spacing: 3) {
+            Image(systemName: "moon.zzz.fill").font(.system(size: 8, weight: .semibold))
+            Text(snoozeWhen(until, now: Date()).capitalizedFirst).font(.system(size: 9.5, weight: .semibold))
+        }
+        .lineLimit(1)
+        .foregroundStyle(.secondary)
+        switch TagStyle(rawValue: style) ?? .outline {
+        case .outline:
+            label.padding(.horizontal, 6).padding(.vertical, 0.5)
+                .overlay(Capsule().strokeBorder(Color.secondary.opacity(contrast ? 0.95 : 0.6), lineWidth: 1))
+                .fixedSize()
+        case .filled:
+            label.padding(.horizontal, 6).padding(.vertical, 1)
+                .background(Capsule().fill(Color.secondary.opacity(contrast ? 0.26 : 0.16)))
+                .fixedSize()
+        case .dot, .text:
+            label.fixedSize()
+        }
+    }
+}
+
+extension String {
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }
 
 /// Limbo's mark, the Orbit logo without its square: sessions in the three
@@ -2037,6 +2317,7 @@ struct Indicator: View {
     let group: Group
     var quiet = false
     var held = false
+    var snoozed = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.highContrast) private var forcedContrast
@@ -2045,6 +2326,8 @@ struct Indicator: View {
         let p = Palette(scheme, contrast: forcedContrast || systemContrast == .increased)
         ZStack {
             switch group {
+            case _ where snoozed:
+                Image(systemName: "moon.zzz").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
             case _ where held:
                 Image(systemName: "pause.circle").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             case .yourTurn:
@@ -2137,7 +2420,7 @@ struct SessionRow: View {
     var body: some View {
         Button { if canOpen { open(row) } } label: {
             HStack(alignment: .top, spacing: 10) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held).padding(.top, 1)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed).padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title)
@@ -2147,7 +2430,7 @@ struct SessionRow: View {
                         Spacer(minLength: 4)
                         trailing
                     }
-                    TagPills(tags: row.tags)
+                    TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil)
                     if let line = secondLine {
                         Text(line)
                             .font(.system(size: 12))
@@ -2180,7 +2463,7 @@ struct SessionRow: View {
         .opacity(dimmed || row.held ? 0.72 : 1)
         .help(tooltip)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(row.title), \(row.held ? "on hold" : stateWord)"
+        .accessibilityLabel("\(row.title), \(row.snoozed ? "snoozed" : row.held ? "on hold" : stateWord)"
                             + (row.tags.isEmpty ? "" : ", tagged " + row.tags.joined(separator: ", ")))
         .tagMenu(row)
         .accessibilityValue(secondLine ?? meta)
@@ -2321,6 +2604,7 @@ struct PanelView: View {
     @AppStorage("showTerminal") private var showTerminal = false
     @AppStorage("showOlder") private var showOlder = false
     @AppStorage("showHeld") private var showHeld = false
+    @AppStorage("showSnoozed") private var showSnoozed = false
     @State private var loginOn = LoginItem.isEnabled
 
     var body: some View {
@@ -2396,6 +2680,12 @@ struct PanelView: View {
                 if !b.review.isEmpty {
                     SectionTitle(title: "Ready for review", count: b.review.count)
                     ForEach(b.review) { SessionRow(row: $0, now: now, open: open) }
+                }
+                if !b.snoozed.isEmpty {
+                    DisclosureTitle(title: "Snoozed", count: b.snoozed.count, expanded: $showSnoozed)
+                    if showSnoozed || expandAll {
+                        ForEach(b.snoozed) { SessionRow(row: $0, now: now, open: open) }
+                    }
                 }
                 if !b.onHold.isEmpty {
                     DisclosureTitle(title: "On hold", count: b.onHold.count, expanded: $showHeld)
@@ -2574,23 +2864,23 @@ struct CompactRow: View {
         let active = !row.held && (row.group == .running || row.group == .yourTurn)
         return Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         let title = Text(row.title)
                             .font(.system(size: active ? 13 : 12.5,
                                           weight: contrast ? .bold : (active ? .semibold : .medium)))
                             .lineLimit(1).truncationMode(.tail)
-                        if oneLine && !row.tags.isEmpty {
+                        if oneLine && (!row.tags.isEmpty || row.snoozed) {
                             // Tags beside the title when the whole title still fits, else under it.
                             ViewThatFits(in: .horizontal) {
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                                     title.fixedSize(horizontal: true, vertical: false)
-                                    TagPills(tags: row.tags)
+                                    TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil)
                                 }
                                 VStack(alignment: .leading, spacing: 3) {
                                     title
-                                    TagPills(tags: row.tags)
+                                    TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil)
                                 }
                             }
                         } else {
@@ -2613,7 +2903,7 @@ struct CompactRow: View {
                         if response != nil { Color.clear.frame(width: 18, height: 1) }   // room for the response button
                     }
                     // Rows with a second line: tags on their own line, so a long one never squeezes the title.
-                    if !oneLine { TagPills(tags: row.tags).padding(.vertical, 1) }
+                    if !oneLine { TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil).padding(.vertical, 1) }
                     if let quiet {
                         Text([quietPhrase(quiet, compact: true), row.activity].compactMap { $0 }.joined(separator: " · "))
                             .font(.system(size: 11)).foregroundStyle(p.quiet).lineLimit(1).truncationMode(.tail)
@@ -2795,7 +3085,7 @@ struct AnswerCard: View {
                     ResponseToggle(shown: responseShown, action: toggleResponse).testFrame("response:\(row.id)")
                 }
             }
-            if !row.tags.isEmpty { TagPills(tags: row.tags).padding(.leading, 22) }
+            if !row.tags.isEmpty { TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil).padding(.leading, 22) }
             if responseShown, let response = card.response {
                 ResponseDrawer(text: response, open: { open(row) })
             }
@@ -2956,6 +3246,8 @@ struct FloatingRows {
     let finished: [Row]
     /// Sessions you put on hold, within the header's time choice; listed last.
     let onHold: [Row]
+    /// Sessions you snoozed, until they wake; listed after the finished ones.
+    let snoozed: [Row]
     /// Waiting or review sessions older than the header's time choice.
     let hidden: Int
 
@@ -2966,10 +3258,11 @@ struct FloatingRows {
         review = board.review.filter { now.timeIntervalSince($0.since) <= limit }
         finished = board.justFinished + board.done.filter { now.timeIntervalSince($0.since) <= finishedWithin }
         onHold = board.onHold.filter { now.timeIntervalSince($0.since) <= limit }
+        snoozed = board.snoozed.sorted { ($0.snoozedUntil ?? .distantFuture) < ($1.snoozedUntil ?? .distantFuture) }
         hidden = (allWaiting + board.review).filter { now.timeIntervalSince($0.since) > limit }.count
     }
 
-    var all: [Row] { running + waiting + review + finished + onHold }
+    var all: [Row] { running + waiting + review + finished + snoozed + onHold }
 
     func rows(_ filter: RowFilter?) -> [Row] {
         switch filter {
@@ -3168,14 +3461,15 @@ struct FloatingView: View {
     static let corner: CGFloat = 16
 
     /// The cards ("Waiting on you"), then the other sessions under small
-    /// headings: Running, Needs you, Ready for review, Finished, On hold.
+    /// headings: Running, Needs you, Ready for review, Finished, Snoozed, On hold.
     private func content(_ carded: [Row], _ rows: [Row]) -> some View {
         let sections: [(title: String, rows: [Row])] = [
             ("Running", rows.filter { $0.group == .running && !$0.held }),
             ("Needs you", rows.filter { $0.group == .yourTurn && !$0.held }),
             ("Ready for review", rows.filter { $0.group == .review && !$0.held }),
             ("Finished", rows.filter { ($0.group == .justFinished || $0.group == .done) && !$0.held }),
-            ("On hold", rows.filter(\.held)),
+            ("Snoozed", rows.filter(\.snoozed)),
+            ("On hold", rows.filter { $0.held && !$0.snoozed }),
         ].filter { !$0.rows.isEmpty }
         return VStack(alignment: .leading, spacing: 0) {
             if !carded.isEmpty {
@@ -3604,7 +3898,7 @@ struct FloatingView: View {
     /// asked you something shows the amber "!", whatever its state.
     private func compactMark(_ row: Row) -> some View {
         Indicator(group: Self.asks(row) ? .yourTurn : row.group, quiet: row.quiet(now: model.now) != nil,
-                  held: row.held)
+                  held: row.held, snoozed: row.snoozed)
             .frame(width: 16, height: 16)
     }
 
@@ -3616,9 +3910,10 @@ struct FloatingView: View {
         return min(max(chipMidX - card / 2, 0), rowWidth - card)
     }
 
-    /// The hovered session's card: its question and buttons, or its row.
+    /// The hovered session's card: its question and buttons, or its row,
+    /// then the snooze choices.
     @ViewBuilder private func hoverCard(_ row: Row) -> some View {
-        SwiftUI.Group {
+        VStack(alignment: .leading, spacing: 0) {
             if row.group != .running, !row.held, let card = row.card, card.ask != nil {
                 AnswerCard(row: row, card: card, now: model.now, open: open,
                            responseShown: openResponse == row.id,
@@ -3632,6 +3927,7 @@ struct FloatingView: View {
                            toggleResponse: row.group == .running ? nil : { toggleResponse(row.id) })
                     .padding(4)
             }
+            if SessionSnoozes.snoozable(row) { snoozeButtons(row) }
         }
         .frame(width: Self.hoverCardWidth, alignment: .leading)
         .background { surface(RoundedRectangle(cornerRadius: 12, style: .continuous)) }
@@ -3649,6 +3945,75 @@ struct FloatingView: View {
             .alignmentGuide(trailing ? HorizontalAlignment.trailing : HorizontalAlignment.leading) { _ in
                 trailing ? rowWidth - x : -x
             }
+    }
+
+    /// "Snooze 1h 3h Tomorrow" under a hover card: out of the strip and the
+    /// counts until then, or until the session moves on.
+    private func snoozeButtons(_ row: Row) -> some View {
+        let p = palette
+        return HStack(spacing: 5) {
+            Image(systemName: "moon.zzz").font(.system(size: 10, weight: .semibold))
+            Text("Snooze")
+            ForEach(SnoozeChoice.allCases) { choice in
+                Button {
+                    hovered = nil
+                    model.snooze(row, until: choice.until(from: Date()))
+                } label: {
+                    Text(choice.short)
+                        .padding(.horizontal, 8)
+                        .frame(height: 20)
+                        .background(Capsule().fill(Color.primary.opacity(contrast ? 0.2 : 0.09)))
+                        .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.6 : 0)))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.primary)
+                .help("Snooze " + snoozeWhen(choice.until(from: model.now), now: model.now))
+                .testFrame("snooze:\(row.id):\(choice.rawValue)")
+            }
+        }
+        .font(.system(size: 10.5, weight: .semibold))
+        .foregroundStyle(p.time)
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+        .padding(.bottom, 9)
+    }
+
+    /// The snoozed sessions as a moon and a count; its menu wakes them.
+    @ViewBuilder private func snoozedChip(_ rows: [Row], height: CGFloat = 24) -> some View {
+        if !rows.isEmpty {
+            let p = palette
+            let label = rows.count == 1 ? "1 snoozed" : "\(rows.count) snoozed"
+            Menu {
+                ForEach(rows) { row in
+                    Menu(row.title) {
+                        if let until = row.snoozedUntil { Text("Snoozed " + snoozeWhen(until, now: model.now)) }
+                        Button("Wake Now") { model.wake(row) }
+                        if row.link != nil { Button("Open in Claude") { open(row) } }
+                    }
+                }
+                if rows.count > 1 {
+                    Divider()
+                    Button("Wake All") { model.wakeAll() }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "moon.zzz.fill").font(.system(size: 9, weight: .semibold)).foregroundStyle(p.time)
+                    Text("\(rows.count)")
+                }
+                .padding(.horizontal, 8)
+                .frame(height: height)
+                .background(Capsule().fill(Color.primary.opacity(0.07)))
+                .contentShape(Capsule())
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help(label + ": click to wake one")
+            .testFrame("snoozed-chip")
+            .accessibilityLabel(label)
+        }
     }
 
     /// Records where a chip sits, for its card, and makes the pointer on it show the card.
@@ -3713,6 +4078,7 @@ struct FloatingView: View {
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(finished == 1 ? "1 finished" : "\(finished) finished")
                 }
+                snoozedChip(list.snoozed)
                 listButton.padding(.trailing, 2)
             }
             .font(.system(size: 12, weight: .semibold).monospacedDigit())
@@ -3767,6 +4133,7 @@ struct FloatingView: View {
 
     /// Running, needs you, ready for review, finished: for VoiceOver.
     private func spokenState(_ row: Row) -> String {
+        if let until = row.snoozedUntil, row.snoozed { return "snoozed " + snoozeWhen(until, now: model.now) }
         if row.held { return "on hold" }
         if Self.asks(row) { return "waiting on you" }
         switch row.group {
@@ -3809,6 +4176,12 @@ struct FloatingView: View {
                 }
                 if more > 0 {
                     Text("+\(more)").font(.system(size: 11, weight: .semibold).monospacedDigit()).foregroundStyle(p.time)
+                }
+                if !list.snoozed.isEmpty {
+                    spotDivider(12)
+                    snoozedChip(list.snoozed, height: 18)
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                        .padding(.horizontal, -4)
                 }
             }
             .padding(.horizontal, 10)
@@ -3873,6 +4246,10 @@ struct FloatingView: View {
                         Text("\(g.finished.count)")
                     }
                     .fixedSize()
+                }
+                if !list.snoozed.isEmpty {
+                    if !shown.isEmpty || !g.finished.isEmpty { spotDivider(14) }
+                    snoozedChip(list.snoozed, height: 22)
                 }
                 // The empty part: double-click for the list.
                 backToList(Color.clear.frame(minWidth: 8, maxWidth: .infinity, minHeight: 22, maxHeight: 22))
@@ -3955,7 +4332,7 @@ struct FloatingView: View {
                 columnDivider
                 column("Waiting on you", g.waiting + g.review)
                 columnDivider
-                column("Finished", g.finished + list.onHold)
+                column("Finished", g.finished + list.snoozed + list.onHold)
             }
             .fixedSize(horizontal: false, vertical: true)
             .padding(.bottom, 6)
@@ -6334,6 +6711,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func didWake() {
+        model.wakeDue()
         engine.refresh()
         updateStatusItem()
     }
@@ -6410,6 +6788,9 @@ func sampleRows(now: Date) -> [Row] {
         Row(id: "local_s3b", group: .yourTurn, title: "Rename the billing exports",
             ask: "Which naming scheme should the new export files use?",
             context: "billing-service", since: minutesAgo(50), link: "local_s3b", tags: [SessionTags.onHold]),
+        Row(id: "local_s3c", group: .yourTurn, title: "Rotate the staging API keys",
+            ask: "OK to revoke the old keys now?", context: "web-platform", since: minutesAgo(70),
+            link: "local_s3c", snoozedUntil: now.addingTimeInterval(45 * 60)),
         Row(id: "local_s4", group: .running, title: "Audit traffic before the old site is shut down",
             context: "Documents", since: minutesAgo(12), link: "local_s4",
             activity: "Scanning the app logs for scope errors"),
@@ -6570,7 +6951,7 @@ func runDump() {
     let groups: [(String, [Row])] = [
         ("your-turn", board.yourTurn), ("your-turn-older", board.older), ("running", board.running),
         ("just-finished", board.justFinished), ("review", board.review), ("done", board.done),
-        ("terminal", board.terminal), ("on-hold", board.onHold),
+        ("terminal", board.terminal), ("on-hold", board.onHold), ("snoozed", board.snoozed),
     ]
     for (name, rows) in groups {
         for r in rows {
@@ -6804,7 +7185,8 @@ func runSelfTest() {
     check("a turn without a wrap-up keeps its reply",
           turnCard(transcript: transcriptFile([saidLine("hi"), replyLine("Hello")])) == TurnCard(reply: "Hello"))
     check("a question with no buttons gets one", TurnCard(ask: "Go?").buttons == ["Answer in Claude"])
-    // Background work: a child shell holding …/<session>/tasks/<id>.output counts.
+    // Background work: a child shell holding …/<session>/tasks/<id>.output
+    // counts, and so does a monitor: a shell Claude started, holding no file.
     let taskDir = NSTemporaryDirectory() + "limbo-bg-\(getpid())/s-123/tasks"
     try? FileManager.default.createDirectory(atPath: taskDir, withIntermediateDirectories: true)
     let shell = Process()
@@ -6817,6 +7199,20 @@ func runSelfTest() {
     shell.terminate()
     shell.waitUntilExit()
     check("a finished task doesn't", runningBackgroundTasks(parent: getpid(), session: "s-123") == 0)
+    let monitor = Process()
+    monitor.executableURL = URL(fileURLWithPath: "/bin/zsh")   // sh in POSIX mode quits when source finds no file
+    monitor.arguments = ["-c", "source /nowhere/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && sleep 5; :"]
+    let plainShell = Process()
+    plainShell.executableURL = URL(fileURLWithPath: "/bin/sh")
+    plainShell.arguments = ["-c", "sleep 5"]
+    try? plainShell.run()
+    Thread.sleep(forTimeInterval: 0.3)
+    check("a shell Claude didn't start doesn't count", runningBackgroundTasks(parent: getpid(), session: "s-123") == 0)
+    try? monitor.run()
+    Thread.sleep(forTimeInterval: 0.3)
+    check("a monitor (a shell Claude started, streaming, no output file) counts",
+          runningBackgroundTasks(parent: getpid(), session: "s-123") == 1)
+    for process in [monitor, plainShell] { process.terminate(); process.waitUntilExit() }
     try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "limbo-bg-\(getpid())")
     let reviewDesk = DeskRecord(sessionId: "local_bg1", title: "Watch the deploys", cwd: "/tmp", lastActivity: now,
                                 lastTurnEdge: now.addingTimeInterval(-30), fileTime: now, isArchived: false,
@@ -6965,6 +7361,75 @@ func runSelfTest() {
     check("shrinking on the left keeps the left edge",
           anchoredFrame(NSRect(x: 40, y: 600, width: 320, height: 200), size: NSSize(width: 150, height: 32),
                         screen: screenFrame) == NSRect(x: 40, y: 768, width: 150, height: 32))
+
+    // Snooze: held until a time you pick, or until the session moves on.
+    let snoozeSuite = "limbo-tasks-selftest-snooze"
+    let snoozeDefaults = UserDefaults(suiteName: snoozeSuite)!
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    let today = Date(timeIntervalSince1970: 1_800_000_000)   // 2027-01-15 08:00 UTC
+    let morning = SnoozeChoice.tomorrow.until(from: today, calendar: calendar)
+    check("tomorrow morning is 9:00 the next day",
+          calendar.dateComponents([.day, .hour, .minute], from: morning) == DateComponents(day: 16, hour: 9, minute: 0))
+    check("an hour is an hour", SnoozeChoice.hour.until(from: today) == today.addingTimeInterval(3600))
+    check("a snooze ending today says only the time",
+          snoozeWhen(today.addingTimeInterval(3600), now: today, calendar: calendar).hasPrefix("until ")
+              && !snoozeWhen(today.addingTimeInterval(3600), now: today, calendar: calendar).contains("tomorrow"))
+    check("one ending tomorrow says tomorrow",
+          snoozeWhen(morning, now: today, calendar: calendar).hasPrefix("until tomorrow "))
+    let asker = Row(id: "local_z1", group: .yourTurn, title: "Rotate the keys", ask: "OK to revoke?", context: "",
+                    since: Date().addingTimeInterval(-600), link: "local_z1")
+    let reviewAsk = Row(id: "local_z2", group: .review, title: "Ship the fix", context: "",
+                        since: Date().addingTimeInterval(-900), link: "local_z2",
+                        card: TurnCard(ask: "Merge it?", actions: ["Merge"]))
+    let busy = Row(id: "local_z3", group: .running, title: "Busy", context: "", since: Date().addingTimeInterval(-60),
+                   link: "local_z3")
+    check("needs you, to review and asking rows can be snoozed",
+          SessionSnoozes.snoozable(asker) && SessionSnoozes.snoozable(reviewAsk))
+    check("running, quiet finished and terminal rows can't",
+          !SessionSnoozes.snoozable(busy) && !SessionSnoozes.snoozable(quietDone)
+              && !SessionSnoozes.snoozable(Row(id: "pid:9", group: .yourTurn, title: "t", context: "", since: Date(),
+                                               terminal: true)))
+    let snoozer = SessionModel(defaults: snoozeDefaults)
+    snoozer.setRows([asker, reviewAsk, busy])
+    snoozer.now = Date()
+    snoozer.snooze(asker, until: Date().addingTimeInterval(3600))
+    snoozer.snooze(reviewAsk, until: Date().addingTimeInterval(7200))
+    let snoozedBoard = Board(rows: snoozer.rows, now: snoozer.now)
+    check("a snoozed session leaves Your turn for Snoozed",
+          snoozedBoard.yourTurn.isEmpty && Set(snoozedBoard.snoozed.map(\.id)) == ["local_z1", "local_z2"])
+    check("snoozed: no amber glow", snoozer.freshNeedsYou(snoozedBoard).isEmpty)
+    let snoozedList = FloatingRows(board: snoozedBoard, now: snoozer.now, within: 86400, finishedWithin: 7200)
+    check("snoozed asking rows leave the strip",
+          FloatingView.Compact(snoozedList).waiting.isEmpty && FloatingView.stripRows(snoozedList).shown.map(\.id) == ["local_z3"])
+    check("Snoozed lists the soonest to wake first", snoozedList.snoozed.map(\.id) == ["local_z1", "local_z2"])
+    check("a snooze is kept in the settings", Set(SessionSnoozes.load(snoozeDefaults).byId.keys) == ["local_z1", "local_z2"])
+    check("a snooze leaves running rows alone",
+          SessionSnoozes(byId: ["local_z3": .init(until: .distantFuture, at: Date())]).apply(to: [busy], now: Date())[0].snoozedUntil == nil)
+    // You answer it (or it ends another turn): the snooze is over.
+    let movedOn = Row(id: "local_z2", group: .running, title: "Ship the fix", context: "", since: Date().addingTimeInterval(5),
+                      link: "local_z2")
+    snoozer.setRows([asker, movedOn, busy])
+    check("a session that moves on wakes", snoozer.snoozes.byId["local_z2"] == nil
+              && Board(rows: snoozer.rows, now: snoozer.now).snoozed.map(\.id) == ["local_z1"])
+    snoozer.wake(asker)
+    check("Wake Now brings it back", Board(rows: snoozer.rows, now: snoozer.now).yourTurn.map(\.id) == ["local_z1"])
+    // A snooze that runs out: back in Your turn, glowing amber as if it had just asked.
+    let oldAsk = Row(id: "local_z4", group: .yourTurn, title: "Old question", context: "",
+                     since: Date().addingTimeInterval(-5 * 3600), link: "local_z4")
+    snoozer.setRows([oldAsk])
+    snoozer.snooze(oldAsk, until: Date().addingTimeInterval(-1))
+    snoozer.wakeDue()
+    let wokenBoard = Board(rows: snoozer.rows, now: snoozer.now)
+    check("a snooze that ran out wakes and glows amber again",
+          wokenBoard.yourTurn.map(\.id) == ["local_z4"] && snoozer.freshNeedsYou(wokenBoard).map(\.id) == ["local_z4"])
+    snoozer.snooze(oldAsk, until: Date().addingTimeInterval(3600))
+    snoozer.forgetArchived(["local_z4"])
+    check("archiving drops its snooze", snoozer.snoozes.byId.isEmpty && Board(rows: snoozer.rows, now: snoozer.now).snoozed.isEmpty)
+    check("the snooze symbols exist", ["moon.zzz", "moon.zzz.fill"].allSatisfy {
+        NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil })
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
 
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
@@ -7245,6 +7710,53 @@ func runGestureCheck() {
     } else {
         check("the response button shows the reply without opening the session", false, "(button not found)")
     }
+    // Snooze from a hover card: the session leaves the strip for the moon's
+    // count, and the moon's menu can wake it. Own settings, cleared after.
+    let snoozeSuite = "limbo-tasks-gesture-snooze"
+    let snoozeDefaults = UserDefaults(suiteName: snoozeSuite)!
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
+    let snoozeModel = SessionModel(defaults: snoozeDefaults)
+    snoozeModel.setRows(sampleRows(now: Date()).filter { $0.snoozedUntil == nil })
+    let stripLayout = FloatingLayout(chosen: .strip)
+    let stripHost = FirstClickHostingView(rootView: FloatingView(model: snoozeModel, open: { _ in }, unpin: {},
+                                                                 glow: nil, layout: stripLayout,
+                                                                 initialHover: "local_s1"))
+    stripHost.frame = NSRect(origin: .zero, size: stripHost.fittingSize)
+    let stripPanel = KeepOnTopPanel(contentRect: stripHost.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                    backing: .buffered, defer: false)
+    stripPanel.contentView = stripHost
+    stripPanel.setFrameOrigin(NSPoint(x: -6000, y: -5000))
+    stripPanel.orderFrontRegardless()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    stripHost.frame = NSRect(origin: .zero, size: stripHost.fittingSize)
+    stripPanel.setContentSize(stripHost.frame.size)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    if let button = testFrames["snooze:local_s1:hour"] {
+        let at = NSPoint(x: button.midX, y: stripHost.frame.height - button.midY)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            let event = NSEvent.mouseEvent(with: type, location: at, modifierFlags: [],
+                                           timestamp: ProcessInfo.processInfo.systemUptime,
+                                           windowNumber: stripPanel.windowNumber, context: nil, eventNumber: 0,
+                                           clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!
+            stripPanel.sendEvent(event)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        let until = snoozeModel.snoozes.byId["local_s1"]?.until.timeIntervalSinceNow ?? 0
+        check("a hover card's 1h button snoozes the session for an hour", (3590...3600).contains(until),
+              "(\(Int(until)) s)")
+        stripHost.frame = NSRect(origin: .zero, size: stripHost.fittingSize)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let stillThere = FloatingView.stripRows(FloatingRows(board: Board(rows: snoozeModel.rows, now: Date()), now: Date(),
+                                                             within: 86400, finishedWithin: 7200)).shown.map(\.id)
+        check("it leaves the strip, and the moon counts it",
+              !stillThere.contains("local_s1") && testFrames["snoozed-chip"] != nil && stripHost.frame.height == 32,
+              "(strip \(stillThere), height \(Int(stripHost.frame.height)))")
+    } else {
+        check("a hover card's 1h button snoozes the session for an hour", false, "(button not found)")
+    }
+    stripPanel.orderOut(nil)
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
     // New Tag…: the box takes the keyboard without making Limbo the active app,
     // and Return adds what was typed; Esc adds nothing.
     let prompt = TagPrompt()

@@ -100,11 +100,12 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 | | |
 |---|---|
 | **Menu bar** | The Claude mark with the number of sessions running and a speech bubble with the number waiting for you. |
-| **Menu bar panel** | Every session from the last 7 days in groups: Running, Your turn, Just finished, Ready for review, On hold, Done, In a terminal. |
+| **Menu bar panel** | Every session from the last 7 days in groups: Running, Your turn, Just finished, Ready for review, Snoozed, On hold, Done, In a terminal. |
 | **Keep-on-top window** | A small window above everything, full-screen apps included, that never takes the keyboard. |
 | **Waiting on you cards** | A session's question and the buttons from Claude's next-step box, with its latest reply one click away. |
 | **Answer from Cards** | Click a card's button and Limbo presses it in Claude for you, then puts your screens back. |
 | **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
+| **Snooze** | Put a session away for an hour, three hours or until tomorrow morning; it comes back by itself. |
 | **Glows** | A calm rim while sessions run, amber when one needs you, green when everything finishes. |
 | **Layouts** | List, Strip, Bar, Dots, Columns or Pill; the strip can take over while an app is full screen. |
 
@@ -124,9 +125,9 @@ Every session from the last 7 days, grouped by what it needs from you (the rules
 
 The pin in the panel opens a small window with the running sessions, the ones waiting for you or ready for review, and ones finished in the last 2 hours. It stays above other windows, full-screen videos and games included, on every Space, and never takes keyboard focus, so it never interrupts what you type.
 
-- **Sections:** small capital headings with a count and a hairline: Waiting on you, Running, Needs you, Ready for review, Finished, On hold.
+- **Sections:** small capital headings with a count and a hairline: Waiting on you, Running, Needs you, Ready for review, Finished, Snoozed, On hold.
 - **Look:** the system's glass background, like other macOS windows and alerts, darkened in Dark Mode the way Control Center's panels are (the blurred material before macOS 26), Apple's rounded system font, 16-point corners, a light blue backing behind running sessions, stronger titles for sessions still going, one line per finished session.
-- **A mark per state,** told apart by shape as well as colour: a turning blue ring (running), an hourglass (running but nothing written for 10 minutes), an exclamation (needs you), an eye (ready for review), a check (finished), a pause mark (on hold). Every time uses one short style: "4m 12s" ticking for running sessions, "6m", "18h", "now" for the rest.
+- **A mark per state,** told apart by shape as well as colour: a turning blue ring (running), an hourglass (running but nothing written for 10 minutes), an exclamation (needs you), an eye (ready for review), a check (finished), a moon (snoozed), a pause mark (on hold). Every time uses one short style: "4m 12s" ticking for running sessions, "6m", "18h", "now" for the rest.
 - **Running sessions** show what they are doing now, like Claude's own status line ("Thinking", the command being run, the file being edited), with a light band sweeping across it. A session between turns that still has background tasks running shows "2 background tasks running" and counts as running.
 - **Questions and summaries** show in full, wrapping onto more lines; a running status stays on one line so the row doesn't jump.
 - **Count chips filter the list:** click "1 needs you" to list only those sessions, click again for everything.
@@ -167,6 +168,14 @@ Right-click any session (in the window, the panel or on a card) to tag it: **On 
 </table>
 
 Tags stay until you remove them or archive the session in Claude. They live in Limbo's own settings, so they show only in Limbo; sessions started in a terminal can't be tagged. Typing a new tag opens a small box by the pointer, the one time Limbo takes the keyboard, and the app you were in gets it back on Return or Esc.
+
+#### Snooze
+
+Snooze a session that needs you (or is ready for review, or asked you something) when you don't want to deal with it yet: **For 1 Hour**, **For 3 Hours** or **Until Tomorrow Morning** (9:00). Pick it from the session's right-click menu, anywhere it shows, or from the **Snooze 1h 3h Tomorrow** buttons under a card in the strip, the bar and the dots.
+
+- A snoozed session moves to its own Snoozed section, dimmed with a moon and when it wakes ("Until 8:02 PM"). It no longer counts as needing you, in the header or the menu bar, and never starts a glow. The strip, the bar and the dots show a moon with how many are snoozed; its menu wakes one, or all, or opens one in Claude.
+- It wakes on its own at that time, back where it was; one that needs you glows amber again, as if it had just asked. It wakes early if the session moves on: you answer it, or it ends another turn. **Wake Now** in its right-click menu brings it back at once.
+- Snoozes live in Limbo's own settings, like tags; sessions started in a terminal can't be snoozed.
 
 #### Glows
 
@@ -214,6 +223,7 @@ Panel groups, first rule that matches wins:
 | Your turn | The Claude app's own end-of-turn summary (`postTurnSummary` in the session's `local_<id>.json`) is current and says `blocked`, `need_input` or `failed`, or the session stopped with an error in the last 7 days. The row shows what it needs from you. Questions older than 3 days fold under "older"; older than 7 days drop off. |
 | Just finished | The turn has ended but the app has not written its summary yet (usually seconds). |
 | Ready for review | The summary says `review_ready`, and you have not opened the session in Claude since its turn ended (the record's `lastFocusedAt`, which Claude sets each time the session comes into view). Once you have, it counts as done. A session that finishes while you are already looking at it stays here until it next comes into view. |
+| Snoozed | You snoozed it, and its time hasn't come and it hasn't moved on since (and it is not running). |
 | On hold | You tagged it On hold (and it is not running). |
 | Done | Anything else from the last 7 days, collapsed. |
 | In a terminal | Idle sessions started in a terminal. They have no summary, so they never count as your turn. Collapsed. |
@@ -225,11 +235,11 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 - `~/.claude/sessions/<pid>.json`: the live Claude Code processes.
 - `~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_<id>.json`: each desktop session's record, decoded into a few named fields (title, folder, turn times, end-of-turn summary, `lastFocusedAt`); the rest of the file is never kept. `waiting-input/` (queued input under the same file names) is skipped by path.
 - The last 256 KB of each recent session's transcript (`~/.claude/projects/<folder>/<id>.jsonl`), only while the panel or the window is showing: what a running session is doing now, how its latest turn ended (the next-step box's question and buttons) and its latest reply. Re-read at most once a second while a session runs, and otherwise only when that transcript changes.
-- Background tasks: the open files of the session's own child shells (via `libproc`), counting paths ending `.output` under `<session>/tasks/`. File names only, never contents.
+- Background tasks: the session's own child shells (via `libproc`). A Bash command left running holds a file ending `.output` under `<session>/tasks/` open; a monitor streams to Claude instead, so it counts as a shell Claude started (its command sources one of Claude's `~/.claude/shell-snapshots/`) that holds no such file. File names, and whether a shell's command has that marker; never file contents, and nothing else of the command.
 - A running session that has written nothing for 10 minutes (its transcript, its agents' transcripts under `<session>/subagents`, its workflow files under `<session>/workflows`) gets the hourglass and "No output for 12 min": it may be stuck, or in one long command.
 - It never opens the `*.key` files, and never changes Claude's files.
 
-Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`.
+Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`, snoozes under `sessionSnoozes`.
 
 #### Answer from Cards, step by step
 
@@ -265,9 +275,9 @@ limbo-tasks --snapshot out.png --floating [--mini] [--filter running|needsYou|re
 limbo-tasks --snapshot out.png --floating --layout strip|bar|dots|columns [--hover local_s1]   # --size 1400 for the bar's width
 limbo-tasks --snapshot out.png --floating --response local_s7 [--live] [-tagStyle outline|filled|dot|text]
 limbo-tasks --glow-cycle 16                         # Random in an offscreen window: effect each second, then CPU used
-limbo-tasks --gesture-check                         # chips, cards, replies, the New Tag box, close, pill, layouts (off screen)
+limbo-tasks --gesture-check                         # chips, cards, replies, snooze, the New Tag box, close, pill, layouts (off screen)
 limbo-tasks --resize-check                          # dragging the edges, and never becoming the front app
-limbo-tasks --self-test                             # states, tags, glow decisions, cards, answers, background tasks
+limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks
 limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
 kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json,
                                                     # a picture of the menu bar button -> ...limbo-tasks.menubar.png,
