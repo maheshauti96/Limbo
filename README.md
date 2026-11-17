@@ -73,7 +73,15 @@ Dedup: emits only when `(tool, label)` state changes; disappeared → `finished`
 
 ## Limbo Tasks (Claude sessions, grouped by what they need from you)
 
-A small, separate menu bar app in [tasks/main.swift](tasks/main.swift) that shows every Claude Code session in the Claude desktop app: what is running, what is waiting for you, what is ready for review and what just finished. It does not need the Go watcher. All screenshots below use the app's built-in sample sessions (`--sample`).
+### The problem
+
+With several Claude Code sessions going at once, the Claude desktop app tells you that one has finished, or is waiting for your answer, with nothing more than a small grey dot next to its name in the sidebar. The dot is easy to miss in a long list, and it doesn't say whether the session needs you, finished, or only has new output. So you end up hopping from one session to the next just to see which ones have news, and the one that has been waiting for you sits unnoticed.
+
+<p align="center"><img src="docs/images/limbo-tasks/claude-sidebar-dot.gif" width="370" alt="Claude's sidebar: small grey dots appear next to three sessions, the only sign that they have news"><br><sub>Claude's sidebar (example names): the grey dot is the only sign that a session has news.</sub></p>
+
+### What Limbo Tasks does
+
+A small, separate menu bar app in [tasks/main.swift](tasks/main.swift) that shows every Claude Code session in the Claude desktop app by what it needs from you: what is running and what it is doing, what is waiting for your answer (with Claude's own buttons, so you can answer from it), what is ready for review and what just finished. A window that stays on top shows it at a glance, and its edge glows amber when a session needs you and green when everything has finished, so you can stay in one task and still notice the others. It does not need the Go watcher. All screenshots below use the app's built-in sample sessions (`--sample`).
 
 <p align="center"><img src="docs/images/limbo-tasks/window.png" width="392" alt="The keep-on-top window: Waiting on you cards, then Running, Ready for review, Finished and On hold sections"></p>
 
