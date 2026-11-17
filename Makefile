@@ -14,6 +14,8 @@ install-tasks: tasks
 	mkdir -p "$(TASKS_APP)/Contents/MacOS"
 	cp bin/limbo-tasks "$(TASKS_APP)/Contents/MacOS/limbo-tasks"
 	cp tasks/Info.plist "$(TASKS_APP)/Contents/Info.plist"
+	mkdir -p "$(TASKS_APP)/Contents/Resources"
+	cp tasks/AppIcon.icns "$(TASKS_APP)/Contents/Resources/AppIcon.icns"
 	codesign --force --sign "$(SIGN)" "$(TASKS_APP)"
 	-launchctl bootout gui/$$(id -u)/com.maheshauti.limbo-tasks 2>/dev/null
 	-pkill -x limbo-tasks

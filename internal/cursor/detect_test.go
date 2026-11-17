@@ -252,7 +252,7 @@ func TestDetect_conversationSearch(t *testing.T) {
 	listing := "/Applications/Cursor.app/Contents/MacOS/Cursor\n"
 	dbPath := writeConversationSearchDB(t, []convRow{
 		{
-			id:        "bc-b610472e-d15e-47aa-837b-a0965eb98aab",
+			id:        "bc-00000000-0000-4000-8000-000000000004",
 			source:    "cloud-cache",
 			title:     "FE+BE",
 			updatedAt: now.Add(-30 * time.Second).UnixMilli(),
@@ -291,7 +291,7 @@ func TestDetect_conversationSearch(t *testing.T) {
 	// workspaceStorage would falsely show idle for FE+BE (wal 18m stale) — must not be used
 	wsRoot := t.TempDir()
 	writeWorkspace(t, filepath.Join(wsRoot, "hash-febe"),
-		`{"folder":"file:///tmp/background-composer/bc-b610472e-d15e-47aa-837b-a0965eb98aab"}`,
+		`{"folder":"file:///tmp/background-composer/bc-00000000-0000-4000-8000-000000000004"}`,
 		"state.vscdb-wal", now.Add(-18*time.Minute))
 
 	got := Detect(DetectOptions{

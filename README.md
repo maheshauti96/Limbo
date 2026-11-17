@@ -1,6 +1,8 @@
-# Limbo
+<p align="center"><img src="docs/images/limbo-logo.svg" width="112" alt="Limbo logo: blue, amber and green sessions circling a white centre"></p>
 
-macOS menu-bar board for Cursor, Claude, Grok, and Codex sessions.
+<h1 align="center">Limbo</h1>
+
+<p align="center">macOS menu-bar board for Cursor, Claude, Grok, and Codex sessions.</p>
 
 A local Go watcher reads verified Mac signals and writes a JSON snapshot. The tray reads that file. No webhooks. No HTTP. No secrets in logs or files.
 
