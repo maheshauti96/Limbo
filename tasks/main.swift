@@ -3295,7 +3295,7 @@ struct FloatingView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(palette.done)
                     .padding(.horizontal, 8)
-                    .padding(.vertical, 2.5)
+                    .padding(.vertical, 2)
                     .background(Capsule().fill(palette.done.opacity(0.16)))
                     .contentShape(Capsule())
                 }
@@ -3368,7 +3368,7 @@ struct FloatingView: View {
             .font(.system(size: 11, weight: .semibold).monospacedDigit())
             .foregroundStyle(selected ? tint : Color.primary)
             .padding(.horizontal, 8)
-            .padding(.vertical, 2.5)
+            .padding(.vertical, 2)
             .background(Capsule().fill(selected ? tint.opacity(0.2) : Color.primary.opacity(0.1)))
             .overlay(Capsule().strokeBorder(selected ? tint.opacity(0.7) : Color.primary.opacity(contrast ? 0.6 : 0)))
             .contentShape(Capsule())
