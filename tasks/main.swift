@@ -1925,22 +1925,52 @@ struct TagMenu: ViewModifier {
     }
 }
 
+/// How tags are drawn: chosen from the keep-on-top window's header menu.
+enum TagStyle: String, CaseIterable, Identifiable {
+    case outline, filled, dot, text
+    static let key = "tagStyle"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .outline: return "Outline"
+        case .filled: return "Filled"
+        case .dot: return "Dot and label"
+        case .text: return "Coloured text"
+        }
+    }
+}
+
 /// A tag as a small label beside a session's title.
 struct TagPill: View {
     let tag: String
     @Environment(\.highContrast) private var contrast
+    @AppStorage(TagStyle.key) private var style = TagStyle.outline.rawValue
 
     var body: some View {
         let color = Self.color(tag)
-        Text(tag)
-            .font(.system(size: 9.5, weight: .semibold))
-            .lineLimit(1)
-            .foregroundStyle(color)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(RoundedRectangle(cornerRadius: 4, style: .continuous)
-                .fill(color.opacity(contrast ? 0.26 : 0.16)))
+        let label = Text(tag).font(.system(size: 9.5, weight: .semibold)).lineLimit(1)
+        switch TagStyle(rawValue: style) ?? .outline {
+        case .outline:
+            label.foregroundStyle(color)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 0.5)
+                .overlay(Capsule().strokeBorder(color.opacity(contrast ? 0.95 : 0.6), lineWidth: 1))
+                .fixedSize()
+        case .filled:
+            label.foregroundStyle(color)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(color.opacity(contrast ? 0.26 : 0.16)))
+                .fixedSize()
+        case .dot:
+            HStack(spacing: 4) {
+                Circle().fill(color).frame(width: 6, height: 6)
+                label.foregroundStyle(contrast ? Color.primary : Color.secondary)
+            }
             .fixedSize()
+        case .text:
+            label.foregroundStyle(color).fixedSize()
+        }
     }
 
     /// Grey for On hold, purple for Awaiting manual review, and one of a few
@@ -1957,10 +1987,11 @@ struct TagPill: View {
 /// Up to two tags, then "+1" for the rest.
 struct TagPills: View {
     let tags: [String]
+    @AppStorage(TagStyle.key) private var style = TagStyle.outline.rawValue
 
     var body: some View {
         if !tags.isEmpty {
-            HStack(spacing: 3) {
+            HStack(spacing: style == TagStyle.dot.rawValue ? 9 : 4) {
                 ForEach(tags.prefix(2), id: \.self) { TagPill(tag: $0) }
                 if tags.count > 2 {
                     Text("+\(tags.count - 2)").font(.system(size: 9.5, weight: .semibold)).foregroundStyle(.secondary)
@@ -2508,13 +2539,36 @@ struct CompactRow: View {
         let p = Palette(scheme, contrast: contrast)
         // A question from the session's next-step box, when it is not shown as a card.
         let question = row.group == .running ? nil : row.card?.ask
+        let detail = question ?? (row.group == .yourTurn ? row.ask
+            : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil)))
+        // A row with nothing under its title (a finished one) is a single line,
+        // its tags beside the title; sessions still going are a little stronger.
+        let oneLine = quiet == nil && detail == nil
+        let active = !row.held && (row.group == .running || row.group == .yourTurn)
         return Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
                 Indicator(group: row.group, quiet: quiet != nil, held: row.held)
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(row.title).font(.system(size: 12, weight: contrast ? .bold : .medium))
+                        let title = Text(row.title)
+                            .font(.system(size: active ? 13 : 12.5,
+                                          weight: contrast ? .bold : (active ? .semibold : .medium)))
                             .lineLimit(1).truncationMode(.tail)
+                        if oneLine && !row.tags.isEmpty {
+                            // Tags beside the title when the whole title still fits, else under it.
+                            ViewThatFits(in: .horizontal) {
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                    title.fixedSize(horizontal: true, vertical: false)
+                                    TagPills(tags: row.tags)
+                                }
+                                VStack(alignment: .leading, spacing: 3) {
+                                    title
+                                    TagPills(tags: row.tags)
+                                }
+                            }
+                        } else {
+                            title
+                        }
                         Spacer(minLength: 4)
                         // One short style for every time: "4m 12s" ticking for running rows
                         // (only while this window shows), "6m", "18h", "now" for the rest.
@@ -2531,13 +2585,12 @@ struct CompactRow: View {
                         }
                         if response != nil { Color.clear.frame(width: 18, height: 1) }   // room for the response button
                     }
-                    // Tags on their own line, so a long one never squeezes the title.
-                    TagPills(tags: row.tags).padding(.vertical, 1)
+                    // Rows with a second line: tags on their own line, so a long one never squeezes the title.
+                    if !oneLine { TagPills(tags: row.tags).padding(.vertical, 1) }
                     if let quiet {
                         Text([quietPhrase(quiet, compact: true), row.activity].compactMap { $0 }.joined(separator: " · "))
                             .font(.system(size: 11)).foregroundStyle(p.quiet).lineLimit(1).truncationMode(.tail)
-                    } else if let line = question ?? (row.group == .yourTurn ? row.ask
-                        : (row.group == .review ? row.detail : (row.group == .running ? row.activity : nil))) {
+                    } else if let line = detail {
                         if row.group == .running && !staticIndicators {
                             ShimmerText(text: line, base: p.shimmerBase, bright: p.shimmer)
                                 .accessibilityLabel(line)
@@ -2554,12 +2607,14 @@ struct CompactRow: View {
                 }
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.vertical, oneLine ? 4 : 6)
             .opacity(row.held ? 0.72 : 1)
             .contentShape(Rectangle())
             .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.primary.opacity(hovering && row.link != nil ? 0.08 : 0)))
+                // A running session sits on a light blue backing; any row lights up under the pointer.
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(row.group == .running && !row.held && !contrast ? p.running.opacity(hovering ? 0.17 : 0.11)
+                          : Color.primary.opacity(hovering && row.link != nil ? 0.08 : 0)))
         }
         .buttonStyle(.plain)
         .pointerStyle(row.link != nil ? .link : nil)
@@ -2719,11 +2774,11 @@ struct AnswerCard: View {
         .padding(.horizontal, 10)
         .padding(.top, 7)
         .padding(.bottom, 10)
-        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .fill(Color.primary.opacity(contrast ? 0.1 : 0.06)))
         .overlay {
             if contrast {
-                RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.5))
+                RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.5))
             }
         }
         .onHover { if $0 { warm?() } }
@@ -2938,7 +2993,8 @@ struct FloatingView: View {
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppStorage("keepOnTopWaitingHours") private var waitingHours = WaitingWindow.day.rawValue
-    @AppStorage(GlowStyle.key) private var glowStyle = GlowStyle.aurora.rawValue
+    @AppStorage(GlowStyle.key) private var glowStyle = GlowStyle.calm.rawValue
+    @AppStorage(TagStyle.key) private var tagStyle = TagStyle.outline.rawValue
     @AppStorage(GlowColor.key) private var glowColor = GlowColor.red.rawValue
     @AppStorage(GlowSignal.needsYouKey) private var needsYouGlow = true
     @AppStorage(GlowSignal.doneFlashKey) private var doneFlash = true
@@ -2951,7 +3007,8 @@ struct FloatingView: View {
 
     private var window: WaitingWindow { WaitingWindow(rawValue: waitingHours) ?? .day }
     private var contrast: Bool { forceContrast ?? (systemContrast == .increased) }
-    private var solid: Bool { forceSolid ?? reduceTransparency }
+    /// A solid background with Reduce Transparency, or with the calm rim.
+    private var solid: Bool { forceSolid ?? (reduceTransparency || glowStyle == GlowStyle.calm.rawValue) }
     private var palette: Palette { Palette(scheme, contrast: contrast) }
     private var showGotIt: Bool { !status.previewing && (status.mode == .done || status.mode == .needsYou) }
 
@@ -2961,6 +3018,7 @@ struct FloatingView: View {
         SwiftUI.Group {
             if layout.mini { pill(list) } else { full(list) }
         }
+        .fontDesign(.rounded)
         .environment(\.highContrast, contrast)
         .environment(\.tagActions, model.tagActions)
         .onAppear {
@@ -3034,16 +3092,27 @@ struct FloatingView: View {
         }
         .frame(width: layout.width, height: layout.height, alignment: .top)
         .background { if let glow { GlowBackdrop(view: glow) } }
-        .background { surface(RoundedRectangle(cornerRadius: 12, style: .continuous)) }
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+        .background { surface(RoundedRectangle(cornerRadius: Self.corner, style: .continuous)) }
+        .overlay(RoundedRectangle(cornerRadius: Self.corner, style: .continuous)
             .strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
     }
 
-    /// The cards ("Waiting on you"), then the other sessions.
+    /// The window's corners, and the glow's.
+    static let corner: CGFloat = 16
+
+    /// The cards ("Waiting on you"), then the other sessions under small
+    /// headings: Running, Needs you, Ready for review, Finished, On hold.
     private func content(_ carded: [Row], _ rows: [Row]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let sections: [(title: String, rows: [Row])] = [
+            ("Running", rows.filter { $0.group == .running && !$0.held }),
+            ("Needs you", rows.filter { $0.group == .yourTurn && !$0.held }),
+            ("Ready for review", rows.filter { $0.group == .review && !$0.held }),
+            ("Finished", rows.filter { ($0.group == .justFinished || $0.group == .done) && !$0.held }),
+            ("On hold", rows.filter(\.held)),
+        ].filter { !$0.rows.isEmpty }
+        return VStack(alignment: .leading, spacing: 0) {
             if !carded.isEmpty {
-                sectionTitle("Waiting on you")
+                sectionHeader("Waiting on you", count: carded.count)
                 ForEach(carded) { row in
                     if let card = row.card {
                         AnswerCard(row: row, card: card, now: model.now, open: open,
@@ -3055,26 +3124,36 @@ struct FloatingView: View {
                                    note: answers.notes[row.id])
                     }
                 }
-                if rows.contains(where: { !$0.held }) { sectionTitle("Sessions") }
             }
             // With cards, the band sits behind the rows only: the cards have their own fill.
-            let active = rows.filter { !$0.held }
-            let held = rows.filter(\.held)
-            if !active.isEmpty { rowStack(active).background { if !carded.isEmpty { scrim } } }
-            if !held.isEmpty {
-                sectionTitle("On hold")
-                rowStack(held).background { if !carded.isEmpty { scrim } }
+            ForEach(sections, id: \.title) { section in
+                sectionHeader(section.title, count: section.rows.count)
+                rowStack(section.rows).background { if !carded.isEmpty { scrim } }
             }
         }
+        .padding(.bottom, 4)
     }
 
-    private func sectionTitle(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(palette.time)
-            .padding(.leading, 12)
-            .padding(.bottom, 4)
-            .accessibilityAddTraits(.isHeader)
+    /// A small capitals heading, its count, and a hairline to the edge.
+    private func sectionHeader(_ text: String, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(text.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(palette.time)
+            Text("\(count)")
+                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                .foregroundStyle(palette.time)
+            Rectangle()
+                .fill(Color.primary.opacity(contrast ? 0.35 : 0.09))
+                .frame(height: 1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 3)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(text), \(count)")
+        .accessibilityAddTraits(.isHeader)
     }
 
     private func toggleResponse(_ id: String) {
@@ -3082,20 +3161,20 @@ struct FloatingView: View {
     }
 
     private func rowStack(_ rows: [Row]) -> some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 2) {
             ForEach(rows) { row in
                 CompactRow(row: row, now: model.now, open: open, responseShown: openResponse == row.id,
                            toggleResponse: row.group == .running ? nil : { toggleResponse(row.id) })
             }
         }
         .padding(.horizontal, 4)
-        .padding(.bottom, 6)
+        .padding(.bottom, 2)
     }
 
     /// A soft band behind the text while a running glow moves under it. Outside
     /// the scroll view, so its blurred edge is never cut off.
     @ViewBuilder private var scrim: some View {
-        if status.mode == .running && !contrast {
+        if status.mode == .running && !contrast && glowStyle != GlowStyle.calm.rawValue {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .fill(scheme == .dark ? Color.black.opacity(0.2) : Color.white.opacity(0.4))
                 .padding(.horizontal, 18)
@@ -3187,6 +3266,9 @@ struct FloatingView: View {
                 .disabled(layout.height == nil && layout.width == FloatingLayout.defaultWidth)
             Divider()
             Toggle("Answer from Cards (uses Accessibility)", isOn: $answerFromCards)
+            Picker("Tag Style", selection: $tagStyle) {
+                ForEach(TagStyle.allCases) { Text($0.title).tag($0.rawValue) }
+            }
         }
     }
 
@@ -3201,8 +3283,27 @@ struct FloatingView: View {
         let compact = fit != .full
         let iconGotIt = fit == .compactIcon || (fit == .minimal && !kinds.isEmpty)
         let title = all.isEmpty || ((fit == .full || fit == .compact) && status.mode == .done)
+        // Everything finished, still green: one green chip that is also Got it.
+        let doneChip = showGotIt && status.mode == .done && (fit == .full || fit == .compact)
         return HStack(spacing: 5) {
-            if title {
+            if doneChip {
+                Button(action: acknowledge) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark").font(.system(size: 8, weight: .heavy))
+                        Text("All finished")
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(palette.done)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2.5)
+                    .background(Capsule().fill(palette.done.opacity(0.16)))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .pointerStyle(.link)
+                .help("Got it: stop the green, you've seen that everything finished")
+                .accessibilityLabel("All finished. Got it")
+            } else if title {
                 Text(status.mode == .done ? "All finished" : "All caught up")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(status.mode == .done ? Color.primary : palette.time)
@@ -3211,7 +3312,7 @@ struct FloatingView: View {
             ForEach(kinds, id: \.self) { kind in
                 countChip(kind, list.count(kind), selected: active == kind, compact: compact)
             }
-            if showGotIt {
+            if showGotIt && !doneChip {
                 Button(action: acknowledge) {
                     if iconGotIt {
                         Image(systemName: "checkmark")
@@ -3254,21 +3355,22 @@ struct FloatingView: View {
         return Button {
             filter = selected ? nil : kind
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 if compact {
                     chipMark(kind)
                     Text("\(n)")
                 } else {
+                    Circle().fill(tint).frame(width: 6, height: 6)
                     Text(chipTitle(kind, n))
                 }
                 if selected { Image(systemName: "xmark").font(.system(size: 7, weight: .bold)) }
             }
             .font(.system(size: 11, weight: .semibold).monospacedDigit())
             .foregroundStyle(selected ? tint : Color.primary)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2)
-            .background(Capsule().fill(selected ? tint.opacity(0.2) : Color.clear))
-            .overlay(Capsule().strokeBorder(selected ? tint.opacity(0.7) : Color.primary.opacity(contrast ? 0.6 : 0.18)))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2.5)
+            .background(Capsule().fill(selected ? tint.opacity(0.2) : Color.primary.opacity(0.1)))
+            .overlay(Capsule().strokeBorder(selected ? tint.opacity(0.7) : Color.primary.opacity(contrast ? 0.6 : 0)))
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
@@ -3341,7 +3443,7 @@ struct FloatingView: View {
 
     /// Picks how the window glows while a session runs, and in what colour.
     private var glowMenu: some View {
-        let style = GlowStyle(rawValue: glowStyle) ?? .aurora
+        let style = GlowStyle(rawValue: glowStyle) ?? .calm
         return Menu {
             Picker("Glow while a session runs", selection: $glowStyle) {
                 ForEach(GlowStyle.allCases) { Text($0.title).tag($0.rawValue) }
@@ -3377,13 +3479,14 @@ struct FloatingView: View {
 /// comes in from its edges, with no border line. Picked from the sparkle menu
 /// in the window's header.
 enum GlowStyle: String, CaseIterable, Identifiable {
-    case aurora, ember, corners, tide, rise, heartbeat, random, none
+    case calm, aurora, ember, corners, tide, rise, heartbeat, random, none
     static let key = "runningGlow"
     /// The effects themselves, the ones Random picks from.
     static let effects: [GlowStyle] = [.aurora, .ember, .corners, .tide, .rise, .heartbeat]
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .calm: return "Calm rim"
         case .aurora: return "Aurora drift"
         case .ember: return "Ember breath"
         case .corners: return "Corner bloom"
@@ -3395,7 +3498,7 @@ enum GlowStyle: String, CaseIterable, Identifiable {
         }
     }
     static var saved: GlowStyle {
-        UserDefaults.standard.string(forKey: key).flatMap(GlowStyle.init(rawValue:)) ?? .aurora
+        UserDefaults.standard.string(forKey: key).flatMap(GlowStyle.init(rawValue:)) ?? .calm
     }
 }
 
@@ -3629,21 +3732,32 @@ final class RunningGlowView: NSView {
         let holder = CALayer()
         holder.frame = b
         holder.opacity = 0
-        let edge = imageLayer(insetGlowImage(color: green, blur: 26, spread: 3, scale: scale))
-        edge.frame = b
         let wash = CAGradientLayer()
-        wash.colors = washColors(green)
-        wash.locations = [0, 0.3, 0.5, 0.7, 1]
-        layoutWash(wash, in: b)
-        wash.opacity = calm ? 0 : 0.5
-        holder.addSublayer(edge)
-        holder.addSublayer(wash)
+        if chosen == .calm {
+            // Calm rim: the ring lights up green, nothing sweeps behind the text.
+            let ring = CALayer()
+            ring.frame = b
+            ring.borderWidth = 2
+            ring.borderColor = green.cgColor
+            ring.cornerRadius = cornerRadius
+            ring.cornerCurve = .continuous
+            holder.addSublayer(ring)
+        } else {
+            let edge = imageLayer(insetGlowImage(color: green, blur: 26, spread: 3, scale: scale))
+            edge.frame = b
+            wash.colors = washColors(green)
+            wash.locations = [0, 0.3, 0.5, 0.7, 1]
+            layoutWash(wash, in: b)
+            wash.opacity = calm ? 0 : 0.5
+            holder.addSublayer(edge)
+            holder.addSublayer(wash)
+        }
         flashClip.addSublayer(holder)
         let fade = keyframes("opacity", values: [0, 1, 1, 0], times: [0, 0.12, 0.5, 1], duration: 2.2)
         fade.repeatCount = 1
         CATransaction.setCompletionBlock { [weak holder] in holder?.removeFromSuperlayer() }
         holder.add(fade, forKey: "flash")
-        if !calm {
+        if !calm && chosen != .calm {
             let sweep = loop("position.x", from: b.minX - 0.54 * b.width, to: b.minX + 1.54 * b.width,
                              duration: 1.4, autoreverses: false)
             sweep.repeatCount = 1
@@ -3736,6 +3850,10 @@ final class RunningGlowView: NSView {
         builtScale = scale
         switch (mode, highContrast) {
         case (.off, _): effect = Effect()
+        case (_, false) where chosen == .calm:
+            // Calm rim: every state as a thin ring and a top edge, in its colour.
+            let color = mode == .running ? tint.color : mode == .needsYou ? needsYouColor : GlowColor.green.color
+            effect = buildCalm(deepen(color), breathe: mode == .needsYou ? 1.6 : mode == .running ? 2.4 : 3)
         case (.running, false): effect = build(showing)
         case (.needsYou, false): effect = buildNeedsYou()
         case (.done, false): effect = buildDone()
@@ -3748,6 +3866,41 @@ final class RunningGlowView: NSView {
         if mode != .off { effect.start(bounds, still) }
         CATransaction.commit()
         updateShuffle()
+    }
+
+    /// Calm rim: a thin ring just inside the edge and a 2 pt band along the
+    /// top, with a faint inner glow, breathing slowly; nothing behind the text,
+    /// which stays on a solid background.
+    private func buildCalm(_ color: NSColor, breathe: CFTimeInterval) -> Effect {
+        let holder = CALayer()
+        let soft = imageLayer(insetGlowImage(color: color, blur: 10, spread: 1, scale: builtScale))
+        soft.opacity = 0.5
+        let ring = CALayer()
+        ring.borderWidth = 1.5
+        ring.borderColor = color.cgColor
+        ring.cornerRadius = cornerRadius
+        ring.cornerCurve = .continuous
+        let band = CALayer()
+        band.backgroundColor = color.cgColor
+        holder.addSublayer(soft)
+        holder.addSublayer(ring)
+        holder.addSublayer(band)
+        clip.addSublayer(holder)
+        var effect = Effect()
+        effect.layout = { b in
+            holder.frame = b
+            let local = CGRect(origin: .zero, size: b.size)
+            soft.frame = local
+            ring.frame = local
+            band.frame = CGRect(x: 0, y: b.height - 2, width: b.width, height: 2)   // the top edge
+        }
+        effect.start = { _, still in
+            holder.opacity = 1
+            guard !still else { return }
+            holder.add(loop("opacity", from: 0.55, to: 1.0, duration: breathe), forKey: "glow")
+        }
+        effect.probe = holder
+        return effect
     }
 
     /// Increase Contrast: a steady ring just inside the edge (and, for "all
@@ -3961,7 +4114,7 @@ final class RunningGlowView: NSView {
             }
             effect.probe = heat
 
-        case .random, .none:
+        case .calm, .random, .none:
             break
         }
         return effect
@@ -4478,7 +4631,7 @@ final class FloatingController {
             self.updateGlow()
             guard !self.resizing else { return }
             // The pill: rounder glow, and no resizing.
-            self.glow.cornerRadius = self.layout.mini ? 16 : 12
+            self.glow.cornerRadius = FloatingView.corner
             self.edges?.isHidden = self.layout.mini
             let size = host.fittingSize
             guard panel.frame.size != size else { return }
@@ -5448,8 +5601,9 @@ func sampleRows(now: Date) -> [Row] {
             tags: [SessionTags.awaitingReview]),
         Row(id: "local_s8", group: .done, title: "Chrome tabs cleanup",
             detail: "Closed 5 tabs for merged PRs; one PR still open", context: "Scratch",
-            since: minutesAgo(215), link: "local_s8",
-            card: TurnCard(reply: "Closed five tabs for merged PRs. One PR is still open, so its tab stays.")),
+            since: minutesAgo(40), link: "local_s8",
+            card: TurnCard(reply: "Closed five tabs for merged PRs. One PR is still open, so its tab stays."),
+            tags: ["Needs revisiting"]),
         Row(id: "local_s9", group: .done, title: "Draft the release notes for 4.2",
             detail: "Notes drafted; screenshots still needed", context: "web-app",
             since: minutesAgo(1500), link: "local_s9"),
