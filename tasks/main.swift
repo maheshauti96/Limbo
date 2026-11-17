@@ -742,6 +742,11 @@ struct Row: Identifiable, Equatable {
     var lastOutput: Date? = nil // when a running session last wrote anything
     var card: TurnCard? = nil   // how its latest turn ended: question, buttons, reply
     var seen: Date? = nil       // when it last came into view in the Claude app
+    var tags: [String] = []     // your tags on it, kept by Limbo (SessionTags)
+
+    /// Tagged On hold: listed apart, not counted, no glow. A running session
+    /// still shows as running, and goes on hold when it stops.
+    var held: Bool { group != .running && tags.contains(SessionTags.onHold) }
 
     /// How long a running session has written nothing, once that passes
     /// `quietAfter`: possibly stuck, or in one long command.
@@ -907,10 +912,15 @@ struct Board {
     var review: [Row] = []
     var done: [Row] = []
     var terminal: [Row] = []
+    var onHold: [Row] = []
 
     init(rows: [Row], now: Date) {
         for r in rows {
             let age = now.timeIntervalSince(r.since)
+            if r.held {
+                if age <= Board.window { onHold.append(r) }
+                continue
+            }
             switch r.group {
             case .running: running.append(r)
             case .justFinished: justFinished.append(r)
@@ -926,8 +936,82 @@ struct Board {
 
     var isEmpty: Bool {
         yourTurn.isEmpty && older.isEmpty && running.isEmpty && justFinished.isEmpty
-            && review.isEmpty && done.isEmpty && terminal.isEmpty
+            && review.isEmpty && done.isEmpty && terminal.isEmpty && onHold.isEmpty
     }
+}
+
+/// Your tags on sessions ("On hold", "Awaiting manual review", your own),
+/// kept in Limbo's settings by session id. Claude's files are never touched,
+/// so the tags show only in Limbo.
+struct SessionTags: Equatable {
+    static let key = "sessionTags"
+    static let onHold = "On hold"
+    static let awaitingReview = "Awaiting manual review"
+    static let presets = [onHold, awaitingReview]
+    static let maxLength = 30
+
+    var byId: [String: [String]] = [:]
+
+    static func load(_ defaults: UserDefaults = .standard) -> SessionTags {
+        SessionTags(byId: defaults.dictionary(forKey: key) as? [String: [String]] ?? [:])
+    }
+
+    func save(_ defaults: UserDefaults = .standard) {
+        defaults.set(byId, forKey: Self.key)
+    }
+
+    /// The presets, then your own tags in use, A to Z: on the sessions in
+    /// `ids` when given (the ones Limbo lists), so old tags leave the menu.
+    func known(among ids: Set<String>? = nil) -> [String] {
+        let tagged = ids.map { ids in byId.filter { ids.contains($0.key) } } ?? byId
+        let custom = Set(tagged.values.joined()).subtracting(Self.presets)
+        return Self.presets + custom.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    /// Drops the tags of these sessions (archived in the Claude app); true if any went.
+    mutating func forget(_ ids: Set<String>) -> Bool {
+        let before = byId.count
+        for id in ids { byId[id] = nil }
+        return byId.count != before
+    }
+
+    /// A tag name as typed, tidied: spaces collapsed, at most 30 characters,
+    /// and the spelling of a tag you already have when only the case differs.
+    func clean(_ name: String) -> String? {
+        var t = name.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        if t.count > Self.maxLength { t = String(t.prefix(Self.maxLength)).trimmingCharacters(in: .whitespaces) }
+        guard !t.isEmpty else { return nil }
+        return known().first { $0.caseInsensitiveCompare(t) == .orderedSame } ?? t
+    }
+
+    mutating func toggle(_ tag: String, on id: String) {
+        var list = byId[id] ?? []
+        if let i = list.firstIndex(of: tag) { list.remove(at: i) } else { list.append(tag) }
+        byId[id] = list.isEmpty ? nil : list
+    }
+
+    mutating func add(_ tag: String, to id: String) {
+        guard !(byId[id] ?? []).contains(tag) else { return }
+        byId[id, default: []].append(tag)
+    }
+
+    mutating func clear(_ id: String) { byId[id] = nil }
+
+    /// The rows with your tags on them; a row's own tags (sample data) stay
+    /// when you have none on it.
+    func apply(to rows: [Row]) -> [Row] {
+        guard !byId.isEmpty else { return rows }
+        return rows.map { row in
+            guard let tags = byId[row.id] else { return row }
+            var tagged = row
+            tagged.tags = tags
+            return tagged
+        }
+    }
+
+    /// Only sessions from the Claude app can be tagged: a terminal session
+    /// has no lasting id.
+    static func taggable(_ row: Row) -> Bool { row.link.map(isSessionId) ?? false }
 }
 
 // MARK: - Engine
@@ -937,6 +1021,8 @@ final class SessionEngine {
     let queue = DispatchQueue(label: "com.maheshauti.limbo-tasks.data", qos: .utility)
     /// Called on the main queue, only when the rows changed.
     var onRows: (([Row]) -> Void)?
+    /// Called on the main queue with the sessions archived in the Claude app, whose tags go.
+    var onArchived: ((Set<String>) -> Void)?
 
     private struct DeskEntry {
         let stamp: FileStamp
@@ -1177,7 +1263,11 @@ final class SessionEngine {
                             cards: currentCards(), background: backgroundWork())
         guard rows != lastRows else { return }
         lastRows = rows
-        DispatchQueue.main.async { [weak self] in self?.onRows?(rows) }
+        let archived = Set(desk.values.compactMap { $0.record?.isArchived == true ? $0.record?.sessionId : nil })
+        DispatchQueue.main.async { [weak self] in
+            self?.onRows?(rows)
+            self?.onArchived?(archived)
+        }
     }
 
     private func startStream() {
@@ -1237,6 +1327,55 @@ final class SessionEngine {
 
 final class SessionModel: ObservableObject {
     @Published var rows: [Row] = []
+    /// The rows as the engine made them, before your tags.
+    private var sourceRows: [Row] = []
+    private(set) var tags = SessionTags.load()
+    /// After a tag changes: counts, glow and the window's size follow.
+    var onTagsChanged: (() -> Void)?
+    /// New Tag…: asks for the name.
+    var onNewTag: ((Row) -> Void)?
+
+    /// Sets the rows, with your tags on them.
+    func setRows(_ rows: [Row]) {
+        sourceRows = rows
+        self.rows = tags.apply(to: rows)
+    }
+
+    func toggleTag(_ tag: String, on row: Row) {
+        tags.toggle(tag, on: row.id)
+        tagsChanged()
+    }
+
+    func addTag(named name: String, to row: Row) {
+        guard let tag = tags.clean(name) else { return }
+        tags.add(tag, to: row.id)
+        tagsChanged()
+    }
+
+    func clearTags(on row: Row) {
+        tags.clear(row.id)
+        tagsChanged()
+    }
+
+    /// A session archived in the Claude app loses its tags.
+    func forgetArchived(_ ids: Set<String>) {
+        guard tags.forget(ids) else { return }
+        tagsChanged()
+    }
+
+    private func tagsChanged() {
+        tags.save()
+        rows = tags.apply(to: sourceRows)
+        onTagsChanged?()
+    }
+
+    /// What a row's right-click menu offers.
+    var tagActions: TagActions {
+        TagActions(enabled: true, known: tags.known(among: Set(sourceRows.map(\.id))),
+                   toggle: { [weak self] row, tag in self?.toggleTag(tag, on: row) },
+                   newTag: { [weak self] row in self?.onNewTag?(row) },
+                   clear: { [weak self] row in self?.clearTags(on: row) })
+    }
     /// Drives the "3 min ago" labels. Ticks only while a panel is showing.
     @Published var now = Date()
     /// True while the keep-on-top window is showing.
@@ -1741,12 +1880,105 @@ func compactAge(since d: Date, now: Date) -> String {
     return "\(s / 86400)d"
 }
 
+/// A row's right-click menu: your tags, New Tag… and Remove Tags.
+struct TagActions {
+    var enabled = false
+    var known: [String] = []
+    var toggle: (Row, String) -> Void = { _, _ in }
+    var newTag: (Row) -> Void = { _ in }
+    var clear: (Row) -> Void = { _ in }
+}
+
+private struct TagActionsKey: EnvironmentKey { static let defaultValue = TagActions() }
+extension EnvironmentValues {
+    var tagActions: TagActions {
+        get { self[TagActionsKey.self] }
+        set { self[TagActionsKey.self] = newValue }
+    }
+}
+
+extension View {
+    /// Right-click to tag the session (Claude app sessions only).
+    func tagMenu(_ row: Row) -> some View { modifier(TagMenu(row: row)) }
+}
+
+struct TagMenu: ViewModifier {
+    let row: Row
+    @Environment(\.tagActions) private var actions
+
+    func body(content: Content) -> some View {
+        if actions.enabled && SessionTags.taggable(row) {
+            content.contextMenu {
+                Section("Tags") {
+                    ForEach(actions.known, id: \.self) { tag in
+                        Toggle(tag, isOn: Binding(get: { row.tags.contains(tag) },
+                                                  set: { _ in actions.toggle(row, tag) }))
+                    }
+                }
+                Divider()
+                Button("New Tag…") { actions.newTag(row) }
+                if !row.tags.isEmpty { Button("Remove Tags") { actions.clear(row) } }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+/// A tag as a small label beside a session's title.
+struct TagPill: View {
+    let tag: String
+    @Environment(\.highContrast) private var contrast
+
+    var body: some View {
+        let color = Self.color(tag)
+        Text(tag)
+            .font(.system(size: 9.5, weight: .semibold))
+            .lineLimit(1)
+            .foregroundStyle(color)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(color.opacity(contrast ? 0.26 : 0.16)))
+            .fixedSize()
+    }
+
+    /// Grey for On hold, purple for Awaiting manual review, and one of a few
+    /// colours kept clear of the states' amber, blue and green for your own.
+    static func color(_ tag: String) -> Color {
+        if tag == SessionTags.onHold { return .secondary }
+        if tag == SessionTags.awaitingReview { return Color(nsColor: .systemPurple) }
+        let palette: [NSColor] = [.systemTeal, .systemPink, .systemIndigo, .systemBrown, .systemPurple]
+        let index = tag.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xffff } % palette.count
+        return Color(nsColor: palette[index])
+    }
+}
+
+/// Up to two tags, then "+1" for the rest.
+struct TagPills: View {
+    let tags: [String]
+
+    var body: some View {
+        if !tags.isEmpty {
+            HStack(spacing: 3) {
+                ForEach(tags.prefix(2), id: \.self) { TagPill(tag: $0) }
+                if tags.count > 2 {
+                    Text("+\(tags.count - 2)").font(.system(size: 9.5, weight: .semibold)).foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Tags: " + tags.joined(separator: ", "))
+        }
+    }
+}
+
 /// One mark per state, told apart by shape as well as colour: a turning ring
 /// (running), an hourglass (running but quiet), an exclamation (needs you),
 /// an eye (ready for review), a check (finished), a ring (idle terminal).
 struct Indicator: View {
     let group: Group
     var quiet = false
+    var held = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.highContrast) private var forcedContrast
@@ -1755,6 +1987,8 @@ struct Indicator: View {
         let p = Palette(scheme, contrast: forcedContrast || systemContrast == .increased)
         ZStack {
             switch group {
+            case _ where held:
+                Image(systemName: "pause.circle").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             case .yourTurn:
                 Image(systemName: "exclamationmark.circle.fill")
                     .symbolRenderingMode(.palette)
@@ -1845,7 +2079,7 @@ struct SessionRow: View {
     var body: some View {
         Button { if canOpen { open(row) } } label: {
             HStack(alignment: .top, spacing: 10) {
-                Indicator(group: row.group, quiet: quiet != nil).padding(.top, 1)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held).padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title)
@@ -1855,6 +2089,7 @@ struct SessionRow: View {
                         Spacer(minLength: 4)
                         trailing
                     }
+                    TagPills(tags: row.tags)
                     if let line = secondLine {
                         Text(line)
                             .font(.system(size: 12))
@@ -1884,10 +2119,12 @@ struct SessionRow: View {
         .buttonStyle(.plain)
         .pointerStyle(canOpen ? .link : nil)
         .onHover { hovering = $0 }
-        .opacity(dimmed ? 0.72 : 1)
+        .opacity(dimmed || row.held ? 0.72 : 1)
         .help(tooltip)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(row.title), \(stateWord)")
+        .accessibilityLabel("\(row.title), \(row.held ? "on hold" : stateWord)"
+                            + (row.tags.isEmpty ? "" : ", tagged " + row.tags.joined(separator: ", ")))
+        .tagMenu(row)
         .accessibilityValue(secondLine ?? meta)
         .accessibilityHint(canOpen ? "Opens the session in Claude" : "")
     }
@@ -2025,6 +2262,7 @@ struct PanelView: View {
     @AppStorage("showDone") private var showDone = false
     @AppStorage("showTerminal") private var showTerminal = false
     @AppStorage("showOlder") private var showOlder = false
+    @AppStorage("showHeld") private var showHeld = false
     @State private var loginOn = LoginItem.isEnabled
 
     var body: some View {
@@ -2041,6 +2279,7 @@ struct PanelView: View {
             footer
         }
         .frame(width: 380)
+        .environment(\.tagActions, model.tagActions)
     }
 
     private func header(_ b: Board) -> some View {
@@ -2100,6 +2339,12 @@ struct PanelView: View {
                     SectionTitle(title: "Ready for review", count: b.review.count)
                     ForEach(b.review) { SessionRow(row: $0, now: now, open: open) }
                 }
+                if !b.onHold.isEmpty {
+                    DisclosureTitle(title: "On hold", count: b.onHold.count, expanded: $showHeld)
+                    if showHeld || expandAll {
+                        ForEach(b.onHold) { SessionRow(row: $0, now: now, open: open) }
+                    }
+                }
                 if !b.done.isEmpty {
                     DisclosureTitle(title: "Done", count: b.done.count, expanded: $showDone)
                     if showDone || expandAll {
@@ -2147,6 +2392,8 @@ final class PanelController: NSObject, NSPopoverDelegate {
     private let willOpen: () -> Void
     private let pin: (() -> Void)?
     private var popover: NSPopover?
+    /// The app in front when the panel opened (opening it makes Limbo active).
+    private(set) var appBeforeOpening: NSRunningApplication?
 
     private var clock: Timer?
 
@@ -2167,6 +2414,8 @@ final class PanelController: NSObject, NSPopoverDelegate {
         willOpen()
         let p = popover ?? makePopover()
         popover = p
+        let front = NSWorkspace.shared.frontmostApplication
+        appBeforeOpening = front?.processIdentifier == getpid() ? appBeforeOpening : front
         if activate { NSApp.activate() }
         p.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
         p.contentViewController?.view.window?.makeKey()
@@ -2251,6 +2500,7 @@ struct CompactRow: View {
                     .padding(.bottom, 6)
             }
         }
+        .tagMenu(row)
     }
 
     private var line: some View {
@@ -2260,7 +2510,7 @@ struct CompactRow: View {
         let question = row.group == .running ? nil : row.card?.ask
         return Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
-                Indicator(group: row.group, quiet: quiet != nil)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held)
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title).font(.system(size: 12, weight: contrast ? .bold : .medium))
@@ -2281,6 +2531,8 @@ struct CompactRow: View {
                         }
                         if response != nil { Color.clear.frame(width: 18, height: 1) }   // room for the response button
                     }
+                    // Tags on their own line, so a long one never squeezes the title.
+                    TagPills(tags: row.tags).padding(.vertical, 1)
                     if let quiet {
                         Text([quietPhrase(quiet, compact: true), row.activity].compactMap { $0 }.joined(separator: " · "))
                             .font(.system(size: 11)).foregroundStyle(p.quiet).lineLimit(1).truncationMode(.tail)
@@ -2303,6 +2555,7 @@ struct CompactRow: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
+            .opacity(row.held ? 0.72 : 1)
             .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -2445,6 +2698,7 @@ struct AnswerCard: View {
                     ResponseToggle(shown: responseShown, action: toggleResponse).testFrame("response:\(row.id)")
                 }
             }
+            if !row.tags.isEmpty { TagPills(tags: row.tags).padding(.leading, 22) }
             if responseShown, let response = card.response {
                 ResponseDrawer(text: response, open: { open(row) })
             }
@@ -2473,6 +2727,7 @@ struct AnswerCard: View {
             }
         }
         .onHover { if $0 { warm?() } }
+        .tagMenu(row)
         .padding(.horizontal, 6)
         .padding(.bottom, 6)
     }
@@ -2602,6 +2857,8 @@ struct FloatingRows {
     let waiting: [Row]
     let review: [Row]
     let finished: [Row]
+    /// Sessions you put on hold, within the header's time choice; listed last.
+    let onHold: [Row]
     /// Waiting or review sessions older than the header's time choice.
     let hidden: Int
 
@@ -2611,10 +2868,11 @@ struct FloatingRows {
         waiting = allWaiting.filter { now.timeIntervalSince($0.since) <= limit }
         review = board.review.filter { now.timeIntervalSince($0.since) <= limit }
         finished = board.justFinished + board.done.filter { now.timeIntervalSince($0.since) <= finishedWithin }
+        onHold = board.onHold.filter { now.timeIntervalSince($0.since) <= limit }
         hidden = (allWaiting + board.review).filter { now.timeIntervalSince($0.since) > limit }.count
     }
 
-    var all: [Row] { running + waiting + review + finished }
+    var all: [Row] { running + waiting + review + finished + onHold }
 
     func rows(_ filter: RowFilter?) -> [Row] {
         switch filter {
@@ -2704,6 +2962,7 @@ struct FloatingView: View {
             if layout.mini { pill(list) } else { full(list) }
         }
         .environment(\.highContrast, contrast)
+        .environment(\.tagActions, model.tagActions)
         .onAppear {
             if let initialFilter { filter = initialFilter }
             if let initialResponse { openResponse = initialResponse }
@@ -2729,7 +2988,7 @@ struct FloatingView: View {
         let active = list.effective(filter)
         let rows = list.rows(active)
         // Sessions whose latest turn asked you something: cards on top, newest first.
-        let carded = Array(rows.filter { $0.group != .running && $0.card?.ask != nil }
+        let carded = Array(rows.filter { $0.group != .running && !$0.held && $0.card?.ask != nil }
             .sorted { $0.since > $1.since }.prefix(Self.maxCards))
         let cardIds = Set(carded.map(\.id))
         let listRows = rows.filter { !cardIds.contains($0.id) }
@@ -2796,10 +3055,16 @@ struct FloatingView: View {
                                    note: answers.notes[row.id])
                     }
                 }
-                if !rows.isEmpty { sectionTitle("Sessions") }
+                if rows.contains(where: { !$0.held }) { sectionTitle("Sessions") }
             }
             // With cards, the band sits behind the rows only: the cards have their own fill.
-            if !rows.isEmpty { rowStack(rows).background { if !carded.isEmpty { scrim } } }
+            let active = rows.filter { !$0.held }
+            let held = rows.filter(\.held)
+            if !active.isEmpty { rowStack(active).background { if !carded.isEmpty { scrim } } }
+            if !held.isEmpty {
+                sectionTitle("On hold")
+                rowStack(held).background { if !carded.isEmpty { scrim } }
+            }
         }
     }
 
@@ -3973,6 +4238,113 @@ final class KeepOnTopPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// The one place Limbo takes the keyboard: typing a new tag's name. A panel
+/// that takes key without making Limbo the active app, so the app you were in
+/// stays in front and gets the keyboard back when it closes (Return, Esc, or
+/// a click elsewhere).
+final class TagPromptPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+final class TagPrompt: NSObject, NSWindowDelegate {
+    private var panel: TagPromptPanel?
+
+    var isShowing: Bool { panel != nil }
+    /// For --gesture-check.
+    var window: NSWindow? { panel }
+
+    /// Asks for a tag name next to the pointer; `done` gets what was typed.
+    private var closed: (() -> Void)?
+
+    func show(for title: String, done: @escaping (String) -> Void, closed: (() -> Void)? = nil) {
+        close()
+        self.closed = closed
+        let view = TagPromptView(title: title,
+                                 submit: { [weak self] name in self?.close(); done(name) },
+                                 cancel: { [weak self] in self?.close() })
+        let host = NSHostingView(rootView: view)
+        let size = host.fittingSize
+        host.frame = NSRect(origin: .zero, size: size)
+        let panel = TagPromptPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                   backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)   // above the window
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.contentView = host
+        panel.delegate = self
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        let area = screen?.visibleFrame ?? NSRect(origin: .zero, size: size)
+        let x = min(max(mouse.x - 16, area.minX + 8), area.maxX - size.width - 8)
+        let y = min(max(mouse.y - size.height - 10, area.minY + 8), area.maxY - size.height - 8)
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        panel.makeKeyAndOrderFront(nil)
+        self.panel = panel
+    }
+
+    func close() {
+        guard let panel else { return }
+        self.panel = nil
+        panel.delegate = nil
+        panel.orderOut(nil)
+        let closed = self.closed
+        self.closed = nil
+        closed?()
+    }
+
+    func windowDidResignKey(_ notification: Notification) { close() }
+}
+
+struct TagPromptView: View {
+    let title: String
+    let submit: (String) -> Void
+    let cancel: () -> Void
+    @State private var name = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("New tag for “\(title)”")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            TextField("e.g. Waiting on design", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
+                .focused($focused)
+                .onSubmit(add)
+                .onChange(of: name) { _, typed in
+                    if typed.count > SessionTags.maxLength { name = String(typed.prefix(SessionTags.maxLength)) }
+                }
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+                Button("Add", action: add).keyboardShortcut(.defaultAction)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .controlSize(.small)
+        }
+        .padding(12)
+        .frame(width: 260)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.regularMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+        .onExitCommand(perform: cancel)
+        .onAppear { DispatchQueue.main.async { focused = true } }
+    }
+
+    private func add() {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        submit(trimmed)
+    }
+}
+
 /// The keep-on-top window: above other windows, full-screen videos and games
 /// included, on every Space, without taking focus. Its position is remembered,
 /// and so is whether it was showing, across launches.
@@ -4029,7 +4401,8 @@ final class FloatingController {
     func updateGlow() {
         glow.configure(style: .saved, color: .saved)
         let board = Board(rows: model.rows, now: model.now)
-        let running = board.running.count
+        // A running session you put on hold starts no glow, and its end no green.
+        let running = board.running.filter { !$0.tags.contains(SessionTags.onHold) }.count
         let decision = glowDecision(pinned: model.pinned, running: running, wasRunning: wasRunning,
                                     finished: finished, needsYou: !model.freshNeedsYou(board).isEmpty,
                                     previewing: previewing, needsYouOn: GlowSignal.needsYou,
@@ -4809,6 +5182,8 @@ final class ClaudeAnswerer {
 
 
 
+
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -4828,6 +5203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var markRect: NSRect?
     private var screensAsleep = false
     private var snapshotSignal: DispatchSourceSignal?
+    private let tagPrompt = TagPrompt()
 
     func applicationWillTerminate(_ note: Notification) {
         floating?.shutdownAnswerer()
@@ -4855,6 +5231,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         snapshotSignal = signalSource
         floating = FloatingController(model: model)
         model.onOpened = { [weak self] in self?.floating.sessionOpened() }
+        model.onTagsChanged = { [weak self] in
+            self?.updateStatusItem()
+            self?.floating.fitToContent()
+        }
+        model.onNewTag = { [weak self] row in
+            guard let self else { return }
+            // From the menu bar panel Limbo is the active app: after the box,
+            // the app you were in before the panel gets the keyboard back.
+            let fromPanel = NSApp.isActive
+            let before = self.panel.appBeforeOpening
+            self.panel.close()
+            self.tagPrompt.show(for: row.title, done: { [weak self] name in self?.model.addTag(named: name, to: row) },
+                                closed: {
+                                    guard fromPanel else { return }
+                                    if let before, !before.isTerminated { before.activate() } else { NSApp.deactivate() }
+                                })
+        }
         model.onVisibilityChange = { [weak self] in
             guard let self else { return }
             self.engine.setActivityWanted(self.model.panelOpen || self.model.pinned)
@@ -4864,10 +5257,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         updateStatusItem()
         engine.onRows = { [weak self] rows in
-            self?.model.rows = rows
+            self?.model.setRows(rows)
             self?.updateStatusItem()
             self?.floating.fitToContent()
         }
+        engine.onArchived = { [weak self] ids in self?.model.forgetArchived(ids) }
         if floating.wasShown { floating.show() }
         // Answer from Cards is on but the permission is missing (say, after a reset): ask again.
         if UserDefaults.standard.bool(forKey: ClaudeAnswerer.enabledKey) && !AXIsProcessTrusted() {
@@ -5033,6 +5427,9 @@ func sampleRows(now: Date) -> [Row] {
         Row(id: "local_s3", group: .yourTurn, title: "btw: give me the queries for this",
             ask: "Run the step 3 check and tell me whether it returns recent rows.",
             context: "Go-live readiness", since: minutesAgo(4 * 1440), link: "local_s3"),
+        Row(id: "local_s3b", group: .yourTurn, title: "Rename the billing exports",
+            ask: "Which naming scheme should the new export files use?",
+            context: "billing-service", since: minutesAgo(50), link: "local_s3b", tags: [SessionTags.onHold]),
         Row(id: "local_s4", group: .running, title: "Audit traffic before the old site is shut down",
             context: "Documents", since: minutesAgo(12), link: "local_s4",
             activity: "Scanning the app logs for scope errors"),
@@ -5047,7 +5444,8 @@ func sampleRows(now: Date) -> [Row] {
         Row(id: "local_s7", group: .review, title: "Move dashboards to the new BI tool",
             detail: "Two schema PRs open; will validate after they merge", context: "analytics",
             since: minutesAgo(19 * 60), link: "local_s7",
-            card: TurnCard(reply: "Both schema PRs are open. Once they merge, I'll point the dashboards at the new tables and compare a week of numbers.")),
+            card: TurnCard(reply: "Both schema PRs are open. Once they merge, I'll point the dashboards at the new tables and compare a week of numbers."),
+            tags: [SessionTags.awaitingReview]),
         Row(id: "local_s8", group: .done, title: "Chrome tabs cleanup",
             detail: "Closed 5 tabs for merged PRs; one PR still open", context: "Scratch",
             since: minutesAgo(215), link: "local_s8",
@@ -5075,7 +5473,7 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     staticIndicators = !arguments.contains("--live")
     let model = SessionModel()
     let rows = sample ? sampleRows(now: Date()) : SessionEngine.scanOnce()
-    model.rows = limit.map { Array(rows.prefix($0)) } ?? rows
+    model.setRows(limit.map { Array(rows.prefix($0)) } ?? rows)
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     // The running glow, frozen at --phase seconds (default 1) into its loop.
     let floating = arguments.contains("--floating")
@@ -5187,7 +5585,7 @@ func runDump() {
     let groups: [(String, [Row])] = [
         ("your-turn", board.yourTurn), ("your-turn-older", board.older), ("running", board.running),
         ("just-finished", board.justFinished), ("review", board.review), ("done", board.done),
-        ("terminal", board.terminal),
+        ("terminal", board.terminal), ("on-hold", board.onHold),
     ]
     for (name, rows) in groups {
         for r in rows {
@@ -5204,7 +5602,7 @@ func runPanelBench(cycles: Int, reuse: Bool, real: Bool, hold: Double) {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     let model = SessionModel()
-    model.rows = real ? SessionEngine.scanOnce() : sampleRows(now: Date())
+    model.setRows(real ? SessionEngine.scanOnce() : sampleRows(now: Date()))
     let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 32, height: 32),
                           styleMask: [.borderless], backing: .buffered, defer: false)
     window.isReleasedWhenClosed = false
@@ -5296,6 +5694,37 @@ func runSelfTest() {
     model.now = now.addingTimeInterval(120)
     check("asks again after being opened: fresh again",
           model.freshNeedsYou(Board(rows: [askedAgain], now: model.now)).map(\.id) == ["a"])
+    // Tags: kept by Limbo; On hold takes a session out of the counts.
+    var tagSet = SessionTags()
+    check("the presets are offered first", tagSet.known() == SessionTags.presets)
+    check("a typed tag is tidied", tagSet.clean("  waiting   on  design ") == "waiting on design")
+    check("a tag that differs only in case is the same tag", tagSet.clean("on HOLD") == SessionTags.onHold)
+    check("an empty tag is nothing", tagSet.clean("   ") == nil)
+    check("a long tag is cut to 30 characters", tagSet.clean(String(repeating: "x", count: 50))?.count == 30)
+    tagSet.toggle(SessionTags.onHold, on: "local_t1")
+    tagSet.add("Waiting on design", to: "local_t2")
+    check("your own tags are offered after the presets", tagSet.known() == SessionTags.presets + ["Waiting on design"])
+    check("only tags on sessions Limbo lists are offered", tagSet.known(among: ["local_t1"]) == SessionTags.presets)
+    let heldRow = Row(id: "local_t1", group: .yourTurn, title: "t1", context: "", since: now.addingTimeInterval(-300),
+                      link: "local_t1")
+    let labelled = Row(id: "local_t2", group: .review, title: "t2", context: "", since: now.addingTimeInterval(-300),
+                       link: "local_t2")
+    let runningHeld = Row(id: "local_t3", group: .running, title: "t3", context: "", since: now.addingTimeInterval(-60),
+                          link: "local_t3", tags: [SessionTags.onHold])
+    let tagged = tagSet.apply(to: [heldRow, labelled, runningHeld])
+    let tagBoard = Board(rows: tagged, now: now)
+    check("on hold leaves Your turn for On hold", tagBoard.yourTurn.isEmpty && tagBoard.onHold.map(\.id) == ["local_t1"])
+    check("another tag only labels the session",
+          tagBoard.review.map(\.id) == ["local_t2"] && tagged[1].tags == ["Waiting on design"])
+    check("a running session on hold still shows as running", tagBoard.running.map(\.id) == ["local_t3"])
+    check("on hold: no amber glow", model.freshNeedsYou(tagBoard).isEmpty)
+    tagSet.toggle(SessionTags.onHold, on: "local_t1")
+    check("choosing it again removes it", tagSet.byId["local_t1"] == nil)
+    check("archiving a session in Claude drops its tags",
+          tagSet.forget(["local_t2", "local_x"]) && tagSet.byId.isEmpty && !tagSet.forget(["local_t2"]))
+    check("a terminal session can't be tagged",
+          !SessionTags.taggable(Row(id: "pid:9", group: .terminal, title: "t", context: "", since: now, terminal: true)))
+
     var seenInClaude = askedAgain
     seenInClaude.seen = now.addingTimeInterval(90)
     check("opened in Claude since it asked: no longer fresh",
@@ -5507,7 +5936,7 @@ func runGlowCycle(seconds: Int) {
 func runResizeCheck() {
     _ = NSApplication.shared
     let model = SessionModel()
-    model.rows = sampleRows(now: Date())
+    model.setRows(sampleRows(now: Date()))
     let layout = FloatingLayout()
     let host = FirstClickHostingView(rootView: FloatingView(model: model, open: { _ in }, unpin: {},
                                                             glow: RunningGlowView(frame: .zero), layout: layout))
@@ -5599,7 +6028,7 @@ func runGestureCheck() {
     _ = NSApplication.shared
     recordTestFrames = true
     let model = SessionModel()
-    model.rows = sampleRows(now: Date())
+    model.setRows(sampleRows(now: Date()))
     let layout = FloatingLayout()
     let glow = RunningGlowView(frame: .zero)
     var unpinned = false
@@ -5706,6 +6135,42 @@ func runGestureCheck() {
     } else {
         check("the response button shows the reply without opening the session", false, "(button not found)")
     }
+    // New Tag…: the box takes the keyboard without making Limbo the active app,
+    // and Return adds what was typed; Esc adds nothing.
+    let prompt = TagPrompt()
+    var typedTag: String?
+    let activeBefore = NSApp.isActive
+    let frontBefore = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    prompt.show(for: "Rename the billing exports") { typedTag = $0 }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    let editor = prompt.window?.firstResponder as? NSTextView
+    check("the new-tag box takes the keyboard", prompt.window?.isKeyWindow == true && editor != nil)
+    // While the box has the keyboard AppKit counts Limbo as active, but the
+    // app in front stays the one you were in, and gets the keyboard back after.
+    let frontAfter = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    check("without bringing Limbo to the front", frontAfter == frontBefore && frontAfter != getpid(),
+          "(in front \(frontBefore ?? 0) -> \(frontAfter ?? 0), me \(getpid()))")
+    editor?.insertText("Waiting on design", replacementRange: NSRange(location: NSNotFound, length: 0))
+    RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+    editor?.insertNewline(nil)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    check("Return adds the typed tag, closes the box and lets go of the keyboard",
+          typedTag == "Waiting on design" && !prompt.isShowing && NSApp.isActive == activeBefore,
+          "(got \(typedTag ?? "nothing"), active \(NSApp.isActive))")
+    typedTag = nil
+    prompt.show(for: "Rename the billing exports") { typedTag = $0 }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    (prompt.window?.firstResponder as? NSTextView)?.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
+    if let window = prompt.window,
+       let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                     timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                     context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+                                     isARepeat: false, keyCode: 53) {
+        window.sendEvent(escape)
+    }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    check("Esc closes it without adding", typedTag == nil && !prompt.isShowing)
+    prompt.close()
     // A single click on the close button still works.
     click(at: NSPoint(x: host.frame.width - 20, y: host.frame.height - 18))
     check("the close button takes a single click", unpinned)
