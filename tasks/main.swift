@@ -3049,8 +3049,8 @@ struct FloatingView: View {
 
     private var window: WaitingWindow { WaitingWindow(rawValue: waitingHours) ?? .day }
     private var contrast: Bool { forceContrast ?? (systemContrast == .increased) }
-    /// A solid background with Reduce Transparency, or with the calm rim.
-    private var solid: Bool { forceSolid ?? (reduceTransparency || glowStyle == GlowStyle.calm.rawValue) }
+    /// A solid background only with Reduce Transparency on.
+    private var solid: Bool { forceSolid ?? reduceTransparency }
     private var palette: Palette { Palette(scheme, contrast: contrast) }
     private var showGotIt: Bool { !status.previewing && (status.mode == .done || status.mode == .needsYou) }
 
@@ -3225,15 +3225,23 @@ struct FloatingView: View {
         }
     }
 
-    /// The window's background: the blurred material, or a solid one with
-    /// Reduce Transparency on.
+    /// The window's background: the system's glass, like other macOS windows
+    /// and alerts (the blurred material before macOS 26), or a solid one with
+    /// Reduce Transparency on. In Dark Mode the glass is darkened, as Control
+    /// Center's panels are, so a bright page behind it never makes it pale.
     @ViewBuilder private func surface<S: Shape>(_ shape: S) -> some View {
         if solid {
             shape.fill(Color(nsColor: .windowBackgroundColor))
+        } else if #available(macOS 26.0, *) {
+            Color.clear.glassEffect(.regular, in: shape)
+                .overlay(shape.fill(Color.black.opacity(Self.glassShade(scheme))))
         } else {
             shape.fill(.regularMaterial)
         }
     }
+
+    /// How much black sits on the glass: most of it in Dark Mode, none in Light.
+    static func glassShade(_ scheme: ColorScheme) -> Double { scheme == .dark ? 0.8 : 0 }
 
     private func header(_ list: FloatingRows, filter active: RowFilter?) -> some View {
         HStack(spacing: 6) {
@@ -6051,6 +6059,10 @@ func runSelfTest() {
     check("so is a link whose text has brackets", links("[safe [nested]](file:///tmp/evil.command)").isEmpty)
     check("a web link stays a link", links("[docs](https://example.com) and <https://example.org>")
             == ["https://example.com", "https://example.org"])
+
+    // The window's glass: dark in Dark Mode, plain in Light Mode.
+    check("Dark Mode darkens the glass", FloatingView.glassShade(.dark) >= 0.5)
+    check("Light Mode leaves the glass plain", FloatingView.glassShade(.light) == 0)
 
     // Answering from a card presses only an exact match.
     check("the same question, ignoring case and spacing",

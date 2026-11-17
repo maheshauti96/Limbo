@@ -125,7 +125,7 @@ Every session from the last 7 days, grouped by what it needs from you (the rules
 The pin in the panel opens a small window with the running sessions, the ones waiting for you or ready for review, and ones finished in the last 2 hours. It stays above other windows, full-screen videos and games included, on every Space, and never takes keyboard focus, so it never interrupts what you type.
 
 - **Sections:** small capital headings with a count and a hairline: Waiting on you, Running, Needs you, Ready for review, Finished, On hold.
-- **Look:** Apple's rounded system font, 16-point corners, a light blue backing behind running sessions, stronger titles for sessions still going, one line per finished session.
+- **Look:** the system's glass background, like other macOS windows and alerts, darkened in Dark Mode the way Control Center's panels are (the blurred material before macOS 26), Apple's rounded system font, 16-point corners, a light blue backing behind running sessions, stronger titles for sessions still going, one line per finished session.
 - **A mark per state,** told apart by shape as well as colour: a turning blue ring (running), an hourglass (running but nothing written for 10 minutes), an exclamation (needs you), an eye (ready for review), a check (finished), a pause mark (on hold). Every time uses one short style: "4m 12s" ticking for running sessions, "6m", "18h", "now" for the rest.
 - **Running sessions** show what they are doing now, like Claude's own status line ("Thinking", the command being run, the file being edited), with a light band sweeping across it. A session between turns that still has background tasks running shows "2 background tasks running" and counts as running.
 - **Questions and summaries** show in full, wrapping onto more lines; a running status stays on one line so the row doesn't jump.
@@ -177,7 +177,7 @@ The window's edge tells you the state from the corner of your eye. The sparkle m
 <tr><td><b>Aurora drift</b> (one of the other effects)<br><img src="docs/images/limbo-tasks/aurora.png" width="332" alt="Aurora drift glow"></td><td><b>Pill</b><br><img src="docs/images/limbo-tasks/pill.png" width="175" alt="The window shrunk to a pill with its counts"></td></tr>
 </table>
 
-- **Calm rim** (default, shown at the top): while a session runs, a thin ring and a top edge in the glow colour breathe slowly, on a solid background with nothing behind the text.
+- **Calm rim** (default, shown at the top): while a session runs, a thin ring and a top edge in the glow colour breathe slowly, with nothing moving behind the text.
 - **Needs you:** while a session that started waiting for you in the last hour has not been opened (from Limbo or in Claude), the rim turns amber. A Got it button stops it without opening anything.
 - **All finished:** when the last running session stops, the rim turns green until a session runs again or you open one. The green "All finished" chip in the header is its Got it.
 - **Other effects:** Aurora drift, Ember breath, Corner bloom, Tide sweep, Rising warmth, Heartbeat, Random (a new one every 5 seconds) or No glow, in red, orange, rose or green. A new choice plays for 4 seconds so you can see it. The amber and green signals each have an on/off switch in the same menu.
