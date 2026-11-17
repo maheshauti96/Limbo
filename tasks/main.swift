@@ -2682,6 +2682,10 @@ struct ResponseDrawer: View {
                 .lineLimit(12)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Only web links open, even if another kind slipped through.
+                .environment(\.openURL, OpenURLAction { url in
+                    Self.isWebLink(url) ? .systemAction : .discarded
+                })
             Button(action: open) {
                 HStack(spacing: 3) {
                     Text("Open in Claude")
@@ -2701,9 +2705,20 @@ struct ResponseDrawer: View {
     }
 
     /// Bold, italics, code and web links; the reply's line breaks are kept.
+    /// The reply is Claude's text, which can carry what a page or file it read
+    /// put there: any link that isn't http or https (file://, an app's own
+    /// scheme) becomes plain text, so a click can't open a local file or app.
     static func markdown(_ s: String) -> AttributedString {
-        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+        var text = (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
             ?? AttributedString(s)
+        for run in text.runs {
+            if let link = run.link, !isWebLink(link) { text[run.range].link = nil }
+        }
+        return text
+    }
+
+    static func isWebLink(_ url: URL) -> Bool {
+        ["http", "https"].contains(url.scheme?.lowercased() ?? "")
     }
 }
 
@@ -6007,6 +6022,16 @@ func runSelfTest() {
     openedDesk.lastFocused = now.addingTimeInterval(-300)
     check("opened only before the turn ended: still ready for review",
           classify(desk: [openedDesk], live: [4242: idleLive], now: now).first?.group == .review)
+
+    // Links in a reply: only web links stay links.
+    func links(_ s: String) -> [String] {
+        ResponseDrawer.markdown(cleanReply([s]) ?? "").runs.compactMap { $0.link?.absoluteString }
+    }
+    check("a reply's angle-bracket file link is plain text", links("see <file:///Applications/Calculator.app>").isEmpty)
+    check("so is an app's own link", links("open <vscode://file/tmp/x>").isEmpty)
+    check("so is a link whose text has brackets", links("[safe [nested]](file:///tmp/evil.command)").isEmpty)
+    check("a web link stays a link", links("[docs](https://example.com) and <https://example.org>")
+            == ["https://example.com", "https://example.org"])
 
     // Answering from a card presses only an exact match.
     check("the same question, ignoring case and spacing",

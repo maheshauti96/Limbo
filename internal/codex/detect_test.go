@@ -81,7 +81,7 @@ func TestDetect_heldLock_busy(t *testing.T) {
 	if err := os.MkdirAll(locks, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	threadID := "01a07c5a-089d-77e2-80a0-777a3429994e"
+	threadID := "01a0c0de-0000-7000-8000-000000000001"
 	lockPath := filepath.Join(locks, threadID+".lock")
 	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -99,16 +99,16 @@ func TestDetect_heldLock_busy(t *testing.T) {
 	if err := os.WriteFile(global, []byte(`{
   "thread-titles": {
     "titles": {
-      "01a07c5a-089d-77e2-80a0-777a3429994e": "CRSR BQ"
+      "01a0c0de-0000-7000-8000-000000000001": "Export check"
     },
-    "order": ["01a07c5a-089d-77e2-80a0-777a3429994e"]
+    "order": ["01a0c0de-0000-7000-8000-000000000001"]
   }
 }`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	index := filepath.Join(dir, "session_index.jsonl")
 	if err := os.WriteFile(index, []byte(
-		`{"id":"01a07c5a-089d-77e2-80a0-777a3429994e","thread_name":"from-index-should-lose","updated_at":"2026-09-07T14:51:14Z"}`+"\n",
+		`{"id":"01a0c0de-0000-7000-8000-000000000001","thread_name":"from-index-should-lose","updated_at":"2026-09-07T14:51:14Z"}`+"\n",
 	), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestDetect_heldLock_busy(t *testing.T) {
 		GlobalState:  global,
 		SessionIndex: index,
 	})
-	want := []obs.Observation{{Tool: Tool, Label: "CRSR BQ", State: "running"}}
+	want := []obs.Observation{{Tool: Tool, Label: "Export check", State: "running"}}
 	if !obsEqual(got, want) {
 		t.Fatalf("got %#v want %#v", got, want)
 	}
@@ -135,7 +135,7 @@ func TestDetect_unheldLock_notBusy(t *testing.T) {
 	if err := os.MkdirAll(locks, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	id := "01a0a9e4-0e98-7223-aa2b-ec0e3f6ff4bd"
+	id := "01a0a9e4-0000-7000-8000-000000000003"
 	if err := os.WriteFile(filepath.Join(locks, id+".lock"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -222,8 +222,8 @@ func TestDetect_unlabeledGuardianLock_skipped(t *testing.T) {
 	if err := os.MkdirAll(locks, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	userID := "01a07c5a-089d-77e2-80a0-777a3429994e"
-	guardID := "01a0a9e9-ce8e-7b03-9d2d-87dcfe5a131a"
+	userID := "01a0c0de-0000-7000-8000-000000000001"
+	guardID := "01a0a9e9-0000-7000-8000-000000000002"
 	for _, id := range []string{userID, guardID} {
 		p := filepath.Join(locks, id+".lock")
 		if err := os.WriteFile(p, nil, 0o644); err != nil {
@@ -234,7 +234,7 @@ func TestDetect_unlabeledGuardianLock_skipped(t *testing.T) {
 	}
 	index := filepath.Join(dir, "session_index.jsonl")
 	if err := os.WriteFile(index, []byte(
-		`{"id":"01a07c5a-089d-77e2-80a0-777a3429994e","thread_name":"CRSR BQ Data Gap Check (4)"}`+"\n",
+		`{"id":"01a0c0de-0000-7000-8000-000000000001","thread_name":"Nightly export check (4)"}`+"\n",
 	), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestDetect_unlabeledGuardianLock_skipped(t *testing.T) {
 		GlobalState:  filepath.Join(dir, "no-global.json"),
 		SessionIndex: index,
 	})
-	want := []obs.Observation{{Tool: Tool, Label: "CRSR BQ Data Gap Check (4)", State: "running"}}
+	want := []obs.Observation{{Tool: Tool, Label: "Nightly export check (4)", State: "running"}}
 	if !obsEqual(got, want) {
 		t.Fatalf("got %#v want %#v", got, want)
 	}

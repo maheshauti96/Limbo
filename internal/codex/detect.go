@@ -157,7 +157,7 @@ func threadLabel(threadID string, titles, indexNames map[string]string) string {
 	// auto-review subagents (thread_source=guardian_review, model
 	// codex-auto-review) hold a flock with no title in thread-titles /
 	// session_index while the parent user thread is Working. Do not emit
-	// short ids — that duplicated CRSR as 01a0a9e9.
+	// short ids — that duplicated the user's thread as 01a0a9e9.
 	return ""
 }
 

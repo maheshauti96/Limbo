@@ -55,7 +55,7 @@ State: map Claude JSON `busy` → emitted `running`; `idle` → `idle`; ignore u
 
 Do **not** treat Claude.app alone as a coding session.
 
-Recency (2026-09-16): hide Claude sessions whose last `type=user` / `message.role=user` event in `~/.claude/projects/<cwd-encoded>/<sessionId>.jsonl` is older than 48h (Brand Mentions last user 2026-09-09 while the process was still idle-open). If ProjectsDir is set and the jsonl is missing → keep (pid live). If jsonl exists and last user >48h → drop.
+Recency (2026-09-16): hide Claude sessions whose last `type=user` / `message.role=user` event in `~/.claude/projects/<cwd-encoded>/<sessionId>.jsonl` is older than 48h (Onboarding copy last user 2026-09-09 while the process was still idle-open). If ProjectsDir is set and the jsonl is missing → keep (pid live). If jsonl exists and last user >48h → drop.
 
 ## Grok-build (`tool`: `grok`)
 
@@ -84,7 +84,7 @@ Running (thread-writer flock):
 - Dir: `~/.codex/thread-writer-locks/`
 - Files: `{thread-id}.lock` (often empty). Skip `.coordination.lock`.
 - Running iff another process holds an exclusive flock (`LOCK_EX|LOCK_NB` fails with `EWOULDBLOCK` / `EAGAIN`).
-- Verified 2026-09-16: `codex` pid 2813 held **two** locks while the UI showed **one** Working thread (`CRSR BQ Data Gap Check (4)` / `01a07c5a-…`). The extra lock `01a0a9e9-…` is a **guardian auto-review subagent** (`state_5.sqlite` `threads.thread_source=guardian_review`, `model=codex-auto-review`, no `name`, title is the review prompt dump). Skip it.
+- Verified 2026-09-16: `codex` pid 2813 held **two** locks while the UI showed **one** Working thread (`Nightly export check (4)` / `01a0c0de-…`). The extra lock `01a0a9e9-…` is a **guardian auto-review subagent** (`state_5.sqlite` `threads.thread_source=guardian_review`, `model=codex-auto-review`, no `name`, title is the review prompt dump). Skip it.
 
 Label (in order):
 1. `thread-titles.titles[thread-id]` from `~/.codex/.codex-global-state.json` (or flat `thread-titles[thread-id]`)

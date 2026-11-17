@@ -183,14 +183,14 @@ func TestDetect_recency48h(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writeSess("old.json", "oldoldoldoldold1", "Brand Mentions", 21)
-	writeSess("new.json", "newnewnewnewnew1", "Taxonomy engine - Latest", 22)
+	writeSess("old.json", "oldoldoldoldold1", "Onboarding copy", 21)
+	writeSess("new.json", "newnewnewnewnew1", "Release notes - Latest", 22)
 	writeJSONL("oldoldoldoldold1", "2026-09-09T22:17:44.444Z")
 	writeJSONL("newnewnewnewnew1", "2026-09-16T16:45:28.198Z")
 
 	alive := func(pid int) bool { return pid == 21 || pid == 22 }
 	got := Detect(DetectOptions{SessionsDir: sessions, ProjectsDir: projects, Alive: alive, Now: now})
-	if len(got) != 1 || got[0].Label != "Taxonomy engine - Latest" {
+	if len(got) != 1 || got[0].Label != "Release notes - Latest" {
 		t.Fatalf("want only recent thread, got %#v", got)
 	}
 }
