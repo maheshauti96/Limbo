@@ -2003,6 +2003,33 @@ struct TagPills: View {
     }
 }
 
+/// Limbo's mark, the Orbit logo without its square: sessions in the three
+/// state colours (running, needs you, finished) around a centre dot, on a
+/// faint orbit. The keep-on-top window's header and pill show it.
+struct LimboMark: View {
+    var size: CGFloat = 16
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.highContrast) private var contrast
+
+    var body: some View {
+        let p = Palette(scheme, contrast: contrast)
+        let r = size * 0.37                 // the orbit's radius
+        let d = size * 0.27                 // a session dot
+        let corner = r * 0.7071             // 135° and 225°: bottom left, top left
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(contrast ? 0.5 : 0.25), lineWidth: max(1, size * 0.085))
+                .frame(width: r * 2, height: r * 2)
+            Circle().fill(p.running).frame(width: d, height: d).offset(x: r)
+            Circle().fill(p.needsYou).frame(width: d, height: d).offset(x: -corner, y: corner)
+            Circle().fill(p.done).frame(width: d, height: d).offset(x: -corner, y: -corner)
+            Circle().fill(Color.primary).frame(width: size * 0.2, height: size * 0.2)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
 /// One mark per state, told apart by shape as well as colour: a turning ring
 /// (running), an hourglass (running but quiet), an exclamation (needs you),
 /// an eye (ready for review), a check (finished), a ring (idle terminal).
@@ -3210,11 +3237,7 @@ struct FloatingView: View {
 
     private func header(_ list: FloatingRows, filter active: RowFilter?) -> some View {
         HStack(spacing: 6) {
-            Image(nsImage: claudeMark)
-                .renderingMode(.template)
-                .resizable()
-                .frame(width: 15, height: 15)
-                .foregroundStyle(.secondary)
+            LimboMark(size: 16)
             // Full chips when they fit, then compact ones (mark and number),
             // then a check for Got it, then only the chosen filter's chip: the
             // header never grows past the window.
@@ -3406,11 +3429,7 @@ struct FloatingView: View {
                 Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(p.done)
                 Text("All finished")
             } else {
-                Image(nsImage: claudeMark)
-                    .renderingMode(.template)
-                    .resizable()
-                    .frame(width: 14, height: 14)
-                    .foregroundStyle(.secondary)
+                LimboMark(size: 15)
                 if running == 0 && waiting == 0 { Text("All caught up").foregroundStyle(p.time) }
                 if running > 0 { Text("\(running) running") }
                 if running > 0 && waiting > 0 { Text("·").foregroundStyle(p.time) }
