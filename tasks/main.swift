@@ -3014,6 +3014,9 @@ struct FloatingView: View {
     var glowChanged: (GlowPreview) -> Void = { _ in }
     /// The Got it button: stops the green or amber without opening anything.
     var acknowledge: () -> Void = {}
+    /// A layout picked, or the full-screen switch flipped: the window checks
+    /// its display and fits the new shape.
+    var layoutChanged: () -> Void = {}
     /// Drawn between the window's material and the rows, so text stays crisp.
     var glow: RunningGlowView?
     @ObservedObject var layout = FloatingLayout()
@@ -3024,6 +3027,8 @@ struct FloatingView: View {
     var forceSolid: Bool? = nil
     var initialFilter: RowFilter? = nil
     var initialResponse: String? = nil
+    /// Snapshots: the session whose hover card shows in the strip, dots or bar.
+    var initialHover: String? = nil
     /// Answering from a card: presses its button in Claude (when the switch is on).
     var answer: ((Row, String) -> Void)? = nil
     var warm: (() -> Void)? = nil
@@ -3031,6 +3036,13 @@ struct FloatingView: View {
     @State private var filter: RowFilter?
     /// The row or card whose latest reply is showing; one at a time.
     @State private var openResponse: String?
+    /// The strip's, the dots' or the bar's session under the pointer: its card shows.
+    @State private var hovered: String?
+    /// Where each chip, mark or bar item sits in its row, and the row's width,
+    /// to hang the hover card under (or over) it.
+    @State private var spots: [String: CGRect] = [:]
+    @State private var rowWidth: CGFloat = 0
+    @AppStorage(KeepOnTopLayout.autoStripKey) private var autoStrip = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -3058,7 +3070,14 @@ struct FloatingView: View {
         let list = FloatingRows(board: Board(rows: model.rows, now: model.now), now: model.now,
                                 within: window.hours * 3600, finishedWithin: Self.doneShownFor)
         SwiftUI.Group {
-            if layout.mini { pill(list) } else { full(list) }
+            switch layout.current {
+            case .list: full(list)
+            case .pill: pill(list)
+            case .strip: strip(list)
+            case .dots: dots(list)
+            case .bar: bar(list)
+            case .columns: columns(list)
+            }
         }
         .fontDesign(.rounded)
         .environment(\.highContrast, contrast)
@@ -3066,11 +3085,17 @@ struct FloatingView: View {
         .onAppear {
             if let initialFilter { filter = initialFilter }
             if let initialResponse { openResponse = initialResponse }
+            if let initialHover { hovered = initialHover }
         }
         .onChange(of: waitingHours) { refit() }
         .onChange(of: layout.width) { refit() }
         .onChange(of: layout.height) { refit() }
-        .onChange(of: layout.mini) { refit() }
+        .onChange(of: layout.current) { hovered = nil; refit() }
+        .onChange(of: layout.chosen) { layoutChanged() }
+        .onChange(of: autoStrip) { refit(); layoutChanged() }
+        .onChange(of: layout.barWidth) { refit() }
+        .onChange(of: layout.columnsWidth) { refit() }
+        .onChange(of: hovered) { refit() }
         .onChange(of: filter) { refit() }
         .onChange(of: showGotIt) { refit() }
         .onChange(of: openResponse) { refit() }
@@ -3183,6 +3208,8 @@ struct FloatingView: View {
                 .font(.system(size: 10, weight: .semibold))
                 .tracking(0.7)
                 .foregroundStyle(palette.time)
+                .lineLimit(1)
+                .layoutPriority(1)   // the hairline gives way first
             Text("\(count)")
                 .font(.system(size: 10, weight: .medium).monospacedDigit())
                 .foregroundStyle(palette.time)
@@ -3243,17 +3270,25 @@ struct FloatingView: View {
     /// How much black sits on the glass: most of it in Dark Mode, none in Light.
     static func glassShade(_ scheme: ColorScheme) -> Double { scheme == .dark ? 0.8 : 0 }
 
-    private func header(_ list: FloatingRows, filter active: RowFilter?) -> some View {
+    /// The window's top line. The columns leave out the counts (each column
+    /// has its own), and a double-click there goes back to the list.
+    private func header(_ list: FloatingRows, filter active: RowFilter?, counts: Bool = true,
+                        doubleClick: KeepOnTopLayout = .pill) -> some View {
         HStack(spacing: 6) {
             LimboMark(size: 16)
             // Full chips when they fit, then compact ones (mark and number),
             // then a check for Got it, then only the chosen filter's chip: the
             // header never grows past the window.
-            ViewThatFits(in: .horizontal) {
-                headerCounts(list, filter: active, fit: .full)
-                headerCounts(list, filter: active, fit: .compact)
-                headerCounts(list, filter: active, fit: .compactIcon)
-                headerCounts(list, filter: active, fit: .minimal)
+            // (In a stack of its own: a priority set inside an `if` is lost.)
+            HStack(spacing: 0) {
+                if counts {
+                    ViewThatFits(in: .horizontal) {
+                        headerCounts(list, filter: active, fit: .full)
+                        headerCounts(list, filter: active, fit: .compact)
+                        headerCounts(list, filter: active, fit: .compactIcon)
+                        headerCounts(list, filter: active, fit: .minimal)
+                    }
+                }
             }
             .layoutPriority(1)
             // The empty middle: double-click it for the pill, or drag the window.
@@ -3261,10 +3296,14 @@ struct FloatingView: View {
             Color.clear
                 .frame(minWidth: 4, maxWidth: .infinity, minHeight: 18, maxHeight: 18)   // never taller
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2) { setMini(true) }
+                .onTapGesture(count: 2) { layout.choose(doubleClick) }
                 .gesture(WindowDragGesture())
-                .help("Double-click to shrink to a pill")
-            glowMenu
+                .testFrame("header-middle")
+                .help(doubleClick == .pill ? "Double-click to shrink to a pill" : "Double-click for the list")
+            HStack(spacing: 2) {   // close together: the counts need the room more
+                layoutMenu
+                glowMenu
+            }
             Menu {
                 Picker("Show sessions waiting for you from", selection: $waitingHours) {
                     ForEach(WaitingWindow.allCases) { Text($0.menuTitle).tag($0.rawValue) }
@@ -3304,7 +3343,7 @@ struct FloatingView: View {
         .contentShape(Rectangle())
         .gesture(WindowDragGesture())   // drag the window by its header
         .contextMenu {
-            Button("Shrink to Pill") { setMini(true) }
+            Button("Shrink to Pill") { layout.choose(.pill) }
             Divider()
             Button("Fit to Content") { layout.height = nil; layout.save() }
                 .disabled(layout.height == nil)
@@ -3413,7 +3452,7 @@ struct FloatingView: View {
             }
             .font(.system(size: 11, weight: .semibold).monospacedDigit())
             .foregroundStyle(selected ? tint : Color.primary)
-            .padding(.horizontal, 8)
+            .padding(.horizontal, compact ? 6 : 8)
             .padding(.vertical, 2)
             .background(Capsule().fill(selected ? tint.opacity(0.2) : Color.primary.opacity(0.1)))
             .overlay(Capsule().strokeBorder(selected ? tint.opacity(0.7) : Color.primary.opacity(contrast ? 0.6 : 0)))
@@ -3455,10 +3494,14 @@ struct FloatingView: View {
         .background { surface(Capsule()) }
         .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
         .contentShape(Capsule())
-        .onTapGesture(count: 2) { setMini(false) }
+        .onTapGesture(count: 2) { layout.choose(.list) }
         .gesture(WindowDragGesture())
         .help("Double-click to expand")
-        .contextMenu { Button("Expand") { setMini(false) } }
+        .contextMenu {
+            Button("Expand") { layout.choose(.list) }
+            Divider()
+            layoutMenuItems(inline: false)
+        }
         .accessibilityElement(children: .combine)
         .accessibilityHint("Double-click to expand")
     }
@@ -3478,9 +3521,478 @@ struct FloatingView: View {
         }
     }
 
-    private func setMini(_ on: Bool) {
-        layout.mini = on
-        layout.save()
+    // MARK: The layout menu
+
+    /// Picks the window's layout; also in the right-click menu of the ones without a header.
+    private var layoutMenu: some View {
+        Menu { layoutMenuItems(inline: true) } label: {
+            Image(systemName: "rectangle.3.group")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(contrast ? Color.primary : Color.secondary)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Layout: \(layout.chosen.title)")
+        .accessibilityLabel("Layout: \(layout.chosen.title)")
+    }
+
+    @ViewBuilder private func layoutMenuItems(inline: Bool) -> some View {
+        let picker = Picker("Layout", selection: Binding(get: { layout.chosen }, set: { layout.choose($0) })) {
+            ForEach(KeepOnTopLayout.allCases) { Label($0.title, systemImage: $0.symbol).tag($0) }
+        }
+        if inline { picker.pickerStyle(.inline) } else { picker }
+        Divider()
+        Toggle("Strip while an app is full screen", isOn: $autoStrip)
+    }
+
+    // MARK: The strip, the dots and the bar
+
+    /// The coordinate space chips, marks and bar items report their places in.
+    private static let chipSpace = "chips"
+    static let maxChips = 6
+    static let maxDots = 12
+    static let hoverCardWidth: CGFloat = 290
+
+    /// A session whose latest turn asked you something: a "Waiting on you"
+    /// card in the list, whether it needs you, is to review or has finished.
+    static func asks(_ row: Row) -> Bool { row.group != .running && !row.held && row.card?.ask != nil }
+
+    /// The strip's, the bar's, the dots' and the columns' groups. Sessions
+    /// that asked you something are waiting on you, newest first, as the
+    /// list's cards are, then the ones that need you.
+    struct Compact {
+        let running, waiting, review, finished: [Row]
+
+        init(_ list: FloatingRows) {
+            let asking = (list.waiting + list.review + list.finished).filter(FloatingView.asks)
+                .sorted { $0.since > $1.since }
+            let ids = Set(asking.map(\.id))
+            running = list.running
+            waiting = asking + list.waiting.filter { !ids.contains($0.id) }
+            review = list.review.filter { !ids.contains($0.id) }
+            finished = list.finished.filter { !ids.contains($0.id) }
+        }
+    }
+
+    /// The strip's sessions: running, waiting on you, then ready for review,
+    /// at most `maxChips`; the rest only counted.
+    static func stripRows(_ list: FloatingRows) -> (shown: [Row], more: Int) {
+        let g = Compact(list)
+        let rows = g.running + g.waiting + g.review
+        return (Array(rows.prefix(maxChips)), max(0, rows.count - maxChips))
+    }
+
+    /// The dots' sessions in groups (running, waiting on you, review,
+    /// finished), at most `maxDots` in all; the rest only counted.
+    static func dotGroups(_ list: FloatingRows) -> (groups: [[Row]], more: Int) {
+        let g = Compact(list)
+        var left = maxDots
+        let groups = [g.running, g.waiting, g.review, g.finished].map { rows -> [Row] in
+            let taken = Array(rows.prefix(left))
+            left -= taken.count
+            return taken
+        }
+        let total = g.running.count + g.waiting.count + g.review.count + g.finished.count
+        return (groups.filter { !$0.isEmpty }, max(0, total - maxDots))
+    }
+
+    /// The mark for a session in the strip, the bar or the dots: one that
+    /// asked you something shows the amber "!", whatever its state.
+    private func compactMark(_ row: Row) -> some View {
+        Indicator(group: Self.asks(row) ? .yourTurn : row.group, quiet: row.quiet(now: model.now) != nil,
+                  held: row.held)
+            .frame(width: 16, height: 16)
+    }
+
+    /// Where a hover card's left edge goes, measured from the left of the row
+    /// it hangs from: centred on its chip when the row is wider than the card,
+    /// else lined up with the side the window keeps fixed.
+    static func hoverCardX(chipMidX: CGFloat, rowWidth: CGFloat, card: CGFloat, trailing: Bool) -> CGFloat {
+        guard rowWidth >= card else { return trailing ? rowWidth - card : 0 }
+        return min(max(chipMidX - card / 2, 0), rowWidth - card)
+    }
+
+    /// The hovered session's card: its question and buttons, or its row.
+    @ViewBuilder private func hoverCard(_ row: Row) -> some View {
+        SwiftUI.Group {
+            if row.group != .running, !row.held, let card = row.card, card.ask != nil {
+                AnswerCard(row: row, card: card, now: model.now, open: open,
+                           responseShown: openResponse == row.id,
+                           toggleResponse: { toggleResponse(row.id) },
+                           answer: answerFromCards && answer != nil ? { label in answer?(row, label) } : nil,
+                           warm: answerFromCards ? warm : nil,
+                           answering: answers.answering?.row == row.id ? answers.answering?.label : nil,
+                           note: answers.notes[row.id])
+            } else {
+                CompactRow(row: row, now: model.now, open: open, responseShown: openResponse == row.id,
+                           toggleResponse: row.group == .running ? nil : { toggleResponse(row.id) })
+                    .padding(4)
+            }
+        }
+        .frame(width: Self.hoverCardWidth, alignment: .leading)
+        .background { surface(RoundedRectangle(cornerRadius: 12, style: .continuous)) }
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+        .testFrame("card:\(row.id)")
+    }
+
+    /// The hover card under (or over) its chip; `trailing` when the window
+    /// keeps its right edge fixed.
+    private func placedCard(_ row: Row, trailing: Bool) -> some View {
+        let x = Self.hoverCardX(chipMidX: spots[row.id]?.midX ?? 0, rowWidth: rowWidth,
+                                card: Self.hoverCardWidth, trailing: trailing)
+        return hoverCard(row)
+            .alignmentGuide(trailing ? HorizontalAlignment.trailing : HorizontalAlignment.leading) { _ in
+                trailing ? rowWidth - x : -x
+            }
+    }
+
+    /// Records where a chip sits, for its card, and makes the pointer on it show the card.
+    private func hoverSpot(_ row: Row) -> HoverSpot {
+        HoverSpot(id: row.id, space: Self.chipSpace,
+                  hover: { hovered = row.id }, place: { spots[row.id] = $0 })
+    }
+
+    /// Double-click to go back to the list (on the mark, so a chip's click stays a chip's).
+    private func backToList(_ view: some View) -> some View {
+        view
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { layout.choose(.list) }
+            .help("Double-click for the list")
+    }
+
+    private var listButton: some View {
+        Button { layout.choose(.list) } label: {
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(contrast ? Color.primary : Color.secondary)
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Back to the list")
+        .accessibilityLabel("Back to the list")
+    }
+
+    private func spotDivider(_ height: CGFloat) -> some View {
+        Rectangle().fill(Color.primary.opacity(contrast ? 0.4 : 0.14)).frame(width: 1, height: height)
+    }
+
+    /// Sessions as one line of chips, for the black bar above a movie: running,
+    /// then waiting, then ready for review; finished ones as a count. The
+    /// pointer on a chip shows its card underneath; a click opens it.
+    private func strip(_ list: FloatingRows) -> some View {
+        let p = palette
+        let (shown, more) = Self.stripRows(list)
+        let finished = Compact(list).finished.count
+        let trailing = layout.trailing
+        let card = hovered.flatMap { id in shown.first { $0.id == id } }
+        return VStack(alignment: trailing ? .trailing : .leading, spacing: 6) {
+            if let card, layout.upward { placedCard(card, trailing: trailing) }
+            HStack(spacing: 4) {
+                backToList(LimboMark(size: 15).padding(.leading, 5).padding(.trailing, 2).frame(height: 32))
+                spotDivider(14)
+                if shown.isEmpty && finished == 0 {
+                    Text("All caught up").foregroundStyle(p.time).padding(.horizontal, 4)
+                }
+                ForEach(shown) { chip($0) }
+                if more > 0 { Text("+\(more)").foregroundStyle(p.time).padding(.horizontal, 4) }
+                if finished > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark").font(.system(size: 9, weight: .heavy)).foregroundStyle(p.done)
+                        Text("\(finished)")
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
+                    .help(finished == 1 ? "1 finished" : "\(finished) finished")
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(finished == 1 ? "1 finished" : "\(finished) finished")
+                }
+                listButton.padding(.trailing, 2)
+            }
+            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+            .padding(.horizontal, 4)
+            .frame(height: 32)
+            .fixedSize()
+            .coordinateSpace(name: Self.chipSpace)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { rowWidth = $0 }
+            .background { if let glow { GlowBackdrop(view: glow) } }
+            .background { surface(Capsule()) }
+            .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+            .contentShape(Capsule())
+            .gesture(WindowDragGesture())
+            .contextMenu { layoutMenuItems(inline: false) }
+            if let card, !layout.upward { placedCard(card, trailing: trailing) }
+        }
+        .fixedSize()
+        .onHover { if !$0 { hovered = nil } }
+    }
+
+    /// A strip chip: the session's mark, its title (clipped) and how long ago.
+    private func chip(_ row: Row) -> some View {
+        let p = palette
+        let waiting = row.group == .yourTurn || Self.asks(row)
+        let tint = row.group == .running ? p.running : waiting ? p.needsYou : p.review
+        return Button { if row.link != nil { open(row) } } label: {
+            HStack(spacing: 5) {
+                compactMark(row)
+                Text(row.title)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 120, alignment: .leading)
+                Text(compactAge(since: row.since, now: model.now))
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(p.time)
+            }
+            .padding(.leading, 5)
+            .padding(.trailing, 9)
+            .frame(height: 24)
+            .background(Capsule().fill(tint.opacity(contrast ? 0 : (waiting ? 0.16 : 0.12))))
+            .overlay(Capsule().strokeBorder(waiting ? tint.opacity(0.6)
+                                            : Color.primary.opacity(contrast ? 0.6 : 0)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(row.link != nil ? .link : nil)
+        .modifier(hoverSpot(row))
+        .tagMenu(row)
+        .testFrame("chip:\(row.id)")
+        .accessibilityLabel("\(row.title), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+    }
+
+    /// Running, needs you, ready for review, finished: for VoiceOver.
+    private func spokenState(_ row: Row) -> String {
+        if row.held { return "on hold" }
+        if Self.asks(row) { return "waiting on you" }
+        switch row.group {
+        case .running: return "running"
+        case .yourTurn: return "needs you"
+        case .review: return "ready for review"
+        default: return "finished"
+        }
+    }
+
+    /// The smallest layout: one mark per session, in groups. The pointer on a
+    /// mark shows its card underneath; a click opens it.
+    private func dots(_ list: FloatingRows) -> some View {
+        let p = palette
+        let (groups, more) = Self.dotGroups(list)
+        let trailing = layout.trailing
+        let card = hovered.flatMap { id in groups.joined().first { $0.id == id } }
+        return VStack(alignment: trailing ? .trailing : .leading, spacing: 6) {
+            if let card, layout.upward { placedCard(card, trailing: trailing) }
+            HStack(spacing: 7) {
+                backToList(LimboMark(size: 14).padding(.leading, 1).frame(height: 26))
+                if groups.isEmpty {
+                    spotDivider(12)
+                    Image(systemName: "checkmark").font(.system(size: 9, weight: .heavy)).foregroundStyle(p.time)
+                        .help("All caught up")
+                }
+                ForEach(groups.indices, id: \.self) { index in
+                    spotDivider(12)
+                    ForEach(groups[index]) { row in
+                        Button { if row.link != nil { open(row) } } label: {
+                            compactMark(row).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .pointerStyle(row.link != nil ? .link : nil)
+                        .modifier(hoverSpot(row))
+                        .tagMenu(row)
+                        .testFrame("dot:\(row.id)")
+                        .accessibilityLabel("\(row.title), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+                    }
+                }
+                if more > 0 {
+                    Text("+\(more)").font(.system(size: 11, weight: .semibold).monospacedDigit()).foregroundStyle(p.time)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 26)
+            .fixedSize()
+            .coordinateSpace(name: Self.chipSpace)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { rowWidth = $0 }
+            .background { if let glow { GlowBackdrop(view: glow) } }
+            .background { surface(Capsule()) }
+            .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+            .contentShape(Capsule())
+            .gesture(WindowDragGesture())
+            .contextMenu { layoutMenuItems(inline: false) }
+            if let card, !layout.upward { placedCard(card, trailing: trailing) }
+        }
+        .fixedSize()
+        .onHover { if !$0 { hovered = nil } }
+    }
+
+    static let barRunning = 4, barWaiting = 3, barReview = 2
+
+    /// A thin bar along the bottom of the screen, its full width: running
+    /// sessions with what they're doing, then the ones waiting and to review,
+    /// then a count of finished ones. The pointer on one shows its card above.
+    private func bar(_ list: FloatingRows) -> some View {
+        let p = palette
+        let g = Compact(list)
+        let running = Array(g.running.prefix(Self.barRunning))
+        let waiting = Array(g.waiting.prefix(Self.barWaiting))
+        let review = Array(g.review.prefix(Self.barReview))
+        let shown = running + waiting + review
+        let more = g.running.count + g.waiting.count + g.review.count - shown.count
+        let card = hovered.flatMap { id in shown.first { $0.id == id } }
+        let shape = UnevenRoundedRectangle(cornerRadii: .init(topLeading: 12, topTrailing: 12), style: .continuous)
+        return VStack(alignment: .leading, spacing: 6) {
+            if let card { placedCard(card, trailing: false) }
+            HStack(spacing: 12) {
+                backToList(LimboMark(size: 16).frame(height: 30))
+                if shown.isEmpty && g.finished.isEmpty {
+                    Text("All caught up").foregroundStyle(p.time)
+                }
+                if !running.isEmpty {
+                    barLabel("Running", g.running.count)
+                    ForEach(running) { barItem($0) }
+                }
+                if !waiting.isEmpty {
+                    if !running.isEmpty { spotDivider(14) }
+                    barLabel("Waiting on you", g.waiting.count)
+                    ForEach(waiting) { barItem($0) }
+                }
+                if !review.isEmpty {
+                    if !running.isEmpty || !waiting.isEmpty { spotDivider(14) }
+                    barLabel("To review", g.review.count)
+                    ForEach(review) { barItem($0) }
+                }
+                if more > 0 { Text("+\(more)").foregroundStyle(p.time).fixedSize() }
+                if !g.finished.isEmpty {
+                    if !shown.isEmpty { spotDivider(14) }
+                    barLabel("Finished", nil)
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark").font(.system(size: 9, weight: .heavy)).foregroundStyle(p.done)
+                        Text("\(g.finished.count)")
+                    }
+                    .fixedSize()
+                }
+                // The empty part: double-click for the list.
+                backToList(Color.clear.frame(minWidth: 8, maxWidth: .infinity, minHeight: 22, maxHeight: 22))
+                    .layoutPriority(-1)   // the sessions take the room first
+                listButton
+            }
+            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+            .padding(.leading, 14)
+            .padding(.trailing, 8)
+            .frame(width: layout.barWidth, height: 30)
+            .coordinateSpace(name: Self.chipSpace)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { rowWidth = $0 }
+            .background { if let glow { GlowBackdrop(view: glow) } }
+            .background { surface(shape) }
+            .overlay(shape.strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+            .contextMenu { layoutMenuItems(inline: false) }
+        }
+        .frame(width: layout.barWidth, alignment: .leading)
+        .onHover { if !$0 { hovered = nil } }
+    }
+
+    /// A small capitals label in the bar, and its count.
+    private func barLabel(_ text: String, _ count: Int?) -> some View {
+        Text(count.map { "\(text.uppercased()) \($0)" } ?? text.uppercased())
+            .font(.system(size: 10, weight: .semibold).monospacedDigit())
+            .tracking(0.7)
+            .foregroundStyle(palette.time)
+            .fixedSize()
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    /// One session in the bar: mark, title, what it's doing (running) or its
+    /// first tag, and how long ago. Titles give way first to the rest.
+    private func barItem(_ row: Row) -> some View {
+        let p = palette
+        let waiting = row.group == .yourTurn || Self.asks(row)
+        return Button { if row.link != nil { open(row) } } label: {
+            HStack(spacing: 6) {
+                compactMark(row)
+                Text(row.title).lineLimit(1).truncationMode(.tail).layoutPriority(1)
+                // What it's doing, or its first tag: whole, or left out when there's no room.
+                ViewThatFits(in: .horizontal) {
+                    if row.group == .running, let activity = row.activity {
+                        Text(activity).font(.system(size: 11)).foregroundStyle(p.text2).fixedSize()
+                    } else if let tag = row.tags.first {
+                        TagPill(tag: tag).fixedSize()
+                    }
+                    Color.clear.frame(width: 0, height: 0)
+                }
+                Text(compactAge(since: row.since, now: model.now))
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(p.time)
+                    .fixedSize()
+            }
+            .padding(.horizontal, waiting ? 8 : 2)
+            .frame(height: 22)
+            .background(Capsule().fill(waiting && !contrast ? p.needsYou.opacity(0.14) : .clear))
+            .overlay(Capsule().strokeBorder(waiting ? p.needsYou.opacity(0.55) : .clear))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(row.link != nil ? .link : nil)
+        .modifier(hoverSpot(row))
+        .tagMenu(row)
+        .testFrame("bar:\(row.id)")
+        .accessibilityLabel("\(row.title), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+    }
+
+    // MARK: The columns
+
+    static let columnRows = 4
+
+    /// Wide and short: running, needs you (and to review), and finished side by side.
+    private func columns(_ list: FloatingRows) -> some View {
+        let g = Compact(list)
+        return VStack(alignment: .leading, spacing: 0) {
+            header(list, filter: nil, counts: false, doubleClick: .list)
+            HStack(alignment: .top, spacing: 0) {
+                column("Running", g.running)
+                columnDivider
+                column("Waiting on you", g.waiting + g.review)
+                columnDivider
+                column("Finished", g.finished + list.onHold)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.bottom, 6)
+        }
+        .frame(width: layout.columnsWidth, alignment: .top)
+        .background { if let glow { GlowBackdrop(view: glow) } }
+        .background { surface(RoundedRectangle(cornerRadius: Self.corner, style: .continuous)) }
+        .overlay(RoundedRectangle(cornerRadius: Self.corner, style: .continuous)
+            .strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+    }
+
+    private var columnDivider: some View {
+        Rectangle().fill(Color.primary.opacity(contrast ? 0.35 : 0.08)).frame(width: 1)
+            .frame(maxHeight: .infinity).padding(.vertical, 8)
+    }
+
+    private func column(_ title: String, _ rows: [Row]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            sectionHeader(title, count: rows.count)
+            if rows.isEmpty {
+                Text("None")
+                    .font(.system(size: 11))
+                    .foregroundStyle(palette.time)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+            } else {
+                rowStack(Array(rows.prefix(Self.columnRows)))
+                if rows.count > Self.columnRows {
+                    Text("\(rows.count - Self.columnRows) more")
+                        .font(.system(size: 10))
+                        .foregroundStyle(palette.time)
+                        .padding(.leading, 36)
+                        .padding(.bottom, 4)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     /// Picks how the window glows while a session runs, and in what colour.
@@ -3512,6 +4024,20 @@ struct FloatingView: View {
         .fixedSize()
         .help("Glow while a session runs: \(style.title)")
         .accessibilityLabel("Glow while a session runs: \(style.title)")
+    }
+}
+
+/// A chip's place in its row, and the pointer reaching it.
+struct HoverSpot: ViewModifier {
+    let id: String
+    let space: String
+    let hover: () -> Void
+    let place: (CGRect) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { if $0 { hover() } }
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(space)) } action: { place($0) }
     }
 }
 
@@ -4215,35 +4741,178 @@ final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-/// The keep-on-top window's size as you left it: any width, and a height
-/// only after you drag its top or bottom edge (until then it fits the rows).
+/// The keep-on-top window's shapes, picked from the layout menu in its header
+/// (or its right-click menu). Only the list and columns can be resized.
+enum KeepOnTopLayout: String, CaseIterable, Identifiable {
+    case list, strip, bar, dots, columns, pill
+    static let autoStripKey = "keepOnTopStripWhenFullScreen"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .list: return "List"
+        case .strip: return "Strip"
+        case .bar: return "Bar"
+        case .dots: return "Dots"
+        case .columns: return "Columns"
+        case .pill: return "Pill"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .list: return "list.bullet"
+        case .strip: return "rectangle.split.3x1"
+        case .bar: return "rectangle.bottomthird.inset.filled"
+        case .dots: return "ellipsis"
+        case .columns: return "rectangle.grid.3x2"
+        case .pill: return "capsule"
+        }
+    }
+    /// The edges a drag resizes: all of the list's, the sides of the columns.
+    var resizable: ResizeEdges {
+        switch self {
+        case .list: return [.left, .right, .top, .bottom]
+        case .columns: return [.left, .right]
+        default: return []
+        }
+    }
+    /// How round the glow's corners are: the window's, or half a capsule's height.
+    var glowCorner: CGFloat {
+        switch self {
+        case .dots: return 13
+        case .bar: return 12
+        default: return 16
+        }
+    }
+
+    /// What shows: the layout you chose, or the strip in place of the list or
+    /// the columns while an app is full screen on the window's display (with
+    /// that switch on), unless you picked a layout since it went full screen.
+    static func effective(chosen: KeepOnTopLayout, fullScreen: Bool, autoStrip: Bool,
+                          kept: Bool) -> KeepOnTopLayout {
+        guard autoStrip, fullScreen, !kept, chosen == .list || chosen == .columns else { return chosen }
+        return .strip
+    }
+
+    /// The saved choice; before layouts there was only the pill switch.
+    static func saved(raw: String?, legacyMini: Bool) -> KeepOnTopLayout {
+        raw.flatMap(KeepOnTopLayout.init(rawValue:)) ?? (legacyMini ? .pill : .list)
+    }
+}
+
+/// The keep-on-top window's layout and size as you left them: any width, and
+/// a height only after you drag its top or bottom edge (until then it fits the rows).
 final class FloatingLayout: ObservableObject {
     static let defaultWidth: CGFloat = 300
     static let minSize = NSSize(width: 220, height: 64)
+    static let defaultColumnsWidth: CGFloat = 660
+    static let minColumnsWidth: CGFloat = 480
     private static let widthKey = "keepOnTopWidth", heightKey = "keepOnTopHeight", miniKey = "keepOnTopMini"
+    private static let layoutKey = "keepOnTopLayout", columnsKey = "keepOnTopColumnsWidth"
     @Published var width: CGFloat
     @Published var height: CGFloat?
-    /// Shrunk to a pill with just the counts.
-    @Published var mini: Bool
+    @Published var columnsWidth: CGFloat
+    /// The layout you picked.
+    @Published var chosen: KeepOnTopLayout
+    /// Set by the window: another app is full screen on its display.
+    @Published var fullScreen = false
+    /// You picked a layout while that was so: it stays until full screen ends.
+    @Published var keptInFullScreen = false
+    /// Set by the window: it sits in the right half of its screen, so a hover
+    /// card lines up with its right edge and it grows to the left.
+    @Published var trailing = false
+    /// Set by the window: the strip or the dots sit in the lower half of their
+    /// screen, so the hover card opens above and the bottom edge stays put.
+    @Published var upward = false
+    /// Set by the window: the bar spans its screen.
+    @Published var barWidth: CGFloat = 1200
 
-    init(width: CGFloat = FloatingLayout.defaultWidth, height: CGFloat? = nil, mini: Bool = false) {
+    init(width: CGFloat = FloatingLayout.defaultWidth, height: CGFloat? = nil, mini: Bool = false,
+         chosen: KeepOnTopLayout? = nil, columnsWidth: CGFloat = FloatingLayout.defaultColumnsWidth) {
         self.width = width
         self.height = height
-        self.mini = mini
+        self.chosen = chosen ?? (mini ? .pill : .list)
+        self.columnsWidth = columnsWidth
+    }
+
+    /// Shrunk to a pill with just the counts.
+    var mini: Bool {
+        get { chosen == .pill }
+        set { chosen = newValue ? .pill : .list }
+    }
+
+    /// The layout showing now.
+    var current: KeepOnTopLayout {
+        KeepOnTopLayout.effective(chosen: chosen, fullScreen: fullScreen,
+                                  autoStrip: UserDefaults.standard.bool(forKey: KeepOnTopLayout.autoStripKey),
+                                  kept: keptInFullScreen)
+    }
+
+    /// Picks a layout from a menu or a double-click, and remembers it.
+    func choose(_ layout: KeepOnTopLayout) {
+        chosen = layout
+        if fullScreen { keptInFullScreen = true }
+        save()
     }
 
     static func saved() -> FloatingLayout {
         let d = UserDefaults.standard
-        let w = d.double(forKey: widthKey), h = d.double(forKey: heightKey)
+        let w = d.double(forKey: widthKey), h = d.double(forKey: heightKey), c = d.double(forKey: columnsKey)
         return FloatingLayout(width: w >= minSize.width ? w : defaultWidth, height: h >= minSize.height ? h : nil,
-                              mini: d.bool(forKey: miniKey))
+                              chosen: KeepOnTopLayout.saved(raw: d.string(forKey: layoutKey),
+                                                            legacyMini: d.bool(forKey: miniKey)),
+                              columnsWidth: c >= minColumnsWidth ? c : defaultColumnsWidth)
     }
 
     func save() {
-        UserDefaults.standard.set(Double(width), forKey: Self.widthKey)
-        UserDefaults.standard.set(Double(height ?? 0), forKey: Self.heightKey)
-        UserDefaults.standard.set(mini, forKey: Self.miniKey)
+        let d = UserDefaults.standard
+        d.set(Double(width), forKey: Self.widthKey)
+        d.set(Double(height ?? 0), forKey: Self.heightKey)
+        d.set(Double(columnsWidth), forKey: Self.columnsKey)
+        d.set(chosen.rawValue, forKey: Self.layoutKey)
+        d.set(chosen == .pill, forKey: Self.miniKey)
     }
+}
+
+/// Whether another app is full screen on a display: its Space is a full-screen
+/// app's, or a normal window covers the whole display (a game, say).
+func fullScreenShown(on screen: NSScreen) -> Bool {
+    if DisplaySpaces.isFullScreen(screen) == true { return true }
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    let primary = NSScreen.screens.first?.frame.height ?? screen.frame.height
+    return windowCovers(screen.frame, primaryHeight: primary, windows: windows, me: getpid())
+}
+
+/// A normal window (layer 0, not ours, not see-through) exactly the size of a
+/// display. Window bounds run from the primary display's top-left; reading
+/// them needs no Screen Recording permission (only titles do).
+func windowCovers(_ screen: NSRect, primaryHeight: CGFloat, windows: [[String: Any]], me: pid_t) -> Bool {
+    let target = CGRect(x: screen.minX, y: primaryHeight - screen.maxY, width: screen.width, height: screen.height)
+    return windows.contains { w in
+        guard (w[kCGWindowLayer as String] as? Int) == 0,
+              (w[kCGWindowOwnerPID as String] as? Int).map({ pid_t($0) }) != me,
+              (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+              let bounds = (w[kCGWindowBounds as String] as? NSDictionary)
+                  .flatMap({ CGRect(dictionaryRepresentation: $0 as CFDictionary) }) else { return false }
+        return abs(bounds.minX - target.minX) < 1 && abs(bounds.minY - target.minY) < 1
+            && abs(bounds.width - target.width) < 1 && abs(bounds.height - target.height) < 1
+    }
+}
+
+/// The bar's frame: along the bottom of `area`, its full width.
+func barFrame(area: NSRect, height: CGFloat) -> NSRect {
+    NSRect(x: area.minX, y: area.minY, width: area.width, height: height)
+}
+
+/// A frame moved just enough to sit inside `area`; the top edge wins when
+/// it is taller than the area.
+func keptOnScreen(_ frame: NSRect, area: NSRect) -> NSRect {
+    var r = frame
+    if r.maxX > area.maxX { r.origin.x = area.maxX - r.width }
+    if r.minX < area.minX { r.origin.x = area.minX }
+    if r.minY < area.minY { r.origin.y = area.minY }
+    if r.maxY > area.maxY { r.origin.y = area.maxY - r.height }
+    return r
 }
 
 /// Which edges of the keep-on-top window a drag resizes.
@@ -4346,6 +5015,8 @@ enum BackgroundCursor {
 /// front (see BackgroundCursor), without making Limbo Tasks frontmost.
 final class ResizeEdgesView: NSView {
     var minSize = FloatingLayout.minSize
+    /// The edges that resize: the columns' sides only, say.
+    var allowed: ResizeEdges = [.left, .right, .top, .bottom]
     var onResize: (NSRect, ResizeEdges) -> Void = { _, _ in }
     var onResizeEnd: () -> Void = {}
     /// The pointer in screen points; a check can stand in for the real mouse.
@@ -4354,7 +5025,7 @@ final class ResizeEdgesView: NSView {
     private var showingResizeCursor = false
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        ResizeEdges(at: convert(point, from: superview), in: bounds.size).isEmpty ? nil : self
+        ResizeEdges(at: convert(point, from: superview), in: bounds.size).intersection(allowed).isEmpty ? nil : self
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -4367,7 +5038,7 @@ final class ResizeEdgesView: NSView {
     }
 
     private func edges(_ event: NSEvent) -> ResizeEdges {
-        ResizeEdges(at: convert(event.locationInWindow, from: nil), in: bounds.size)
+        ResizeEdges(at: convert(event.locationInWindow, from: nil), in: bounds.size).intersection(allowed)
     }
 
     override func mouseEntered(with event: NSEvent) { hover(at: convert(event.locationInWindow, from: nil)) }
@@ -4378,7 +5049,7 @@ final class ResizeEdgesView: NSView {
     /// the resize cursor on an edge, the arrow again off it.
     func hover(at point: NSPoint?) {
         guard drag == nil else { return }
-        let edges = point.map { ResizeEdges(at: $0, in: bounds.size) } ?? []
+        let edges = point.map { ResizeEdges(at: $0, in: bounds.size).intersection(allowed) } ?? []
         if edges.isEmpty { endResizeCursor() } else { showResizeCursor(edges) }
     }
 
@@ -4562,6 +5233,11 @@ final class FloatingController {
     private var edges: ResizeEdgesView?
     /// While an edge is being dragged, the window follows the mouse, not the rows.
     private var resizing = false
+    /// The layout last fitted, and where the window's top-left was before the
+    /// bar took it to the bottom of the screen.
+    private var lastShape: KeepOnTopLayout?
+    private var beforeBar: NSPoint?
+    private var observers: [NSObjectProtocol] = []
     private static let shownKey = "keepOnTop"
     private static let frameName = "LimboTasksKeepOnTop"
 
@@ -4580,11 +5256,13 @@ final class FloatingController {
         clock?.invalidate()
         let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.now = Date()
+            self?.checkFullScreen()
             self?.fitToContent()
         }
         timer.tolerance = 5
         RunLoop.main.add(timer, forMode: .common)
         clock = timer
+        checkFullScreen()
         fitToContent()
         panel.orderFrontRegardless()
         updateGlow()
@@ -4665,29 +5343,119 @@ final class FloatingController {
         clock = nil
     }
 
-    /// Resizes to the content, keeping the top edge where it is.
+    /// Resizes to the content, keeping the top edge where it is and the window
+    /// on its screen; the bar instead spans the bottom of the screen.
     func fitToContent() {
         guard model.pinned else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, let panel = self.panel, let host = self.host else { return }
             self.updateGlow()
             guard !self.resizing else { return }
-            // The pill: rounder glow, and no resizing.
-            self.glow.cornerRadius = FloatingView.corner
-            self.edges?.isHidden = self.layout.mini
-            let size = host.fittingSize
-            guard panel.frame.size != size else { return }
-            let screen = panel.screen?.frame ?? NSScreen.main?.frame ?? panel.frame
-            panel.setFrame(anchoredFrame(panel.frame, size: size, screen: screen), display: true)
+            let shape = self.layout.current
+            self.glow.cornerRadius = shape.glowCorner
+            self.edges?.isHidden = shape.resizable.isEmpty
+            self.edges?.allowed = shape.resizable
+            self.edges?.minSize = shape == .columns
+                ? NSSize(width: FloatingLayout.minColumnsWidth, height: FloatingLayout.minSize.height)
+                : FloatingLayout.minSize
+            let screen = panel.screen ?? NSScreen.main
+            let full = screen?.frame ?? panel.frame
+            // In full screen the whole display is free; otherwise not the menu bar or the Dock.
+            let area = self.layout.fullScreen ? full : (screen?.visibleFrame ?? full)
+            let shapeChanged = self.lastShape != shape
+            if shape == .bar && self.lastShape != .bar {
+                self.beforeBar = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
+            } else if shape != .bar && self.lastShape == .bar, let corner = self.beforeBar {
+                panel.setFrameTopLeftPoint(corner)   // back where it was before the bar
+            }
+            self.lastShape = shape
+            if shape == .bar {
+                guard self.layout.barWidth == area.width else {
+                    self.layout.barWidth = area.width   // the bar refits at its new width
+                    return
+                }
+                let frame = barFrame(area: area, height: host.fittingSize.height)
+                if panel.frame != frame { panel.setFrame(frame, display: true) }
+                return
+            }
+            self.updateAnchors(shapeChanged: shapeChanged)
+            var frame = anchoredFrame(panel.frame, size: host.fittingSize, screen: full)
+            // A card opening above: the bottom stays put (not after a change of layout, which keeps the top).
+            if self.layout.upward && !shapeChanged { frame.origin.y = panel.frame.minY }
+            frame = keptOnScreen(frame, area: area)
+            if panel.frame != frame { panel.setFrame(frame, display: true) }
         }
+    }
+
+    /// Which way the window grows: away from the side nearer its screen's
+    /// edge, and for the strip and the dots in the lower half, upward. Taken
+    /// from the edge the line of chips sits on, so an open card never flips it.
+    private func updateAnchors(shapeChanged: Bool = false) {
+        guard let panel else { return }
+        let full = (panel.screen ?? NSScreen.main)?.frame ?? panel.frame
+        let shape = layout.current
+        let line = layout.upward && !shapeChanged ? panel.frame.minY + 16 : panel.frame.maxY - 16
+        let upward = (shape == .strip || shape == .dots) && line < full.midY
+        let trailing = panel.frame.midX > full.midX
+        if layout.trailing != trailing { layout.trailing = trailing }
+        if layout.upward != upward { layout.upward = upward }
+    }
+
+    /// A layout picked, or the full-screen switch flipped.
+    private func layoutChanged() {
+        checkFullScreen()
+        fitToContent()
+    }
+
+    /// Whether another app is full screen on the window's display, when that
+    /// matters: for "Strip while an app is full screen", and for where the bar sits.
+    func checkFullScreen() {
+        guard model.pinned, let panel else { return }
+        let wanted = UserDefaults.standard.bool(forKey: KeepOnTopLayout.autoStripKey) || layout.chosen == .bar
+        let on = wanted && (panel.screen ?? NSScreen.main).map { fullScreenShown(on: $0) } == true
+        guard layout.fullScreen != on else { return }
+        layout.fullScreen = on
+        if !on { layout.keptInFullScreen = false }
+        fitToContent()
+    }
+
+    /// Checks again when the Space or the app in front changes (going full
+    /// screen is a new Space), and once the slide into it has finished.
+    private func watchFullScreen(_ panel: NSPanel) {
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification] {
+            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.checkFullScreen()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self?.checkFullScreen() }
+            })
+        }
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.checkFullScreen()
+                self?.fitToContent()
+            })
+        // Dragged: which way it grows from here; onto another display: check that one.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in
+                self?.updateAnchors()
+            })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeScreenNotification, object: panel, queue: .main) { [weak self] _ in
+                self?.checkFullScreen()
+                self?.fitToContent()
+            })
     }
 
     /// Side edges change only the width, so the height keeps fitting the rows;
     /// the top or bottom edge sets the height too, and the list scrolls in it.
     private func userResized(to frame: NSRect, edges: ResizeEdges) {
         resizing = true
-        if !edges.isDisjoint(with: [.top, .bottom]) { layout.height = frame.height }
-        layout.width = frame.width
+        if layout.current == .columns {
+            layout.columnsWidth = frame.width
+        } else {
+            if !edges.isDisjoint(with: [.top, .bottom]) { layout.height = frame.height }
+            layout.width = frame.width
+        }
         panel?.setFrame(frame, display: true)
     }
 
@@ -4725,6 +5493,7 @@ final class FloatingController {
                                 refit: { [weak self] in self?.fitToContent() },
                                 glowChanged: { [weak self] in self?.glowChanged($0) },
                                 acknowledge: { [weak self] in self?.acknowledgeGlow() },
+                                layoutChanged: { [weak self] in self?.layoutChanged() },
                                 glow: glow,
                                 layout: layout,
                                 status: status,
@@ -4743,7 +5512,8 @@ final class FloatingController {
         edges.autoresizingMask = [.width, .height]
         edges.onResize = { [weak self] frame, moved in self?.userResized(to: frame, edges: moved) }
         edges.onResizeEnd = { [weak self] in self?.resizeEnded() }
-        edges.isHidden = layout.mini
+        edges.isHidden = layout.current.resizable.isEmpty
+        edges.allowed = layout.current.resizable
         content.addSubview(host)
         content.addSubview(edges)
         self.edges = edges
@@ -4761,6 +5531,7 @@ final class FloatingController {
         }
         panel.setFrameAutosaveName(Self.frameName)
         self.host = host
+        watchFullScreen(panel)
         return panel
     }
 }
@@ -4806,6 +5577,20 @@ enum DisplaySpaces {
         .map { unsafeBitCast($0, to: CurrentSpace.self) }
     private static let windowNumber: WindowNumber? = dlsym(handle, "_AXUIElementGetWindow")
         .map { unsafeBitCast($0, to: WindowNumber.self) }
+    private typealias SpaceType = @convention(c) (Int32, UInt64) -> Int32
+    private static let spaceType: SpaceType? = (dlsym(handle, "CGSSpaceGetType") ?? dlsym(handle, "SLSSpaceGetType"))
+        .map { unsafeBitCast($0, to: SpaceType.self) }
+
+    /// Whether a display shows a full-screen app's own Space (type 4), or nil
+    /// when the window server won't say.
+    static func isFullScreen(_ screen: NSScreen) -> Bool? {
+        guard let connection, let spaceType,
+              let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+              let cfUUID = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue(),
+              let uuid = CFUUIDCreateString(nil, cfUUID) as String?,
+              let space = space(of: uuid) else { return nil }
+        return spaceType(connection, space) == 4
+    }
 
     /// One display when you clicked: its Space, and the app and window in front there.
     struct Shown {
@@ -5659,7 +6444,10 @@ func snapshotLayout() -> FloatingLayout {
     let parts = (argument(after: "--size") ?? "").split(separator: "x").map(String.init)
     let width = parts.first.flatMap(Double.init).map { CGFloat($0) } ?? FloatingLayout.defaultWidth
     let height = parts.count > 1 ? Double(parts[1]).map { CGFloat($0) } : nil
-    return FloatingLayout(width: width, height: height, mini: arguments.contains("--mini"))
+    let layout = FloatingLayout(width: width, height: height, mini: arguments.contains("--mini"),
+                                chosen: argument(after: "--layout").flatMap(KeepOnTopLayout.init(rawValue:)))
+    if layout.chosen == .bar { layout.barWidth = width > 600 ? width : 1200 }
+    return layout
 }
 
 /// Renders the panel and the menu bar item to PNG files.
@@ -5690,7 +6478,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
                                                layout: snapshotLayout(), status: status,
                                                forceContrast: contrast, forceSolid: arguments.contains("--solid"),
                                                initialFilter: argument(after: "--filter").flatMap(RowFilter.init(rawValue:)),
-                                               initialResponse: argument(after: "--response"))
+                                               initialResponse: argument(after: "--response"),
+                                               initialHover: argument(after: "--hover"))
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
             .background(Color(nsColor: .windowBackgroundColor)))
@@ -6064,6 +6853,79 @@ func runSelfTest() {
     check("Dark Mode darkens the glass", FloatingView.glassShade(.dark) >= 0.5)
     check("Light Mode leaves the glass plain", FloatingView.glassShade(.light) == 0)
 
+    // Layouts: the saved choice, and what shows while an app is full screen.
+    check("an old pill setting comes back as the pill", KeepOnTopLayout.saved(raw: nil, legacyMini: true) == .pill)
+    check("no setting is the list", KeepOnTopLayout.saved(raw: nil, legacyMini: false) == .list)
+    check("a saved layout wins over the old pill setting", KeepOnTopLayout.saved(raw: "bar", legacyMini: true) == .bar)
+    check("an unknown saved layout is the list", KeepOnTopLayout.saved(raw: "grid", legacyMini: false) == .list)
+    check("the pill switch still works", FloatingLayout(mini: true).chosen == .pill
+              && { let l = FloatingLayout(mini: true); l.mini = false; return l.chosen == .list }())
+    check("full screen turns the list into the strip",
+          KeepOnTopLayout.effective(chosen: .list, fullScreen: true, autoStrip: true, kept: false) == .strip)
+    check("and the columns", KeepOnTopLayout.effective(chosen: .columns, fullScreen: true, autoStrip: true, kept: false) == .strip)
+    check("the dots stay the dots", KeepOnTopLayout.effective(chosen: .dots, fullScreen: true, autoStrip: true, kept: false) == .dots)
+    check("with the switch off, full screen changes nothing",
+          KeepOnTopLayout.effective(chosen: .list, fullScreen: true, autoStrip: false, kept: false) == .list)
+    check("a layout picked in full screen stays",
+          KeepOnTopLayout.effective(chosen: .list, fullScreen: true, autoStrip: true, kept: true) == .list)
+    check("out of full screen, the layout you chose",
+          KeepOnTopLayout.effective(chosen: .columns, fullScreen: false, autoStrip: true, kept: false) == .columns)
+    check("only the list and the columns resize", KeepOnTopLayout.allCases.filter { !$0.resizable.isEmpty } == [.list, .columns]
+              && KeepOnTopLayout.columns.resizable == [.left, .right])
+    let screenArea = NSRect(x: 0, y: 70, width: 1512, height: 875)
+    check("the bar spans the bottom of the screen",
+          barFrame(area: screenArea, height: 30) == NSRect(x: 0, y: 70, width: 1512, height: 30))
+    check("a window past the bottom moves up onto the screen",
+          keptOnScreen(NSRect(x: 1200, y: 20, width: 300, height: 200), area: screenArea) == NSRect(x: 1200, y: 70, width: 300, height: 200))
+    check("past the right edge, it moves left",
+          keptOnScreen(NSRect(x: 1400, y: 400, width: 300, height: 200), area: screenArea).maxX == 1512)
+    check("taller than the screen, its top stays on it",
+          keptOnScreen(NSRect(x: 10, y: 0, width: 300, height: 1200), area: screenArea).maxY == screenArea.maxY)
+    check("a window on the screen stays put",
+          keptOnScreen(NSRect(x: 10, y: 300, width: 300, height: 200), area: screenArea) == NSRect(x: 10, y: 300, width: 300, height: 200))
+    // The strip and the dots never outgrow the screen.
+    let many = (0..<9).map { Row(id: "r\($0)", group: .running, title: "Session \($0)", context: "", since: Date()) }
+    let crowd = FloatingRows(board: Board(rows: many + many.map { Row(id: $0.id + "d", group: .done, title: $0.title,
+                                                                     context: "", since: Date()) }, now: Date()),
+                             now: Date(), within: 86400, finishedWithin: 7200)
+    let stripped = FloatingView.stripRows(crowd)
+    check("the strip shows six chips and counts the rest", stripped.shown.count == 6 && stripped.more == 3)
+    let dotted = FloatingView.dotGroups(crowd)
+    check("the dots show twelve marks and count the rest",
+          dotted.groups.joined().count == FloatingView.maxDots && dotted.more == 18 - FloatingView.maxDots)
+    // A finished session that asked something is waiting on you, as its card is in the list.
+    let asked = Row(id: "asked", group: .justFinished, title: "Fix the test", context: "", since: Date(),
+                    card: TurnCard(ask: "Commit and push this change?", actions: ["Commit and push"]))
+    let quietDone = Row(id: "quiet", group: .done, title: "Tidy up", context: "", since: Date())
+    let asking = FloatingView.Compact(FloatingRows(board: Board(rows: [asked, quietDone], now: Date()), now: Date(),
+                                                   within: 86400, finishedWithin: 7200))
+    check("a finished session's question puts it with the ones waiting on you",
+          asking.waiting.map(\.id) == ["asked"] && asking.finished.map(\.id) == ["quiet"])
+    // A hover card hangs under its chip, inside the row.
+    check("a card centres under its chip", FloatingView.hoverCardX(chipMidX: 400, rowWidth: 800, card: 290, trailing: false) == 255)
+    check("near the left end it lines up with the row", FloatingView.hoverCardX(chipMidX: 50, rowWidth: 800, card: 290, trailing: false) == 0)
+    check("near the right end too", FloatingView.hoverCardX(chipMidX: 790, rowWidth: 800, card: 290, trailing: true) == 510)
+    check("under a short row it keeps to the fixed side",
+          FloatingView.hoverCardX(chipMidX: 60, rowWidth: 200, card: 290, trailing: true) == -90
+              && FloatingView.hoverCardX(chipMidX: 60, rowWidth: 200, card: 290, trailing: false) == 0)
+    // Full screen: a normal window from another app exactly covering the display.
+    func window(_ x: Int, _ y: Int, _ w: Int, _ h: Int, layer: Int = 0, pid: Int = 42) -> [String: Any] {
+        [kCGWindowLayer as String: layer, kCGWindowOwnerPID as String: pid,
+         kCGWindowBounds as String: ["X": x, "Y": y, "Width": w, "Height": h] as NSDictionary]
+    }
+    let display = NSRect(x: 0, y: 0, width: 1512, height: 982)
+    check("a window covering the display is full screen",
+          windowCovers(display, primaryHeight: 982, windows: [window(0, 0, 1512, 982)], me: 7))
+    check("a zoomed window is not", !windowCovers(display, primaryHeight: 982, windows: [window(0, 37, 1512, 880)], me: 7))
+    check("nor one of ours", !windowCovers(display, primaryHeight: 982, windows: [window(0, 0, 1512, 982, pid: 7)], me: 7))
+    check("nor a shield above the windows", !windowCovers(display, primaryHeight: 982, windows: [window(0, 0, 1512, 982, layer: 25)], me: 7))
+    check("on a display above the main one, bounds count from the main one's top",
+          windowCovers(NSRect(x: 0, y: 982, width: 1920, height: 1080), primaryHeight: 982,
+                       windows: [window(0, -1080, 1920, 1080)], me: 7))
+    check("every layout symbol exists",
+          (KeepOnTopLayout.allCases.map(\.symbol) + ["rectangle.3.group", "arrow.up.left.and.arrow.down.right"])
+              .allSatisfy { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil })
+
     // Answering from a card presses only an exact match.
     check("the same question, ignoring case and spacing",
           ClaudeAnswerer.sameText("Commit and push  this change?", "commit and push this change?"))
@@ -6299,7 +7161,8 @@ func runGestureCheck() {
     check("a double-click on a chip doesn't shrink to the pill", !layout.mini)
     if host.frame.height != fullHeight { click(at: NSPoint(x: 45, y: host.frame.height - 18)); refit() }
     // Double-click the header's empty middle: the pill, with the glow.
-    click(at: NSPoint(x: 175, y: host.frame.height - 18), times: 2)   // between the chips and the menus
+    let middle = testFrames["header-middle"].map { NSPoint(x: $0.midX, y: host.frame.height - $0.midY) }
+    click(at: middle ?? NSPoint(x: 175, y: host.frame.height - 18), times: 2)   // between the chips and the menus
     refit()
     check("double-clicking the header shrinks to the pill", layout.mini, "(\(NSStringFromSize(host.frame.size)))")
     check("the glow comes along to the pill", glow.window != nil && Int(glow.bounds.height) == 32, glowState())
@@ -6308,6 +7171,43 @@ func runGestureCheck() {
     check("double-clicking the pill expands it", !layout.mini)
     check("the glow comes back to the window", glow.window != nil && glow.bounds.height == host.frame.height
               && glow.bounds.height > 100, glowState())
+    // The other layouts: one line for the strip, smaller still for the dots,
+    // full width for the bar, wide and short for the columns. A click on a
+    // session opens it; a double-click on the mark goes back to the list.
+    func point(_ name: String) -> NSPoint? {
+        testFrames[name].map { NSPoint(x: $0.midX, y: host.frame.height - $0.midY) }
+    }
+    let listHeight = host.frame.height
+    layout.choose(.strip)
+    refit()
+    check("the strip is one line", host.frame.height == 32 && host.frame.width > 300, "(\(NSStringFromSize(host.frame.size)))")
+    check("the glow comes along to the strip", glow.window != nil && Int(glow.bounds.height) == 32, glowState())
+    opened.removeAll()
+    if let chip = point("chip:local_s4") { click(at: chip) }
+    check("a click on a chip opens its session", opened == ["local_s4"], "(opened \(opened))")
+    click(at: NSPoint(x: 14, y: host.frame.height / 2), times: 2)
+    refit()
+    check("double-clicking the strip's mark goes back to the list", layout.chosen == .list && host.frame.height == listHeight)
+    layout.choose(.dots)
+    refit()
+    check("the dots are smaller still", host.frame.height == 26 && host.frame.width < 300, "(\(NSStringFromSize(host.frame.size)))")
+    opened.removeAll()
+    if let dot = point("dot:local_s1") { click(at: dot) }
+    check("a click on a mark opens its session", opened == ["local_s1"], "(opened \(opened))")
+    layout.choose(.bar)
+    refit()
+    check("the bar is as wide as it's told and one line", host.frame.width == layout.barWidth && host.frame.height == 30,
+          "(\(NSStringFromSize(host.frame.size)))")
+    opened.removeAll()
+    if let item = point("bar:local_s1") { click(at: item) }
+    check("a click in the bar opens its session", opened == ["local_s1"], "(opened \(opened))")
+    layout.choose(.columns)
+    refit()
+    check("the columns are wide and shorter than the list",
+          host.frame.width == layout.columnsWidth && host.frame.height < listHeight, "(\(NSStringFromSize(host.frame.size)))")
+    layout.choose(.list)
+    refit()
+    check("and back to the list", host.frame.height == listHeight)
     // A card's button opens its session; the response button shows the reply
     // without opening anything. Their places are recorded as they are laid out.
     func place(of name: String) -> NSPoint? {

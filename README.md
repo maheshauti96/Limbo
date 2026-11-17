@@ -106,7 +106,7 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 | **Answer from Cards** | Click a card's button and Limbo presses it in Claude for you, then puts your screens back. |
 | **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
 | **Glows** | A calm rim while sessions run, amber when one needs you, green when everything finishes. |
-| **Pill** | The window shrunk to just its counts. |
+| **Layouts** | List, Strip, Bar, Dots, Columns or Pill; the strip can take over while an app is full screen. |
 
 #### Menu bar
 
@@ -183,6 +183,19 @@ The window's edge tells you the state from the corner of your eye. The sparkle m
 - **Other effects:** Aurora drift, Ember breath, Corner bloom, Tide sweep, Rising warmth, Heartbeat, Random (a new one every 5 seconds) or No glow, in red, orange, rose or green. A new choice plays for 4 seconds so you can see it. The amber and green signals each have an on/off switch in the same menu.
 - **Pill:** double-click the header's empty middle (or right-click it, Shrink to Pill) to shrink the window to just its counts and glow; double-click the pill to expand it.
 
+#### Layouts
+
+The layout button in the window's header (and the right-click menu of the layouts without a header) picks the window's shape. The horizontal ones fit in the black bar above or below a widescreen movie, so they never cover what you're watching:
+
+- **List** (default): the window above.
+- **Strip:** one line of chips, one per session (running, waiting, then ready for review, at most six), with how long ago, and finished ones as a count. Point at a chip for its card (its question and buttons, or its row) underneath, or above it in the lower half of the screen; click to open it.
+- **Bar:** a thin bar across the whole bottom of the screen, with what running sessions are doing and the first tag of the others. Cards open above it.
+- **Dots:** the smallest: one mark per session, in groups. Point at one for its card.
+- **Columns:** wide and short, with Running, Needs you and Finished side by side; drag its sides to resize it.
+- **Pill:** just the counts.
+
+Double-click the Limbo mark (or the bar's empty part) to go back to the list. **Strip while an app is full screen**, in the same menu, swaps the list or the columns for the strip whenever an app is full screen on the window's display, and puts your layout back when it leaves full screen; pick a layout while full screen and it stays until then. The app is taken to be full screen when its display shows a full-screen Space (or a window covers the whole display, as a game's does), so it works for videos in a browser or a player alike.
+
 #### Light mode and accessibility
 
 <img src="docs/images/limbo-tasks/light.png" width="392" alt="The window in light mode">
@@ -249,9 +262,10 @@ limbo-tasks --snapshot out.png --floating [--glow calm|aurora|ember|corners|tide
 limbo-tasks --snapshot out.png --floating --attention | --flash | --done [--phase 0.7]   # amber, green flash, all finished
 limbo-tasks --snapshot out.png --floating --size 440x260 | 440xauto              # the keep-on-top window at a size
 limbo-tasks --snapshot out.png --floating [--mini] [--filter running|needsYou|review] [--contrast] [--solid]
+limbo-tasks --snapshot out.png --floating --layout strip|bar|dots|columns [--hover local_s1]   # --size 1400 for the bar's width
 limbo-tasks --snapshot out.png --floating --response local_s7 [--live] [-tagStyle outline|filled|dot|text]
 limbo-tasks --glow-cycle 16                         # Random in an offscreen window: effect each second, then CPU used
-limbo-tasks --gesture-check                         # chips, cards, replies, the New Tag box, close, pill (off screen)
+limbo-tasks --gesture-check                         # chips, cards, replies, the New Tag box, close, pill, layouts (off screen)
 limbo-tasks --resize-check                          # dragging the edges, and never becoming the front app
 limbo-tasks --self-test                             # states, tags, glow decisions, cards, answers, background tasks
 limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
