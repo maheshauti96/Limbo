@@ -106,6 +106,7 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 | **Answer from Cards** | Click a card's button and Limbo presses it in Claude for you, then puts your screens back. |
 | **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
 | **ChatGPT threads** | Codex threads in the ChatGPT app, running or just finished, beside Claude's sessions. |
+| **Cursor threads** | Cursor's agent threads, running, waiting on you, or finished, beside Claude's sessions. |
 | **Snooze** | Put a session away for an hour, three hours or until tomorrow morning; it comes back by itself. |
 | **Glows** | A calm rim while sessions run, amber when one needs you, green when everything finishes. |
 | **Layouts** | List, Strip, Bar, Dots, Columns or Pill; the strip can take over while an app is full screen. |
@@ -179,6 +180,15 @@ Codex threads open in the ChatGPT app show beside Claude's sessions, with a grey
 - A thread waiting for your approval shows as running: Codex doesn't write that down, the same as Claude's mid-turn permission prompts.
 - They can't be tagged or snoozed.
 
+#### Cursor threads
+
+Cursor's agent threads from the last week show with a grey **Cursor** label while Cursor is running: running ones with what Cursor says under them in its own list ("Read Makefile, build.sh", "Edited settings.ts"), ones waiting on you ("Waiting for your approval", "Plan ready to review"), and finished ones from when their run ended. Click one to switch to Cursor: Cursor has no link to one of its own threads (its agent link finds only cloud agents), so it opens wherever you left it.
+
+- They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
+- Archived threads, subagents' threads and unsent drafts are left out.
+- A run that began before Cursor last started was cut short, so it shows as finished.
+- They can't be tagged or snoozed.
+
 #### Snooze
 
 Snooze a session that needs you (or is ready for review, or asked you something) when you don't want to deal with it yet: **For 1 Hour**, **For 3 Hours** or **Until Tomorrow Morning** (9:00). Pick it from the session's right-click menu, anywhere it shows, or from the **Snooze 1h 3h Tomorrow** buttons under a card in the strip, the bar and the dots.
@@ -248,7 +258,8 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 - Background tasks: the session's own child shells (via `libproc`). A Bash command left running holds a file ending `.output` under `<session>/tasks/` open; a monitor streams to Claude instead, so it counts as a shell Claude started (its command sources one of Claude's `~/.claude/shell-snapshots/`) that holds no such file. File names, and whether a shell's command has that marker; never file contents, and nothing else of the command.
 - A running session that has written nothing for 10 minutes (its transcript, its agents' transcripts under `<session>/subagents`, its workflow files under `<session>/workflows`) gets the hourglass and "No output for 12 min": it may be stuck, or in one long command.
 - ChatGPT's Codex threads, only while the panel or the window is showing: which rollout files (`~/.codex/sessions/…/rollout-…-<id>.jsonl`) the ChatGPT app's Codex server holds open (via `libproc`, every 2 s), the first 16 KB of each once (its folder, and whether you started it), then only the lines it gains, checking the start of each for a turn starting or ending and the kind of step. Names come from `~/.codex/session_index.jsonl`, read again only when it changes. It looks for ChatGPT's Codex server every 10 s while none is running, and every 30 s otherwise. On this Mac a check with nothing new takes under 0.1 ms, looking for the server about 2 ms, and the first read of two open threads about 110 ms (`--codex-bench`).
-- It never opens the `*.key` files, and never changes Claude's or ChatGPT's files.
+- Cursor's agent threads, only while the panel or the window is showing and Cursor is running: a stat every 2 s of Cursor's state database (`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`) and its write-ahead log, and, only when one of them changed (about every 15 s while Cursor works), one indexed query on its small list of threads (`composerHeaders`: name, folder, the line Cursor shows under it, whether a run is going or waits for approval). The database is opened read-only and closed straight after each query, so no read is left open while Cursor writes. Conversations themselves are never read. It looks for Cursor every 10 s while it isn't running, and every 30 s otherwise. On this Mac a tick with nothing new takes about 0.004 ms and a read of the list about 0.2 ms (`--cursor-bench`).
+- It never opens the `*.key` files, and never changes Claude's, ChatGPT's or Cursor's files.
 
 Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`, snoozes under `sessionSnoozes`.
 
@@ -288,9 +299,10 @@ limbo-tasks --snapshot out.png --floating --response local_s7 [--live] [-tagStyl
 limbo-tasks --glow-cycle 16                         # Random in an offscreen window: effect each second, then CPU used
 limbo-tasks --gesture-check                         # chips, cards, replies, snooze, the New Tag box, close, pill, layouts (off screen)
 limbo-tasks --resize-check                          # dragging the edges, and never becoming the front app
-limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks, ChatGPT threads
+limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks, ChatGPT and Cursor threads
 limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
 limbo-tasks --codex-bench                           # what reading ChatGPT's threads costs, on this Mac's open threads
+limbo-tasks --cursor-bench                          # what reading Cursor's threads costs, on this Mac's Cursor
 kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json,
                                                     # a picture of the menu bar button -> ...limbo-tasks.menubar.png,
                                                     # and the glow's state (effect, active, animating, size) -> ...limbo-tasks.glow.json

@@ -27,6 +27,7 @@
 import AppKit
 import ApplicationServices
 import CoreServices
+import SQLite3
 import SwiftUI
 
 // MARK: - Paths and names
@@ -1338,31 +1339,57 @@ func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row
 /// The label on ChatGPT's threads.
 let codexTag = "ChatGPT"
 
-extension Row {
-    /// A thread in the ChatGPT app (Codex), not a Claude session.
-    var isCodex: Bool { id.hasPrefix("codex:") }
+/// The app a row's session or thread is in.
+enum RowSource { case claude, chatGPT, cursor }
 
-    /// Where a click opens it: Claude, or the ChatGPT app.
+extension Row {
+    var source: RowSource {
+        if id.hasPrefix("codex:") { return .chatGPT }
+        if id.hasPrefix("cursor:") { return .cursor }
+        return .claude
+    }
+
+    /// A thread in ChatGPT or Cursor: listed, never counted in the menu bar,
+    /// never tagged or snoozed.
+    var fromOtherApp: Bool { source != .claude }
+
+    /// Where a click goes: the session in Claude, the thread in ChatGPT, or
+    /// Cursor itself. Cursor has no link to one of its own threads (its
+    /// /agent link finds only cloud agents, and shows an error otherwise).
     var openURL: URL? {
         guard let link else { return nil }
         if isSessionId(link) { return URL(string: "claude://claude.ai/epitaxy/\(link)") }
         if link.hasPrefix("codex://threads/") { return URL(string: link) }
+        if link.hasPrefix(cursorLinkPrefix) { return NSWorkspace.shared.urlForApplication(withBundleIdentifier: cursorBundleId) }
         return nil
     }
 
-    /// "Claude" or "ChatGPT", for tooltips.
-    var appName: String { isCodex ? "ChatGPT" : "Claude" }
+    /// "Claude", "ChatGPT" or "Cursor".
+    var appName: String {
+        switch source {
+        case .claude: return "Claude"
+        case .chatGPT: return "ChatGPT"
+        case .cursor: return "Cursor"
+        }
+    }
+
+    /// What a click does, for menus: "Open in Claude", or "Switch to Cursor".
+    var openLabel: String { source == .cursor ? "Switch to Cursor" : "Open in \(appName)" }
 }
 
-/// Reads the ChatGPT app's Codex threads, on the engine's queue, every two
-/// seconds while a panel shows. Each tick: is the app's Codex server still
+/// A process's executable path, or "" if it's gone.
+func executablePath(_ pid: pid_t) -> String {
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    return proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
+}
+
+/// Reads the ChatGPT app's Codex threads, on the engine's queue, on the
+/// engine's two-second tick while a panel shows. Each tick: is the app's Codex server still
 /// there (one call), which rollout files it holds (one call per open file),
 /// and a stat of each; a file is read only when it grew, from where the
 /// last read stopped. It looks for ChatGPT's servers every 10 s while it
 /// knows none, and every 30 s otherwise.
 final class CodexWatcher {
-    private let queue: DispatchQueue
-    private var timer: DispatchSourceTimer?
     private var servers: [pid_t] = []
     private var lookedForServers = Date.distantPast
     private var scans: [String: RolloutScan] = [:]
@@ -1370,32 +1397,15 @@ final class CodexWatcher {
     private var names: [String: String] = [:]
     private var namesStamp: FileStamp?
     private(set) var rows: [Row] = []
-    /// Called on the queue when the rows changed.
-    var onChange: (() -> Void)?
-
-    init(queue: DispatchQueue) { self.queue = queue }
 
     static let indexPath = Paths.home.appendingPathComponent(".codex/session_index.jsonl").path
 
-    func start() {
-        guard timer == nil else { return }
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
-        t.setEventHandler { [weak self] in
-            guard let self, self.refresh() else { return }
-            self.onChange?()
-        }
-        t.resume()
-        timer = t
-    }
-
-    func stop() {
-        timer?.cancel()
-        timer = nil
-        if !rows.isEmpty {
-            rows = []
-            onChange?()
-        }
+    /// No panel shows: drop the rows (what was read stays, for next time).
+    @discardableResult
+    func clear() -> Bool {
+        guard !rows.isEmpty else { return false }
+        rows = []
+        return true
     }
 
     /// Reads once; true if the rows changed.
@@ -1442,10 +1452,7 @@ final class CodexWatcher {
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
         guard count > 0 else { return [] }
-        func path(_ pid: pid_t) -> String {
-            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-            return proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
-        }
+        let path = executablePath
         var found: [pid_t] = []
         for pid in pids.prefix(min(count, pids.count)) where pid > 0 {
             let exe = path(pid)
@@ -1497,6 +1504,173 @@ func codexNames(index: String) -> [String: String] {
     return names
 }
 
+// MARK: - Cursor threads
+
+/// Cursor's bundle id: a click on one of its threads brings it forward.
+let cursorBundleId = "com.todesktop.230313mzl4w4u92"
+
+/// The label on Cursor's threads.
+let cursorTag = "Cursor"
+
+/// A Cursor thread's link: not openable as is (see Row.openURL).
+let cursorLinkPrefix = "cursor-thread:"
+
+/// One Cursor agent thread, from Cursor's own list of them: the small
+/// composerHeaders table in its state database, a row per thread.
+struct CursorThread: Equatable {
+    let id: String
+    var name: String?
+    var subtitle: String?     // what Cursor shows under it: the last step, or your first ask
+    var folder: String?
+    var updated: Date         // lastUpdatedAt: your last message
+    var checkpoint: Date?     // checkpointAt: moves as a run goes, and stamps its end
+    var runStarted: Date?     // unfinishedRunAt: set while a run goes, cleared when it ends
+    var needsApproval = false // hasBlockingPendingActions
+    var planReady = false     // hasPendingPlan
+}
+
+/// A Cursor thread as a row: running, waiting on you, or finished. A run
+/// that began before this Cursor started was cut short (it quit or
+/// crashed mid-run), so it counts as finished.
+func cursorRow(_ thread: CursorThread, cursorStarted: Date?) -> Row? {
+    let name = thread.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let runStart = thread.runStarted.flatMap { start in
+        cursorStarted.map { start >= $0.addingTimeInterval(-60) } ?? true ? start : nil
+    }
+    guard !name.isEmpty || runStart != nil else { return nil }
+    let id = "cursor:\(thread.id)", link = cursorLinkPrefix + thread.id
+    let title = name.isEmpty ? "Cursor thread" : name
+    let context = thread.folder.map(folderLabel) ?? "Cursor"
+    let ended = max(thread.updated, thread.checkpoint ?? thread.updated)
+    if let runStart {
+        if thread.needsApproval {
+            return Row(id: id, group: .yourTurn, title: title, detail: "Waiting for your approval", context: context,
+                       since: thread.checkpoint ?? runStart, link: link, tags: [cursorTag])
+        }
+        let activity = thread.subtitle?.split(whereSeparator: \.isNewline).first
+            .map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
+        // Whole minutes, as Claude's and ChatGPT's: the quiet check needs no more.
+        let written = thread.checkpoint.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
+        return Row(id: id, group: .running, title: title, context: context, since: runStart, link: link,
+                   activity: activity, lastOutput: written, tags: [cursorTag])
+    }
+    if thread.planReady {
+        return Row(id: id, group: .yourTurn, title: title, detail: "Plan ready to review", context: context,
+                   since: ended, link: link, tags: [cursorTag])
+    }
+    return Row(id: id, group: .done, title: title, context: context, since: ended, link: link, tags: [cursorTag])
+}
+
+/// Cursor's recent threads, newest first: not archived, not a subagent's,
+/// not an unsent draft, touched since `since`. One indexed query on a small
+/// table. The database is opened read-only and closed straight after, so
+/// no read is left open to hold up Cursor's own writes. nil on any error.
+func readCursorThreads(database path: String, since: Date, limit: Int = 30) -> [CursorThread]? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    let sql = """
+        SELECT composerId, lastUpdatedAt, checkpointAt, json_extract(value, '$.name'),
+               json_extract(value, '$.subtitle'), json_extract(value, '$.workspaceIdentifier.uri.fsPath'),
+               json_extract(value, '$.unfinishedRunAt'), json_extract(value, '$.hasBlockingPendingActions'),
+               json_extract(value, '$.hasPendingPlan')
+        FROM composerHeaders
+        WHERE isArchived = 0 AND isSubagent = 0 AND recency > ?
+          AND coalesce(json_extract(value, '$.isDraft'), 0) = 0
+        ORDER BY recency DESC LIMIT ?
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, Int64(since.timeIntervalSince1970 * 1000))
+    sqlite3_bind_int(statement, 2, Int32(limit))
+    func text(_ column: Int32) -> String? { sqlite3_column_text(statement, column).map { String(cString: $0) } }
+    func date(_ column: Int32) -> Date? {
+        guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
+        return Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, column)) / 1000)
+    }
+    var threads: [CursorThread] = []
+    while true {
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return threads }
+        guard step == SQLITE_ROW, let id = text(0) else { return nil }
+        threads.append(CursorThread(id: id, name: text(3), subtitle: text(4), folder: text(5),
+                                    updated: date(1) ?? .distantPast, checkpoint: date(2), runStarted: date(6),
+                                    needsApproval: sqlite3_column_int(statement, 7) != 0,
+                                    planReady: sqlite3_column_int(statement, 8) != 0))
+    }
+}
+
+/// Reads Cursor's agent threads, on the engine's queue, on the engine's
+/// two-second tick while a panel shows. Each tick: is Cursor still running
+/// (one call), and a stat of its state database and of that database's log;
+/// the list of threads is read only when one of them changed, about every
+/// 15 s while Cursor works. It looks for Cursor every 10 s while it isn't
+/// running, and every 30 s otherwise. Rows show only while Cursor runs.
+final class CursorWatcher {
+    static let database = Paths.home
+        .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb").path
+    private var app: (pid: pid_t, started: Date)?
+    private var lookedForApp = Date.distantPast
+    private var stamp: [FileStamp?]?
+    private(set) var rows: [Row] = []
+    /// Reads of the list of threads, for the bench.
+    private(set) var reads = 0
+
+    /// One tick; true if the rows changed.
+    @discardableResult
+    func refresh(now: Date = Date()) -> Bool {
+        if let app, kill(app.pid, 0) != 0 { self.app = nil }
+        if now.timeIntervalSince(lookedForApp) >= (app == nil ? 10 : 30) {
+            lookedForApp = now
+            let found = Self.findCursor()
+            if found?.pid != app?.pid { stamp = nil }
+            app = found
+        }
+        guard let app else { return clear() }
+        let current = [fileStamp(Self.database), fileStamp(Self.database + "-wal")]
+        guard current != stamp else { return false }
+        // Kept even when the read fails: it's tried again when Cursor next writes.
+        stamp = current
+        guard let threads = readCursorThreads(database: Self.database, since: now.addingTimeInterval(-Board.window))
+        else { return false }
+        reads += 1
+        let fresh = rowsInOrder(threads.compactMap { cursorRow($0, cursorStarted: app.started) })
+        guard fresh != rows else { return false }
+        rows = fresh
+        return true
+    }
+
+    /// No panel shows, or Cursor quit: drop the rows.
+    @discardableResult
+    func clear() -> Bool {
+        stamp = nil
+        guard !rows.isEmpty else { return false }
+        rows = []
+        return true
+    }
+
+    /// Cursor's main process, and when it started.
+    static func findCursor() -> (pid: pid_t, started: Date)? {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
+        guard count > 0 else { return nil }
+        for pid in pids.prefix(min(count, pids.count)) where pid > 0 {
+            guard executablePath(pid).hasSuffix(".app/Contents/MacOS/Cursor") else { continue }
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { continue }
+            let started = TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1_000_000
+            return (pid, Date(timeIntervalSince1970: started))
+        }
+        return nil
+    }
+}
+
 // MARK: - Engine
 
 /// Owns all file access, on one low-priority serial queue.
@@ -1532,12 +1706,10 @@ final class SessionEngine {
     /// A record is written about 2 s after its transcript ends, which triggers a
     /// look; this also looks every 30 s in case a transcript ends later.
     private var cardCheck: DispatchSourceTimer?
-    /// The ChatGPT app's Codex threads, read only while a panel shows.
-    private lazy var codex: CodexWatcher = {
-        let watcher = CodexWatcher(queue: queue)
-        watcher.onChange = { [weak self] in self?.publishIfChanged() }
-        return watcher
-    }()
+    /// ChatGPT's and Cursor's threads, read every 2 s, only while a panel shows.
+    private let codex = CodexWatcher()
+    private let cursor = CursorWatcher()
+    private var otherApps: DispatchSourceTimer?
 
     func start() {
         queue.async {
@@ -1570,9 +1742,10 @@ final class SessionEngine {
             }
             engine.activityWanted = true
             engine.codex.refresh()
+            engine.cursor.refresh()
             return rowsInOrder(classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
                                         activities: activities, cards: engine.currentCards(),
-                                        background: engine.backgroundWork()) + engine.codex.rows)
+                                        background: engine.backgroundWork()) + engine.codex.rows + engine.cursor.rows)
         }
     }
 
@@ -1613,9 +1786,20 @@ final class SessionEngine {
                 timer.setEventHandler { [weak self] in self?.publishIfChanged() }
                 timer.resume()
                 self.cardCheck = timer
-                self.codex.start()
+                let apps = DispatchSource.makeTimerSource(queue: self.queue)
+                apps.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
+                apps.setEventHandler { [weak self] in
+                    guard let self else { return }
+                    let chatGPT = self.codex.refresh(), cursor = self.cursor.refresh()
+                    if chatGPT || cursor { self.publishIfChanged() }
+                }
+                apps.resume()
+                self.otherApps = apps
             } else {
-                self.codex.stop()
+                self.otherApps?.cancel()
+                self.otherApps = nil
+                self.codex.clear()
+                self.cursor.clear()
             }
             self.syncActivityWatchers()
             self.publishIfChanged()
@@ -1755,7 +1939,8 @@ final class SessionEngine {
     private func publishIfChanged() {
         let claude = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
                               cards: currentCards(), background: backgroundWork())
-        let rows = codex.rows.isEmpty ? claude : rowsInOrder(claude + codex.rows)
+        let others = codex.rows + cursor.rows
+        let rows = others.isEmpty ? claude : rowsInOrder(claude + others)
         guard rows != lastRows else { return }
         lastRows = rows
         let archived = Set(desk.values.compactMap { $0.record?.isArchived == true ? $0.record?.sessionId : nil })
@@ -2560,7 +2745,7 @@ struct TagPill: View {
     /// Grey for On hold, purple for Awaiting manual review, and one of a few
     /// colours kept clear of the states' amber, blue and green for your own.
     static func color(_ tag: String) -> Color {
-        if tag == SessionTags.onHold || tag == codexTag { return .secondary }
+        if tag == SessionTags.onHold || tag == codexTag || tag == cursorTag { return .secondary }
         if tag == SessionTags.awaitingReview { return Color(nsColor: .systemPurple) }
         let palette: [NSColor] = [.systemTeal, .systemPink, .systemIndigo, .systemBrown, .systemPurple]
         let index = tag.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xffff } % palette.count
@@ -2752,7 +2937,7 @@ struct SessionRow: View {
     private var tooltip: String {
         var parts = [row.title]
         if let line = secondLine { parts.append(line) }
-        parts.append(canOpen ? "Click to open in \(row.appName)" : "Started in a terminal, so it can't be opened from here")
+        parts.append(canOpen ? "Click to " + (row.source == .cursor ? "switch to Cursor" : "open in \(row.appName)") : "Started in a terminal, so it can't be opened from here")
         return parts.joined(separator: "\n\n")
     }
 
@@ -2806,7 +2991,7 @@ struct SessionRow: View {
                             + (row.tags.isEmpty ? "" : ", tagged " + row.tags.joined(separator: ", ")))
         .tagMenu(row)
         .accessibilityValue(secondLine ?? meta)
-        .accessibilityHint(canOpen ? "Opens the session in Claude" : "")
+        .accessibilityHint(canOpen ? row.openLabel : "")
     }
 
     @ViewBuilder private var trailing: some View {
@@ -4327,7 +4512,7 @@ struct FloatingView: View {
                     Menu(row.title) {
                         if let until = row.snoozedUntil { Text("Snoozed " + snoozeWhen(until, now: model.now)) }
                         Button("Wake Now") { model.wake(row) }
-                        if row.link != nil { Button("Open in Claude") { open(row) } }
+                        if row.link != nil { Button(row.openLabel) { open(row) } }
                     }
                 }
                 if rows.count > 1 {
@@ -7055,8 +7240,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem() {
         let now = Date()
-        // Claude's sessions only: ChatGPT's threads are read only while a panel shows.
-        let board = Board(rows: model.rows.filter { !$0.isCodex }, now: now)
+        // Claude's sessions only: ChatGPT's and Cursor's threads are read only while a panel shows.
+        let board = Board(rows: model.rows.filter { !$0.fromOtherApp }, now: now)
         let counts = (board.yourTurn.count, board.running.count)
         if shownCounts.map({ $0 != counts }) ?? true {
             shownCounts = counts
@@ -7289,7 +7474,7 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
 /// --codex-bench: what reading ChatGPT's threads costs, on this Mac's real
 /// threads: the first read, then a tick with nothing new.
 func runCodexBench() {
-    let watcher = CodexWatcher(queue: DispatchQueue(label: "bench"))
+    let watcher = CodexWatcher()
     let clock = ContinuousClock()
     let first = clock.measure { watcher.refresh() }
     let ticks = 200
@@ -7303,6 +7488,29 @@ func runCodexBench() {
                  ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
 }
 
+/// --cursor-bench: what reading Cursor's threads costs, on this Mac's real
+/// Cursor: the first read, a tick when nothing changed, and one read.
+func runCursorBench() {
+    let clock = ContinuousClock()
+    func ms(_ d: Duration) -> Double { Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15 }
+    let look = clock.measure { _ = CursorWatcher.findCursor() }
+    let watcher = CursorWatcher()
+    let first = clock.measure { watcher.refresh() }
+    let ticks = 200
+    let rest = clock.measure { for _ in 0..<ticks { watcher.refresh() } }
+    let reads = 20
+    let since = Date().addingTimeInterval(-Board.window)
+    let read = clock.measure { for _ in 0..<reads { _ = readCursorThreads(database: CursorWatcher.database, since: since) } }
+    print(CursorWatcher.findCursor() == nil ? "Cursor isn't running: no rows" : "Cursor threads shown: \(watcher.rows.count)"
+          + " (\(watcher.rows.filter { $0.group == .running }.count) running)")
+    print(String(format: "looking for Cursor (every 30 s): %.1f ms", ms(look)))
+    print(String(format: "first read (finds Cursor, reads its list of threads): %.1f ms", ms(first)))
+    print(String(format: "reading the list (open, query, close; only when Cursor wrote): %.2f ms", ms(read) / Double(reads)))
+    print(String(format: "a tick when Cursor wrote nothing: %.3f ms (%.4f%% of one core at one tick every 2 s)",
+                 ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
+    print("reads during \(ticks) ticks: \(watcher.reads - 1)")
+}
+
 func runDump() {
     let now = Date()
     let board = Board(rows: SessionEngine.scanOnce(), now: now)
@@ -7314,7 +7522,7 @@ func runDump() {
     for (name, rows) in groups {
         for r in rows {
             print("\(name)\t\(String(format: "%.1f", now.timeIntervalSince(r.since) / 3600))h\t\(r.title)"
-                  + (r.activity.map { "\t[\($0)]" } ?? "") + (r.isCodex ? "\t(ChatGPT)" : ""))
+                  + (r.activity.map { "\t[\($0)]" } ?? "") + (r.fromOtherApp ? "\t(\(r.appName))" : ""))
         }
     }
     print("counts: " + groups.map { "\($0.0)=\($0.1.count)" }.joined(separator: " "))
@@ -7774,7 +7982,7 @@ func runSelfTest() {
                      + #"{"id":"a","thread_name":"Renamed","updated_at":"y"}"#) == ["a": "Renamed"])
     let finishedRow = codexRow(id: threadId, name: "Fix the export", cwd: head.cwd, scan: scan)
     check("a finished thread is a finished row that opens in ChatGPT",
-          finishedRow?.group == .done && finishedRow?.isCodex == true && finishedRow?.tags == [codexTag]
+          finishedRow?.group == .done && finishedRow?.source == .chatGPT && finishedRow?.tags == [codexTag]
               && finishedRow?.openURL?.absoluteString == "codex://threads/\(threadId)" && finishedRow?.context == "web-app")
     check("it can't be tagged or snoozed", finishedRow.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
     append(codexLine("02:33:00.000", "event_msg", #""task_started","turn_id":"t2""#)
@@ -7792,6 +8000,64 @@ func runSelfTest() {
           Row(id: "local_a1", group: .done, title: "t", context: "", since: now, link: "local_a1").openURL?.absoluteString
               == "claude://claude.ai/epitaxy/local_a1")
     try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "limbo-codex-\(getpid())")
+
+    // Cursor threads: its list of threads, in a database shaped like Cursor's.
+    let cursorDatabase = NSTemporaryDirectory() + "limbo-cursor-\(getpid()).vscdb"
+    try? FileManager.default.removeItem(atPath: cursorDatabase)
+    var setup: OpaquePointer?
+    _ = sqlite3_open(cursorDatabase, &setup)
+    func ms(_ secondsAgo: TimeInterval) -> Int64 { Int64(now.addingTimeInterval(-secondsAgo).timeIntervalSince1970 * 1000) }
+    func cursorHeader(_ id: String, updated: TimeInterval, checkpoint: TimeInterval? = nil, archived: Int = 0,
+                      subagent: Int = 0, _ fields: String) -> String {
+        let value = #"{"type":"head","composerId":"\#(id)",\#(fields)"workspaceIdentifier":{"uri":{"fsPath":"/tmp/build-tools"}}}"#
+        return "INSERT INTO composerHeaders VALUES ('\(id)', 'w1', \(ms(updated)), \(ms(updated)), \(archived), \(subagent), "
+            + "\(ms(updated)), \(checkpoint.map { String(ms($0)) } ?? "NULL"), '\(value)', NULL);"
+    }
+    let cursorSQL = [
+        "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT, subagentTypeName TEXT);",
+        cursorHeader("c-run", updated: 120, checkpoint: 90,
+                     #""name":"Tidy the build scripts","subtitle":"Read Makefile, build.sh","unfinishedRunAt":\#(ms(120)),"hasBlockingPendingActions":false,"#),
+        cursorHeader("c-wait", updated: 300, checkpoint: 200,
+                     #""name":"Rename the config keys","unfinishedRunAt":\#(ms(300)),"hasBlockingPendingActions":true,"#),
+        cursorHeader("c-done", updated: 3600, checkpoint: 3000, #""name":"Explain the cache","hasBlockingPendingActions":false,"#),
+        cursorHeader("c-plan", updated: 4000, checkpoint: 3900, #""name":"Plan the migration","hasPendingPlan":true,"#),
+        cursorHeader("c-cut", updated: 5000, checkpoint: 4900, #""name":"Cut short","unfinishedRunAt":\#(ms(5000)),"#),
+        cursorHeader("c-noname", updated: 6000, #""name":"","#),
+        cursorHeader("c-draft", updated: 60, #""name":"","subtitle":"half a question","isDraft":true,"#),
+        cursorHeader("c-archived", updated: 60, archived: 1, #""name":"Archived","#),
+        cursorHeader("c-subagent", updated: 60, subagent: 1, #""name":"A subagent","#),
+        cursorHeader("c-old", updated: 30 * 86400, #""name":"Last month","#),
+    ]
+    for sql in cursorSQL { _ = sqlite3_exec(setup, sql, nil, nil, nil) }
+    sqlite3_close(setup)
+    let cursorThreads = readCursorThreads(database: cursorDatabase, since: now.addingTimeInterval(-Board.window)) ?? []
+    check("Cursor's list: recent threads, newest first; no drafts, archived, subagents or old ones",
+          cursorThreads.map(\.id) == ["c-run", "c-wait", "c-done", "c-plan", "c-cut", "c-noname"])
+    check("no database, no list", readCursorThreads(database: cursorDatabase + "-missing", since: now) == nil)
+    let cursorStarted = now.addingTimeInterval(-1800)
+    let cursorRows = Dictionary(uniqueKeysWithValues: cursorThreads.compactMap { thread in
+        cursorRow(thread, cursorStarted: cursorStarted).map { (thread.id, $0) }
+    })
+    let cursorRunning = cursorRows["c-run"]
+    check("a run going is a running row, doing what Cursor says under it",
+          cursorRunning?.group == .running && cursorRunning?.since == Date(timeIntervalSince1970: Double(ms(120)) / 1000)
+              && cursorRunning?.activity == "Read Makefile, build.sh" && cursorRunning?.context == "build-tools"
+              && cursorRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    check("it's Cursor's, labelled, and can't be tagged or snoozed",
+          cursorRunning?.source == .cursor && cursorRunning?.fromOtherApp == true && cursorRunning?.tags == [cursorTag]
+              && cursorRunning?.appName == "Cursor" && cursorRunning?.openLabel == "Switch to Cursor"
+              && cursorRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    check("a run waiting for approval waits on you", cursorRows["c-wait"]?.group == .yourTurn
+              && cursorRows["c-wait"]?.detail == "Waiting for your approval")
+    check("a plan ready waits on you", cursorRows["c-plan"]?.group == .yourTurn && cursorRows["c-plan"]?.detail == "Plan ready to review")
+    check("a finished thread is finished when its run ended", cursorRows["c-done"]?.group == .done
+              && cursorRows["c-done"]?.since == Date(timeIntervalSince1970: Double(ms(3000)) / 1000))
+    check("a run from before Cursor started was cut short: finished", cursorRows["c-cut"]?.group == .done)
+    check("a thread with no name and no run isn't listed", cursorRows["c-noname"] == nil)
+    check("ChatGPT's and Claude's rows say where they open",
+          Row(id: "codex:x", group: .done, title: "t", context: "", since: now).openLabel == "Open in ChatGPT"
+              && Row(id: "local_a1", group: .done, title: "t", context: "", since: now).source == .claude)
+    try? FileManager.default.removeItem(atPath: cursorDatabase)
 
     // Snooze: held until a time you pick, or until the session moves on.
     let snoozeSuite = "limbo-tasks-selftest-snooze"
@@ -8250,6 +8516,10 @@ if let path = argument(after: "--snapshot") {
 }
 if arguments.contains("--codex-bench") {
     runCodexBench()
+    exit(0)
+}
+if arguments.contains("--cursor-bench") {
+    runCursorBench()
     exit(0)
 }
 if arguments.contains("--dump") {
