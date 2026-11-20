@@ -1170,6 +1170,333 @@ func snoozeWhen(_ until: Date, now: Date, calendar: Calendar = .current) -> Stri
     return "until " + until.formatted(.dateTime.weekday(.abbreviated)) + " \(time)"
 }
 
+// MARK: - ChatGPT (Codex) threads
+
+/// Codex threads in the ChatGPT app. Its Codex server keeps each loaded
+/// thread's rollout file (~/.codex/sessions/…/rollout-…-<id>.jsonl) open;
+/// a turn's start and end are lines in it ("task_started", "task_complete",
+/// "turn_aborted"). Read only while the window or the panel shows: which
+/// files the server holds (a few system calls), then only the new lines of
+/// a file that grew. Thread names come from ~/.codex/session_index.jsonl.
+enum CodexMarker: Equatable { case started, complete, aborted }
+
+/// What a rollout file has said so far, read up to `offset` (a line end).
+struct RolloutScan: Equatable {
+    var offset: UInt64 = 0
+    var marker: CodexMarker?
+    var markerTime: Date?
+    var activity: String?       // the last step since the turn started
+    var lastWrite: Date?        // the last line's time
+}
+
+let codexTime: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+/// Reads the complete lines a rollout file gained since `scan`. The first
+/// read of a big file starts in its last 16 MB; a half-written last line is
+/// left for next time. Only each line's first bytes are looked at: the
+/// structure there ("type":"event_msg","payload":{"type":"task_started")
+/// comes before any text, so words inside a message never count.
+func scanRollout(path: String, from scan: RolloutScan) -> RolloutScan {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return scan }
+    defer { try? handle.close() }
+    guard let end = try? handle.seekToEnd() else { return scan }
+    var next = scan
+    if end < scan.offset { next = RolloutScan() }   // rewritten: start over
+    var start = next.offset
+    if start == 0 && end > 16 << 20 { start = end - (16 << 20) }
+    guard end > start else { return next }
+    guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.read(upToCount: Int(end - start)),
+          let lastNewline = data.lastIndex(of: 0x0A) else { return next }
+    let body = data[data.startIndex...lastNewline]
+    var lineStart = body.startIndex
+    // Starting mid-file: the first piece is part of a line.
+    if start > 0 && start != scan.offset, let first = body.firstIndex(of: 0x0A) { lineStart = first + 1 }
+    while lineStart < body.endIndex {
+        let lineEnd = body[lineStart...].firstIndex(of: 0x0A) ?? body.endIndex
+        readRolloutLine(body[lineStart..<lineEnd], into: &next)
+        lineStart = lineEnd + 1
+    }
+    next.offset = start + UInt64(lastNewline - data.startIndex + 1)
+    return next
+}
+
+private let eventPrefix = Array(#""type":"event_msg","payload":{"type":""#.utf8)
+private let itemPrefix = Array(#""type":"response_item","payload":{"type":""#.utf8)
+
+/// One rollout line: a turn marker, or a step that says what a running thread is doing.
+func readRolloutLine(_ line: Data, into scan: inout RolloutScan) {
+    let head = line.prefix(400)
+    guard head.starts(with: Array(#"{"timestamp":""#.utf8)) else { return }
+    let time = head.dropFirst(14).prefix(30).split(separator: UInt8(ascii: "\""), maxSplits: 1).first
+        .flatMap { codexTime.date(from: String(decoding: $0, as: UTF8.self)) }
+    if let time { scan.lastWrite = time }
+    func kind(after prefix: [UInt8]) -> String? {
+        guard let range = head.firstRange(of: prefix) else { return nil }
+        let rest = head[range.upperBound...]
+        guard let close = rest.firstIndex(of: UInt8(ascii: "\"")) else { return nil }
+        return String(decoding: rest[..<close], as: UTF8.self)
+    }
+    if let event = kind(after: eventPrefix) {
+        let marker: CodexMarker? = event == "task_started" ? .started : event == "task_complete" ? .complete
+            : event == "turn_aborted" ? .aborted : nil
+        if let marker {
+            scan.marker = marker
+            scan.markerTime = time
+            scan.activity = nil
+        }
+    } else if let item = kind(after: itemPrefix), scan.marker == .started {
+        switch item {
+        case "reasoning": scan.activity = "Thinking"
+        case "message":
+            if head.firstRange(of: Array(#""role":"assistant""#.utf8)) != nil { scan.activity = "Writing" }
+        case "web_search_call": scan.activity = "Searching the web"
+        case "function_call", "custom_tool_call":
+            let name = head.firstRange(of: Array(#""name":""#.utf8)).map { range -> String in
+                let rest = head[range.upperBound...]
+                return String(decoding: rest.prefix { $0 != UInt8(ascii: "\"") }, as: UTF8.self)
+            } ?? ""
+            scan.activity = codexToolPhrase(name)
+        default: break
+        }
+    }
+}
+
+/// "Running a command", "Editing files", … for a Codex tool call.
+func codexToolPhrase(_ name: String) -> String {
+    switch name {
+    case "exec", "exec_command", "shell", "shell_command", "local_shell": return "Running a command"
+    case "apply_patch": return "Editing files"
+    case "wait", "write_stdin": return "Waiting on a command"
+    case "update_plan": return "Planning"
+    case "view_image": return "Looking at an image"
+    default: return "Using a tool"
+    }
+}
+
+/// The first line of a rollout: the thread's id, its folder, and who started
+/// it (thread_source). Read from its first 16 KB, which come before the long
+/// instructions it carries.
+func rolloutHeader(path: String) -> (id: String?, cwd: String?, source: String?) {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, nil, nil) }
+    defer { try? handle.close() }
+    guard let data = try? handle.read(upToCount: 16 << 10) else { return (nil, nil, nil) }
+    let head = data.prefix { $0 != 0x0A }
+    func value(_ key: String) -> String? {
+        guard let range = head.firstRange(of: Array("\"\(key)\":\"".utf8)) else { return nil }
+        var bytes: [UInt8] = [UInt8(ascii: "\"")]
+        var escaped = false
+        for byte in head[range.upperBound...] {
+            bytes.append(byte)
+            if escaped { escaped = false } else if byte == UInt8(ascii: "\\") { escaped = true }
+            else if byte == UInt8(ascii: "\"") { break }
+        }
+        return (try? JSONSerialization.jsonObject(with: Data(bytes), options: .fragmentsAllowed)) as? String
+    }
+    return (value("id"), value("cwd"), value("thread_source"))
+}
+
+/// Threads you started (not Codex's own agents, reviewers or voice sessions).
+func codexThreadShown(source: String?) -> Bool {
+    guard let source else { return true }
+    return !["subagent", "guardian_review", "realtime_voice"].contains(source)
+}
+
+/// The thread id in a rollout file's name, right after its start time:
+/// rollout-2026-10-14T10-02-20-<id>.jsonl. A long thread's file can carry a
+/// second id after it (<id>_<other>.jsonl), so it's the first, not the last.
+func codexThreadId(path: String) -> String? {
+    let name = (path as NSString).lastPathComponent
+    let start = "rollout-2026-10-14T10-02-20-".count
+    guard name.hasPrefix("rollout-"), name.hasSuffix(".jsonl"), name.count >= start + 36 + 6 else { return nil }
+    let id = String(name.dropFirst(start).prefix(36))
+    return id.allSatisfy { isASCIIAlnum($0) || $0 == "-" } ? id : nil
+}
+
+/// A Codex thread as a row: running, or finished (stopped) with when.
+func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row? {
+    guard let marker = scan.marker, let since = scan.markerTime else { return nil }
+    let title = name.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+        ?? "Codex thread"
+    let context = cwd.map(folderLabel) ?? "ChatGPT"
+    let link = "codex://threads/\(id)"
+    switch marker {
+    case .started:
+        // Written at most once a minute, as Claude's are: the quiet check needs no more.
+        let written = scan.lastWrite.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
+        return Row(id: "codex:\(id)", group: .running, title: title, context: context, since: since, link: link,
+                   activity: scan.activity, lastOutput: written, tags: [codexTag])
+    case .complete, .aborted:
+        return Row(id: "codex:\(id)", group: .done, title: title, detail: marker == .aborted ? "Stopped" : nil,
+                   context: context, since: since, link: link, tags: [codexTag])
+    }
+}
+
+/// The label on ChatGPT's threads.
+let codexTag = "ChatGPT"
+
+extension Row {
+    /// A thread in the ChatGPT app (Codex), not a Claude session.
+    var isCodex: Bool { id.hasPrefix("codex:") }
+
+    /// Where a click opens it: Claude, or the ChatGPT app.
+    var openURL: URL? {
+        guard let link else { return nil }
+        if isSessionId(link) { return URL(string: "claude://claude.ai/epitaxy/\(link)") }
+        if link.hasPrefix("codex://threads/") { return URL(string: link) }
+        return nil
+    }
+
+    /// "Claude" or "ChatGPT", for tooltips.
+    var appName: String { isCodex ? "ChatGPT" : "Claude" }
+}
+
+/// Reads the ChatGPT app's Codex threads, on the engine's queue, every two
+/// seconds while a panel shows. Each tick: is the app's Codex server still
+/// there (one call), which rollout files it holds (one call per open file),
+/// and a stat of each; a file is read only when it grew, from where the
+/// last read stopped. It looks for ChatGPT's servers every 10 s while it
+/// knows none, and every 30 s otherwise.
+final class CodexWatcher {
+    private let queue: DispatchQueue
+    private var timer: DispatchSourceTimer?
+    private var servers: [pid_t] = []
+    private var lookedForServers = Date.distantPast
+    private var scans: [String: RolloutScan] = [:]
+    private var headers: [String: (id: String?, cwd: String?, source: String?)] = [:]
+    private var names: [String: String] = [:]
+    private var namesStamp: FileStamp?
+    private(set) var rows: [Row] = []
+    /// Called on the queue when the rows changed.
+    var onChange: (() -> Void)?
+
+    init(queue: DispatchQueue) { self.queue = queue }
+
+    static let indexPath = Paths.home.appendingPathComponent(".codex/session_index.jsonl").path
+
+    func start() {
+        guard timer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
+        t.setEventHandler { [weak self] in
+            guard let self, self.refresh() else { return }
+            self.onChange?()
+        }
+        t.resume()
+        timer = t
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+        if !rows.isEmpty {
+            rows = []
+            onChange?()
+        }
+    }
+
+    /// Reads once; true if the rows changed.
+    @discardableResult
+    func refresh() -> Bool {
+        let now = Date()
+        servers = servers.filter { kill($0, 0) == 0 }
+        // Every 10 s while none is known, and every 30 s anyway: ChatGPT can
+        // start a new server (after an update) while an old helper lives on.
+        if now.timeIntervalSince(lookedForServers) >= (servers.isEmpty ? 10 : 30) {
+            lookedForServers = now
+            servers = Self.findServers()
+        }
+        var held = Set<String>()
+        for pid in servers { held.formUnion(Self.heldRollouts(pid)) }
+        for path in scans.keys where !held.contains(path) {
+            scans[path] = nil
+            headers[path] = nil
+        }
+        if !held.isEmpty { loadNames() }
+        var fresh: [Row] = []
+        for path in held {
+            let header = headers[path] ?? rolloutHeader(path: path)
+            headers[path] = header
+            // The id inside the file is the thread's; the name is the fallback.
+            guard let id = header.id ?? codexThreadId(path: path), codexThreadShown(source: header.source)
+            else { continue }
+            let before = scans[path] ?? RolloutScan()
+            let size = fileStamp(path)?.size ?? 0
+            let scan = UInt64(size) == before.offset ? before : scanRollout(path: path, from: before)
+            scans[path] = scan
+            if let row = codexRow(id: id, name: names[id], cwd: header.cwd, scan: scan) { fresh.append(row) }
+        }
+        fresh = rowsInOrder(fresh)
+        guard fresh != rows else { return false }
+        rows = fresh
+        return true
+    }
+
+    /// The ChatGPT app's Codex servers: `codex` processes whose parent is the
+    /// app (com.openai.codex, named ChatGPT). Looks at every process's path,
+    /// so only when none is known, at most every 10 s.
+    static func findServers() -> [pid_t] {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
+        guard count > 0 else { return [] }
+        func path(_ pid: pid_t) -> String {
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            return proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
+        }
+        var found: [pid_t] = []
+        for pid in pids.prefix(min(count, pids.count)) where pid > 0 {
+            let exe = path(pid)
+            guard exe.hasSuffix("/MacOS/codex"), exe.contains(".app/Contents/") else { continue }
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { continue }
+            if path(pid_t(info.pbi_ppid)).hasSuffix(".app/Contents/MacOS/ChatGPT") { found.append(pid) }
+        }
+        return found
+    }
+
+    /// The rollout files a process holds open.
+    static func heldRollouts(_ pid: pid_t) -> Set<String> {
+        let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard bytes > 0 else { return [] }
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride)
+        let got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, bytes)
+        guard got > 0 else { return [] }
+        var paths = Set<String>()
+        for fd in fds.prefix(Int(got) / MemoryLayout<proc_fdinfo>.stride) where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
+            var info = vnode_fdinfowithpath()
+            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+            guard proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size) == size else { continue }
+            let path = withUnsafeBytes(of: &info.pvip.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            if path.contains("/.codex/sessions/"), path.hasSuffix(".jsonl") { paths.insert(path) }
+        }
+        return paths
+    }
+
+    /// Thread names: the last name each id got in session_index.jsonl. Read
+    /// again only when the file changes.
+    private func loadNames() {
+        let stamp = fileStamp(Self.indexPath)
+        guard stamp != namesStamp else { return }
+        namesStamp = stamp
+        names = codexNames(index: (try? String(contentsOfFile: Self.indexPath, encoding: .utf8)) ?? "")
+    }
+}
+
+/// The last name each thread id got, from session_index.jsonl's lines.
+func codexNames(index: String) -> [String: String] {
+    var names: [String: String] = [:]
+    for line in index.split(separator: "\n") {
+        guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let id = object["id"] as? String, let name = object["thread_name"] as? String else { continue }
+        names[id] = name
+    }
+    return names
+}
+
 // MARK: - Engine
 
 /// Owns all file access, on one low-priority serial queue.
@@ -1205,6 +1532,12 @@ final class SessionEngine {
     /// A record is written about 2 s after its transcript ends, which triggers a
     /// look; this also looks every 30 s in case a transcript ends later.
     private var cardCheck: DispatchSourceTimer?
+    /// The ChatGPT app's Codex threads, read only while a panel shows.
+    private lazy var codex: CodexWatcher = {
+        let watcher = CodexWatcher(queue: queue)
+        watcher.onChange = { [weak self] in self?.publishIfChanged() }
+        return watcher
+    }()
 
     func start() {
         queue.async {
@@ -1236,8 +1569,10 @@ final class SessionEngine {
                 }
             }
             engine.activityWanted = true
-            return classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
-                            activities: activities, cards: engine.currentCards(), background: engine.backgroundWork())
+            engine.codex.refresh()
+            return rowsInOrder(classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
+                                        activities: activities, cards: engine.currentCards(),
+                                        background: engine.backgroundWork()) + engine.codex.rows)
         }
     }
 
@@ -1278,6 +1613,9 @@ final class SessionEngine {
                 timer.setEventHandler { [weak self] in self?.publishIfChanged() }
                 timer.resume()
                 self.cardCheck = timer
+                self.codex.start()
+            } else {
+                self.codex.stop()
             }
             self.syncActivityWatchers()
             self.publishIfChanged()
@@ -1415,8 +1753,9 @@ final class SessionEngine {
     }
 
     private func publishIfChanged() {
-        let rows = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
-                            cards: currentCards(), background: backgroundWork())
+        let claude = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
+                              cards: currentCards(), background: backgroundWork())
+        let rows = codex.rows.isEmpty ? claude : rowsInOrder(claude + codex.rows)
         guard rows != lastRows else { return }
         lastRows = rows
         let archived = Set(desk.values.compactMap { $0.record?.isArchived == true ? $0.record?.sessionId : nil })
@@ -2221,7 +2560,7 @@ struct TagPill: View {
     /// Grey for On hold, purple for Awaiting manual review, and one of a few
     /// colours kept clear of the states' amber, blue and green for your own.
     static func color(_ tag: String) -> Color {
-        if tag == SessionTags.onHold { return .secondary }
+        if tag == SessionTags.onHold || tag == codexTag { return .secondary }
         if tag == SessionTags.awaitingReview { return Color(nsColor: .systemPurple) }
         let palette: [NSColor] = [.systemTeal, .systemPink, .systemIndigo, .systemBrown, .systemPurple]
         let index = tag.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xffff } % palette.count
@@ -2413,7 +2752,7 @@ struct SessionRow: View {
     private var tooltip: String {
         var parts = [row.title]
         if let line = secondLine { parts.append(line) }
-        parts.append(canOpen ? "Click to open in Claude" : "Started in a terminal, so it can't be opened from here")
+        parts.append(canOpen ? "Click to open in \(row.appName)" : "Started in a terminal, so it can't be opened from here")
         return parts.joined(separator: "\n\n")
     }
 
@@ -2806,8 +3145,7 @@ final class PanelController: NSObject, NSPopoverDelegate {
     }
 
     private func open(_ row: Row) {
-        guard let id = row.link, isSessionId(id),
-              let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
+        guard let url = row.openURL else { return }
         popover?.performClose(nil)
         model.markOpened(row)
         NSWorkspace.shared.open(url)
@@ -5861,8 +6199,7 @@ final class FloatingController {
     private func makePanel() -> KeepOnTopPanel {
         let view = FloatingView(model: model,
                                 open: { [weak self] row in
-                                    guard let id = row.link, isSessionId(id),
-                                          let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
+                                    guard let url = row.openURL else { return }
                                     self?.model.markOpened(row)
                                     NSWorkspace.shared.open(url)
                                 },
@@ -6718,7 +7055,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem() {
         let now = Date()
-        let board = Board(rows: model.rows, now: now)
+        // Claude's sessions only: ChatGPT's threads are read only while a panel shows.
+        let board = Board(rows: model.rows.filter { !$0.isCodex }, now: now)
         let counts = (board.yourTurn.count, board.running.count)
         if shownCounts.map({ $0 != counts }) ?? true {
             shownCounts = counts
@@ -6794,6 +7132,9 @@ func sampleRows(now: Date) -> [Row] {
         Row(id: "local_s4", group: .running, title: "Audit traffic before the old site is shut down",
             context: "Documents", since: minutesAgo(12), link: "local_s4",
             activity: "Scanning the app logs for scope errors"),
+        Row(id: "codex:sample1", group: .running, title: "Refactor the payments client", context: "payments",
+            since: minutesAgo(3), link: "codex://threads/sample1", activity: "Running a command",
+            lastOutput: minutesAgo(0), tags: [codexTag]),
         Row(id: "pid:5", group: .running, title: "data-pipeline", context: "data-pipeline",
             since: minutesAgo(31), terminal: true, activity: "Running the nightly export",
             lastOutput: minutesAgo(14)),
@@ -6945,6 +7286,23 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
 }
 
 /// Group and title per row, plus counts. No asks or summaries.
+/// --codex-bench: what reading ChatGPT's threads costs, on this Mac's real
+/// threads: the first read, then a tick with nothing new.
+func runCodexBench() {
+    let watcher = CodexWatcher(queue: DispatchQueue(label: "bench"))
+    let clock = ContinuousClock()
+    let first = clock.measure { watcher.refresh() }
+    let ticks = 200
+    let rest = clock.measure { for _ in 0..<ticks { watcher.refresh() } }
+    func ms(_ d: Duration) -> Double { Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15 }
+    let look = clock.measure { _ = CodexWatcher.findServers() }
+    print(String(format: "threads open in ChatGPT: %d", watcher.rows.count))
+    print(String(format: "looking for ChatGPT's server (every 30 s): %.1f ms", ms(look)))
+    print(String(format: "first read (finds the server, reads each thread's file): %.1f ms", ms(first)))
+    print(String(format: "a tick with nothing new: %.3f ms (%.4f%% of one core at one tick every 2 s)",
+                 ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
+}
+
 func runDump() {
     let now = Date()
     let board = Board(rows: SessionEngine.scanOnce(), now: now)
@@ -6956,7 +7314,7 @@ func runDump() {
     for (name, rows) in groups {
         for r in rows {
             print("\(name)\t\(String(format: "%.1f", now.timeIntervalSince(r.since) / 3600))h\t\(r.title)"
-                  + (r.activity.map { "\t[\($0)]" } ?? ""))
+                  + (r.activity.map { "\t[\($0)]" } ?? "") + (r.isCodex ? "\t(ChatGPT)" : ""))
         }
     }
     print("counts: " + groups.map { "\($0.0)=\($0.1.count)" }.joined(separator: " "))
@@ -7361,6 +7719,79 @@ func runSelfTest() {
     check("shrinking on the left keeps the left edge",
           anchoredFrame(NSRect(x: 40, y: 600, width: 320, height: 200), size: NSSize(width: 150, height: 32),
                         screen: screenFrame) == NSRect(x: 40, y: 768, width: 150, height: 32))
+
+    // ChatGPT (Codex) threads: a turn's start and end lines in its rollout file.
+    let codexDir = NSTemporaryDirectory() + "limbo-codex-\(getpid())/.codex/sessions/2026/11/19"
+    try? FileManager.default.createDirectory(atPath: codexDir, withIntermediateDirectories: true)
+    let threadId = "01a1f000-0000-7000-8000-000000000001"
+    let rollout = codexDir + "/rollout-2026-11-19T08-00-00-\(threadId).jsonl"
+    func codexLine(_ time: String, _ type: String, _ payload: String) -> String {
+        #"{"timestamp":"2026-11-19T\#(time)Z","ordinal":7,"type":"\#(type)","payload":{"type":\#(payload)}}"# + "\n"
+    }
+    let header = #"{"timestamp":"2026-11-19T02:30:00.000Z","type":"session_meta","payload":{"id":"\#(threadId)","cwd":"\/tmp\/web-app","originator":"Codex Desktop","thread_source":"user","base_instructions":{"text":"long"}}}"# + "\n"
+    let started = codexLine("02:30:01.000", "event_msg", #""task_started","turn_id":"t1""#)
+    let thinking = codexLine("02:30:02.000", "response_item", #""reasoning","summary":[]"#)
+    let command = codexLine("02:30:03.000", "response_item", #""custom_tool_call","status":"completed","call_id":"c1","name":"exec","input":"ls""#)
+    // A reply that quotes a turn's end line: words inside a message never count.
+    let quoting = codexLine("02:31:00.000", "response_item",
+                            #""message","role":"assistant","content":[{"type":"output_text","text":"see {\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}"}]"#)
+    try? (header + started + thinking + command).write(toFile: rollout, atomically: true, encoding: .utf8)
+    var scan = scanRollout(path: rollout, from: RolloutScan())
+    check("a turn started and not ended is running, doing what its last step did",
+          scan.marker == .started && scan.activity == "Running a command"
+              && scan.markerTime == codexTime.date(from: "2026-11-19T02:30:01.000Z"))
+    func append(_ text: String) {
+        if let handle = FileHandle(forWritingAtPath: rollout) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        }
+    }
+    append(quoting)
+    scan = scanRollout(path: rollout, from: scan)
+    check("a reply quoting an end line doesn't end the turn", scan.marker == .started && scan.activity == "Writing")
+    let turnEnd = codexLine("02:32:00.000", "event_msg", #""task_complete","turn_id":"t1","last_agent_message":"done""#)
+    append(String(turnEnd.dropLast(10)))
+    let partly = scanRollout(path: rollout, from: scan)
+    check("a half-written last line waits", partly.marker == .started && partly.offset == scan.offset)
+    append(String(turnEnd.suffix(10)))
+    scan = scanRollout(path: rollout, from: partly)
+    check("the turn's end line ends it", scan.marker == .complete
+              && scan.markerTime == codexTime.date(from: "2026-11-19T02:32:00.000Z"))
+    check("read from where it stopped: a fresh read agrees", scanRollout(path: rollout, from: RolloutScan()) == scan)
+    let head = rolloutHeader(path: rollout)
+    check("the first line gives the thread, its folder and who started it",
+          head.id == threadId && head.cwd == "/tmp/web-app" && head.source == "user")
+    check("Codex's own agents and reviewers are left out",
+          codexThreadShown(source: "user") && codexThreadShown(source: nil) && !codexThreadShown(source: "subagent")
+              && !codexThreadShown(source: "guardian_review"))
+    check("the thread id comes from the file name", codexThreadId(path: rollout) == threadId)
+    check("a long thread's file with a second id still gives the first",
+          codexThreadId(path: codexDir + "/rollout-2026-10-14T10-02-20-\(threadId)_01a1f000-0000-7000-8000-000000000002.jsonl")
+              == threadId)
+    check("a thread's name is the last one it got",
+          codexNames(index: #"{"id":"a","thread_name":"First","updated_at":"x"}"# + "\n"
+                     + #"{"id":"a","thread_name":"Renamed","updated_at":"y"}"#) == ["a": "Renamed"])
+    let finishedRow = codexRow(id: threadId, name: "Fix the export", cwd: head.cwd, scan: scan)
+    check("a finished thread is a finished row that opens in ChatGPT",
+          finishedRow?.group == .done && finishedRow?.isCodex == true && finishedRow?.tags == [codexTag]
+              && finishedRow?.openURL?.absoluteString == "codex://threads/\(threadId)" && finishedRow?.context == "web-app")
+    check("it can't be tagged or snoozed", finishedRow.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    append(codexLine("02:33:00.000", "event_msg", #""task_started","turn_id":"t2""#)
+           + codexLine("02:33:40.000", "event_msg", #""turn_aborted","turn_id":"t2""#))
+    scan = scanRollout(path: rollout, from: scan)
+    check("a stopped turn is finished, marked Stopped",
+          codexRow(id: threadId, name: nil, cwd: nil, scan: scan).map { $0.group == .done && $0.detail == "Stopped"
+              && $0.title == "Codex thread" } == true)
+    var runningScan = scan
+    runningScan.marker = .started
+    runningScan.lastWrite = codexTime.date(from: "2026-11-19T02:33:41.500Z")
+    check("a running thread's last write is kept to the minute",
+          codexRow(id: threadId, name: "x", cwd: nil, scan: runningScan)?.lastOutput == codexTime.date(from: "2026-11-19T02:33:00.000Z"))
+    check("a Claude session still opens in Claude",
+          Row(id: "local_a1", group: .done, title: "t", context: "", since: now, link: "local_a1").openURL?.absoluteString
+              == "claude://claude.ai/epitaxy/local_a1")
+    try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "limbo-codex-\(getpid())")
 
     // Snooze: held until a time you pick, or until the session moves on.
     let snoozeSuite = "limbo-tasks-selftest-snooze"
@@ -7815,6 +8246,10 @@ if let seconds = argument(after: "--glow-cycle").flatMap(Int.init) {
 if let path = argument(after: "--snapshot") {
     writeSnapshot(to: path, dark: arguments.contains("--dark"), sample: arguments.contains("--sample"),
                   expand: arguments.contains("--expand"), limit: argument(after: "--rows").flatMap(Int.init))
+    exit(0)
+}
+if arguments.contains("--codex-bench") {
+    runCodexBench()
     exit(0)
 }
 if arguments.contains("--dump") {

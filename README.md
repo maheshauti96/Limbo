@@ -105,6 +105,7 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 | **Waiting on you cards** | A session's question and the buttons from Claude's next-step box, with its latest reply one click away. |
 | **Answer from Cards** | Click a card's button and Limbo presses it in Claude for you, then puts your screens back. |
 | **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
+| **ChatGPT threads** | Codex threads in the ChatGPT app, running or just finished, beside Claude's sessions. |
 | **Snooze** | Put a session away for an hour, three hours or until tomorrow morning; it comes back by itself. |
 | **Glows** | A calm rim while sessions run, amber when one needs you, green when everything finishes. |
 | **Layouts** | List, Strip, Bar, Dots, Columns or Pill; the strip can take over while an app is full screen. |
@@ -168,6 +169,15 @@ Right-click any session (in the window, the panel or on a card) to tag it: **On 
 </table>
 
 Tags stay until you remove them or archive the session in Claude. They live in Limbo's own settings, so they show only in Limbo; sessions started in a terminal can't be tagged. Typing a new tag opens a small box by the pointer, the one time Limbo takes the keyboard, and the app you were in gets it back on Return or Esc.
+
+#### ChatGPT threads
+
+Codex threads open in the ChatGPT app show beside Claude's sessions, with a grey **ChatGPT** label: running ones with what they're doing ("Thinking", "Running a command", "Editing files"), and finished ones once their turn ends ("Stopped" when you stopped it). Click one to open it in ChatGPT.
+
+- They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
+- Only threads you started: Codex's own agents, reviewers and voice sessions are left out. Ordinary ChatGPT chats aren't on disk in a readable form, so they can't show.
+- A thread waiting for your approval shows as running: Codex doesn't write that down, the same as Claude's mid-turn permission prompts.
+- They can't be tagged or snoozed.
 
 #### Snooze
 
@@ -237,7 +247,8 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 - The last 256 KB of each recent session's transcript (`~/.claude/projects/<folder>/<id>.jsonl`), only while the panel or the window is showing: what a running session is doing now, how its latest turn ended (the next-step box's question and buttons) and its latest reply. Re-read at most once a second while a session runs, and otherwise only when that transcript changes.
 - Background tasks: the session's own child shells (via `libproc`). A Bash command left running holds a file ending `.output` under `<session>/tasks/` open; a monitor streams to Claude instead, so it counts as a shell Claude started (its command sources one of Claude's `~/.claude/shell-snapshots/`) that holds no such file. File names, and whether a shell's command has that marker; never file contents, and nothing else of the command.
 - A running session that has written nothing for 10 minutes (its transcript, its agents' transcripts under `<session>/subagents`, its workflow files under `<session>/workflows`) gets the hourglass and "No output for 12 min": it may be stuck, or in one long command.
-- It never opens the `*.key` files, and never changes Claude's files.
+- ChatGPT's Codex threads, only while the panel or the window is showing: which rollout files (`~/.codex/sessions/…/rollout-…-<id>.jsonl`) the ChatGPT app's Codex server holds open (via `libproc`, every 2 s), the first 16 KB of each once (its folder, and whether you started it), then only the lines it gains, checking the start of each for a turn starting or ending and the kind of step. Names come from `~/.codex/session_index.jsonl`, read again only when it changes. It looks for ChatGPT's Codex server every 10 s while none is running, and every 30 s otherwise. On this Mac a check with nothing new takes under 0.1 ms, looking for the server about 2 ms, and the first read of two open threads about 110 ms (`--codex-bench`).
+- It never opens the `*.key` files, and never changes Claude's or ChatGPT's files.
 
 Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`, snoozes under `sessionSnoozes`.
 
@@ -277,8 +288,9 @@ limbo-tasks --snapshot out.png --floating --response local_s7 [--live] [-tagStyl
 limbo-tasks --glow-cycle 16                         # Random in an offscreen window: effect each second, then CPU used
 limbo-tasks --gesture-check                         # chips, cards, replies, snooze, the New Tag box, close, pill, layouts (off screen)
 limbo-tasks --resize-check                          # dragging the edges, and never becoming the front app
-limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks
+limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks, ChatGPT threads
 limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
+limbo-tasks --codex-bench                           # what reading ChatGPT's threads costs, on this Mac's open threads
 kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json,
                                                     # a picture of the menu bar button -> ...limbo-tasks.menubar.png,
                                                     # and the glow's state (effect, active, animating, size) -> ...limbo-tasks.glow.json
