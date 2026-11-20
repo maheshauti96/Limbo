@@ -171,9 +171,13 @@ Right-click any session (in the window, the panel or on a card) to tag it: **On 
 
 Tags stay until you remove them or archive the session in Claude. They live in Limbo's own settings, so they show only in Limbo; sessions started in a terminal can't be tagged. Typing a new tag opens a small box by the pointer, the one time Limbo takes the keyboard, and the app you were in gets it back on Return or Esc.
 
+#### Which app
+
+Every row starts with the icon of the app its session or thread is in (Claude, ChatGPT or Cursor), with its state on the icon's bottom-right corner, cut out of the icon: the turning blue ring while it runs, a still amber ring once it has written nothing for 10 minutes, the amber "!" when it needs you, a blue dot for review, a green tick when it's done, and a moon or pause sign, with the icon faded, when it's snoozed or on hold. The icons are the installed apps' own, read from macOS (no app's logo is kept in this repo); if an app isn't installed, its rows show the state mark alone. VoiceOver says which app ("…, in Cursor").
+
 #### ChatGPT threads
 
-Codex threads open in the ChatGPT app show beside Claude's sessions, with a grey **ChatGPT** label: running ones with what they're doing ("Thinking", "Running a command", "Editing files"), and finished ones once their turn ends ("Stopped" when you stopped it). Click one to open it in ChatGPT.
+Codex threads open in the ChatGPT app show beside Claude's sessions, led by ChatGPT's icon: running ones with what they're doing ("Thinking", "Running a command", "Editing files"), and finished ones once their turn ends ("Stopped" when you stopped it). Click one to open it in ChatGPT.
 
 - They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
 - Only threads you started: Codex's own agents, reviewers and voice sessions are left out. Ordinary ChatGPT chats aren't on disk in a readable form, so they can't show.
@@ -182,7 +186,7 @@ Codex threads open in the ChatGPT app show beside Claude's sessions, with a grey
 
 #### Cursor threads
 
-Cursor's agent threads from the last week show with a grey **Cursor** label while Cursor is running: running ones with what Cursor says under them in its own list ("Read Makefile, build.sh", "Edited settings.ts"), ones waiting on you ("Waiting for your approval", "Plan ready to review"), and finished ones from when their run ended. Click one to switch to Cursor: Cursor has no link to one of its own threads (its agent link finds only cloud agents), so it opens wherever you left it.
+Cursor's agent threads from the last week show, led by Cursor's icon, while Cursor is running: running ones with what Cursor says under them in its own list ("Read Makefile, build.sh", "Edited settings.ts"), ones waiting on you ("Waiting for your approval", "Plan ready to review"), and finished ones from when their run ended. Click one to switch to Cursor: Cursor has no link to one of its own threads (its agent link finds only cloud agents), so it opens wherever you left it.
 
 - They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
 - Archived threads, subagents' threads and unsent drafts are left out.

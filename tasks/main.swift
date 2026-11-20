@@ -1329,15 +1329,12 @@ func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row
         // Written at most once a minute, as Claude's are: the quiet check needs no more.
         let written = scan.lastWrite.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
         return Row(id: "codex:\(id)", group: .running, title: title, context: context, since: since, link: link,
-                   activity: scan.activity, lastOutput: written, tags: [codexTag])
+                   activity: scan.activity, lastOutput: written)
     case .complete, .aborted:
         return Row(id: "codex:\(id)", group: .done, title: title, detail: marker == .aborted ? "Stopped" : nil,
-                   context: context, since: since, link: link, tags: [codexTag])
+                   context: context, since: since, link: link)
     }
 }
-
-/// The label on ChatGPT's threads.
-let codexTag = "ChatGPT"
 
 /// The app a row's session or thread is in.
 enum RowSource { case claude, chatGPT, cursor }
@@ -1375,6 +1372,33 @@ extension Row {
 
     /// What a click does, for menus: "Open in Claude", or "Switch to Cursor".
     var openLabel: String { source == .cursor ? "Switch to Cursor" : "Open in \(appName)" }
+
+    /// ", in ChatGPT" or ", in Cursor" for VoiceOver, which can't see the icon;
+    /// nothing for Claude's own sessions.
+    var spokenApp: String { fromOtherApp ? ", in \(appName)" : "" }
+}
+
+extension RowSource {
+    /// The app's bundle id: where its icon comes from.
+    var bundleId: String {
+        switch self {
+        case .claude: return "com.anthropic.claudefordesktop"
+        case .chatGPT: return "com.openai.codex"
+        case .cursor: return cursorBundleId
+        }
+    }
+}
+
+/// Each app's icon as macOS shows it, looked up once per app. nil when the
+/// app isn't installed: its rows then show the state mark alone, as before.
+/// Read from the installed app, so no app's logo is kept in this repo.
+private var appIcons: [RowSource: NSImage?] = [:]
+func appIcon(_ source: RowSource) -> NSImage? {
+    if let known = appIcons[source] { return known }
+    let icon = NSWorkspace.shared.urlForApplication(withBundleIdentifier: source.bundleId)
+        .map { NSWorkspace.shared.icon(forFile: $0.path) }
+    appIcons[source] = icon
+    return icon
 }
 
 /// A process's executable path, or "" if it's gone.
@@ -1445,25 +1469,41 @@ final class CodexWatcher {
         return true
     }
 
-    /// The ChatGPT app's Codex servers: `codex` processes whose parent is the
-    /// app (com.openai.codex, named ChatGPT). Looks at every process's path,
-    /// so only when none is known, at most every 10 s.
+    /// The ChatGPT app's Codex servers: `codex` processes started by the app
+    /// (com.openai.codex, named ChatGPT), directly or through one of its
+    /// helpers: since November 2026 the server that holds the threads is
+    /// started by "Codex (Aperitif)" inside the app, so it's the app's
+    /// grandchild. Looks at every process's path, so only when none is known,
+    /// at most every 10 s, and every 30 s otherwise.
     static func findServers() -> [pid_t] {
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
         guard count > 0 else { return [] }
-        let path = executablePath
         var found: [pid_t] = []
         for pid in pids.prefix(min(count, pids.count)) where pid > 0 {
-            let exe = path(pid)
+            let exe = executablePath(pid)
             guard exe.hasSuffix("/MacOS/codex"), exe.contains(".app/Contents/") else { continue }
-            var info = proc_bsdinfo()
-            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { continue }
-            if path(pid_t(info.pbi_ppid)).hasSuffix(".app/Contents/MacOS/ChatGPT") { found.append(pid) }
+            if startedByChatGPT(pid) { found.append(pid) }
         }
         return found
     }
+
+    /// Whether the ChatGPT app is among a process's parent, grandparent or
+    /// great-grandparent.
+    static func startedByChatGPT(_ pid: pid_t) -> Bool {
+        var current = pid
+        for _ in 0..<3 {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(current, PROC_PIDTBSDINFO, 0, &info, size) == size, info.pbi_ppid > 1 else { return false }
+            current = pid_t(info.pbi_ppid)
+            if isChatGPTApp(executablePath(current)) { return true }
+        }
+        return false
+    }
+
+    /// The ChatGPT app's own executable, wherever the app is.
+    static func isChatGPTApp(_ path: String) -> Bool { path.hasSuffix(".app/Contents/MacOS/ChatGPT") }
 
     /// The rollout files a process holds open.
     static func heldRollouts(_ pid: pid_t) -> Set<String> {
@@ -1509,9 +1549,6 @@ func codexNames(index: String) -> [String: String] {
 /// Cursor's bundle id: a click on one of its threads brings it forward.
 let cursorBundleId = "com.todesktop.230313mzl4w4u92"
 
-/// The label on Cursor's threads.
-let cursorTag = "Cursor"
-
 /// A Cursor thread's link: not openable as is (see Row.openURL).
 let cursorLinkPrefix = "cursor-thread:"
 
@@ -1545,20 +1582,20 @@ func cursorRow(_ thread: CursorThread, cursorStarted: Date?) -> Row? {
     if let runStart {
         if thread.needsApproval {
             return Row(id: id, group: .yourTurn, title: title, detail: "Waiting for your approval", context: context,
-                       since: thread.checkpoint ?? runStart, link: link, tags: [cursorTag])
+                       since: thread.checkpoint ?? runStart, link: link)
         }
         let activity = thread.subtitle?.split(whereSeparator: \.isNewline).first
             .map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
         // Whole minutes, as Claude's and ChatGPT's: the quiet check needs no more.
         let written = thread.checkpoint.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
         return Row(id: id, group: .running, title: title, context: context, since: runStart, link: link,
-                   activity: activity, lastOutput: written, tags: [cursorTag])
+                   activity: activity, lastOutput: written)
     }
     if thread.planReady {
         return Row(id: id, group: .yourTurn, title: title, detail: "Plan ready to review", context: context,
-                   since: ended, link: link, tags: [cursorTag])
+                   since: ended, link: link)
     }
-    return Row(id: id, group: .done, title: title, context: context, since: ended, link: link, tags: [cursorTag])
+    return Row(id: id, group: .done, title: title, context: context, since: ended, link: link)
 }
 
 /// Cursor's recent threads, newest first: not archived, not a subagent's,
@@ -2352,23 +2389,28 @@ var staticIndicators = false
 final class SpinnerView: NSView {
     private let track = CAShapeLayer()
     private let arc = CAShapeLayer()
+    private let size: CGFloat
     var color: NSColor = .systemBlue {
         didSet { if color != oldValue { applyColors() } }
     }
 
-    override init(frame: NSRect) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
+    /// A ring of `ring` points across, `lineWidth` thick, centred in a square
+    /// of `size`: 16, 11 and 2 for a row's mark; smaller on an app's icon.
+    init(size: CGFloat = 16, ring: CGFloat = 11, lineWidth: CGFloat = 2) {
+        self.size = size
+        super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
         wantsLayer = true
         // Set up as is, or the arc animates in from a full ring.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
-        let ring = CGPath(ellipseIn: CGRect(x: 2.5, y: 2.5, width: 11, height: 11), transform: nil)
+        let inset = (size - ring) / 2
+        let path = CGPath(ellipseIn: CGRect(x: inset, y: inset, width: ring, height: ring), transform: nil)
         for shape in [track, arc] {
-            shape.frame = CGRect(x: 0, y: 0, width: 16, height: 16)
-            shape.path = ring
+            shape.frame = CGRect(x: 0, y: 0, width: size, height: size)
+            shape.path = path
             shape.fillColor = nil
-            shape.lineWidth = 2
+            shape.lineWidth = lineWidth
             shape.lineCap = .round
             layer?.addSublayer(shape)
         }
@@ -2378,7 +2420,7 @@ final class SpinnerView: NSView {
 
     required init?(coder: NSCoder) { nil }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 16, height: 16) }
+    override var intrinsicContentSize: NSSize { NSSize(width: size, height: size) }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }   // clicks go to the row
 
@@ -2428,7 +2470,10 @@ final class SpinnerView: NSView {
 
 struct RunningSpinner: NSViewRepresentable {
     let color: Color
-    func makeNSView(context: Context) -> SpinnerView { SpinnerView(frame: .zero) }
+    var size: CGFloat = 16
+    var ring: CGFloat = 11
+    var lineWidth: CGFloat = 2
+    func makeNSView(context: Context) -> SpinnerView { SpinnerView(size: size, ring: ring, lineWidth: lineWidth) }
     func updateNSView(_ view: SpinnerView, context: Context) {
         view.color = NSColor(color)
         view.updateAnimation()
@@ -2745,7 +2790,7 @@ struct TagPill: View {
     /// Grey for On hold, purple for Awaiting manual review, and one of a few
     /// colours kept clear of the states' amber, blue and green for your own.
     static func color(_ tag: String) -> Color {
-        if tag == SessionTags.onHold || tag == codexTag || tag == cursorTag { return .secondary }
+        if tag == SessionTags.onHold { return .secondary }
         if tag == SessionTags.awaitingReview { return Color(nsColor: .systemPurple) }
         let palette: [NSColor] = [.systemTeal, .systemPink, .systemIndigo, .systemBrown, .systemPurple]
         let index = tag.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0xffff } % palette.count
@@ -2842,12 +2887,31 @@ struct Indicator: View {
     var quiet = false
     var held = false
     var snoozed = false
+    /// The app the session is in: its icon leads, with the state on the
+    /// icon's bottom-right corner. nil, or the app not installed: the state
+    /// mark alone.
+    var source: RowSource? = nil
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.highContrast) private var forcedContrast
 
+    private var palette: Palette { Palette(scheme, contrast: forcedContrast || systemContrast == .increased) }
+
     var body: some View {
-        let p = Palette(scheme, contrast: forcedContrast || systemContrast == .increased)
+        SwiftUI.Group {
+            if let source, let icon = appIcon(source) {
+                badged(icon)
+            } else {
+                mark
+            }
+        }
+        .frame(width: 16, height: 16)
+        .accessibilityHidden(true)
+    }
+
+    /// The state mark alone, 16 points.
+    @ViewBuilder private var mark: some View {
+        let p = palette
         ZStack {
             switch group {
             case _ where snoozed:
@@ -2880,8 +2944,90 @@ struct Indicator: View {
                 Circle().strokeBorder(Color.secondary.opacity(0.7), lineWidth: 1.5).frame(width: 8, height: 8)
             }
         }
-        .frame(width: 16, height: 16)
-        .accessibilityHidden(true)
+    }
+
+    /// Where the state sits on the icon: a 12-point circle centred 13.5
+    /// points in, cut out of the icon so it reads on any background, and
+    /// reaching 3.5 points past the icon's corner.
+    private static let badgeCut: CGFloat = 12
+    private static let badgeCentre: CGFloat = 13.5
+
+    /// The app's icon, faded when on hold or snoozed, with the state on its corner.
+    private func badged(_ icon: NSImage) -> some View {
+        Image(nsImage: icon)
+            .resizable()
+            .interpolation(.high)
+            .frame(width: 16, height: 16)
+            .opacity(held || snoozed ? 0.45 : 1)
+            .mask {
+                ZStack {
+                    Rectangle()
+                    Circle()
+                        .frame(width: Self.badgeCut, height: Self.badgeCut)
+                        .position(x: Self.badgeCentre, y: Self.badgeCentre)
+                        .blendMode(.destinationOut)
+                }
+                .compositingGroup()
+            }
+            .overlay(alignment: .topLeading) {
+                badge
+                    .frame(width: Self.badgeCut, height: Self.badgeCut)
+                    .offset(x: Self.badgeCentre - Self.badgeCut / 2, y: Self.badgeCentre - Self.badgeCut / 2)
+            }
+    }
+
+    /// The state, small enough for the icon's corner: the turning blue ring
+    /// while running, a filled circle with its sign once it needs you or ends.
+    @ViewBuilder private var badge: some View {
+        let p = palette
+        let grey = Color(white: scheme == .dark ? 0.52 : 0.56)
+        switch group {
+        case _ where snoozed:
+            ZStack {
+                Circle().fill(grey)
+                Image(systemName: "moon.fill").font(.system(size: 5, weight: .bold)).foregroundStyle(.white)
+            }
+            .frame(width: 9, height: 9)
+        case _ where held:
+            Image(systemName: "pause.circle.fill")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, grey)
+                .font(.system(size: 9.5, weight: .bold))
+        case .yourTurn:
+            Image(systemName: "exclamationmark.circle.fill")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(p.needsYouMark, p.needsYou)
+                .font(.system(size: 9.5, weight: .bold))
+        case .running where quiet:
+            // Still running, but nothing written for 10 minutes: a still amber ring.
+            Circle().strokeBorder(p.quiet, lineWidth: 1.6).frame(width: 9, height: 9)
+        case .running:
+            if staticIndicators {
+                ZStack {
+                    Circle().stroke(p.running.opacity(0.24), lineWidth: 1.6)
+                    Circle().trim(from: 0, to: 0.3)
+                        .stroke(p.running, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+                .frame(width: 7.6, height: 7.6)
+            } else {
+                RunningSpinner(color: p.running, size: Self.badgeCut, ring: 7.6, lineWidth: 1.6)
+                    .frame(width: Self.badgeCut, height: Self.badgeCut)
+            }
+        case .justFinished, .done:
+            Image(systemName: "checkmark.circle.fill")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, p.done)
+                .font(.system(size: 9.5, weight: .bold))
+        case .review:
+            ZStack {
+                Circle().fill(p.review)
+                Circle().fill(.white).frame(width: 3, height: 3)
+            }
+            .frame(width: 9, height: 9)
+        case .terminal:
+            Circle().strokeBorder(grey, lineWidth: 1.3).frame(width: 8, height: 8)
+        }
     }
 }
 
@@ -2944,7 +3090,8 @@ struct SessionRow: View {
     var body: some View {
         Button { if canOpen { open(row) } } label: {
             HStack(alignment: .top, spacing: 10) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed).padding(.top, 1)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed, source: row.source)
+                    .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title)
@@ -2987,7 +3134,7 @@ struct SessionRow: View {
         .opacity(dimmed || row.held ? 0.72 : 1)
         .help(tooltip)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(row.title), \(row.snoozed ? "snoozed" : row.held ? "on hold" : stateWord)"
+        .accessibilityLabel("\(row.title)\(row.spokenApp), \(row.snoozed ? "snoozed" : row.held ? "on hold" : stateWord)"
                             + (row.tags.isEmpty ? "" : ", tagged " + row.tags.joined(separator: ", ")))
         .tagMenu(row)
         .accessibilityValue(secondLine ?? meta)
@@ -3387,13 +3534,14 @@ struct CompactRow: View {
         let active = !row.held && (row.group == .running || row.group == .yourTurn)
         return Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed, source: row.source)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         let title = Text(row.title)
                             .font(.system(size: active ? 13 : 12.5,
                                           weight: contrast ? .bold : (active ? .semibold : .medium)))
                             .lineLimit(1).truncationMode(.tail)
+                            .accessibilityLabel(row.title + row.spokenApp)
                         if oneLine && (!row.tags.isEmpty || row.snoozed) {
                             // Tags beside the title when the whole title still fits, else under it.
                             ViewThatFits(in: .horizontal) {
@@ -3588,7 +3736,7 @@ struct AnswerCard: View {
             HStack(spacing: 4) {
                 Button { open(row) } label: {
                     HStack(spacing: 6) {
-                        Indicator(group: row.group)
+                        Indicator(group: row.group, source: row.source)
                         Text(row.title)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(p.text2)
@@ -4421,7 +4569,7 @@ struct FloatingView: View {
     /// asked you something shows the amber "!", whatever its state.
     private func compactMark(_ row: Row) -> some View {
         Indicator(group: Self.asks(row) ? .yourTurn : row.group, quiet: row.quiet(now: model.now) != nil,
-                  held: row.held, snoozed: row.snoozed)
+                  held: row.held, snoozed: row.snoozed, source: row.source)
             .frame(width: 16, height: 16)
     }
 
@@ -4651,7 +4799,7 @@ struct FloatingView: View {
         .modifier(hoverSpot(row))
         .tagMenu(row)
         .testFrame("chip:\(row.id)")
-        .accessibilityLabel("\(row.title), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+        .accessibilityLabel("\(row.title)\(row.spokenApp), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
     }
 
     /// Running, needs you, ready for review, finished: for VoiceOver.
@@ -4694,7 +4842,7 @@ struct FloatingView: View {
                         .modifier(hoverSpot(row))
                         .tagMenu(row)
                         .testFrame("dot:\(row.id)")
-                        .accessibilityLabel("\(row.title), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+                        .accessibilityLabel("\(row.title)\(row.spokenApp), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
                     }
                 }
                 if more > 0 {
@@ -4838,7 +4986,7 @@ struct FloatingView: View {
         .modifier(hoverSpot(row))
         .tagMenu(row)
         .testFrame("bar:\(row.id)")
-        .accessibilityLabel("\(row.title), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+        .accessibilityLabel("\(row.title)\(row.spokenApp), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
     }
 
     // MARK: The columns
@@ -7319,7 +7467,7 @@ func sampleRows(now: Date) -> [Row] {
             activity: "Scanning the app logs for scope errors"),
         Row(id: "codex:sample1", group: .running, title: "Refactor the payments client", context: "payments",
             since: minutesAgo(3), link: "codex://threads/sample1", activity: "Running a command",
-            lastOutput: minutesAgo(0), tags: [codexTag]),
+            lastOutput: minutesAgo(0)),
         Row(id: "pid:5", group: .running, title: "data-pipeline", context: "data-pipeline",
             since: minutesAgo(31), terminal: true, activity: "Running the nightly export",
             lastOutput: minutesAgo(14)),
@@ -7974,6 +8122,9 @@ func runSelfTest() {
           codexThreadShown(source: "user") && codexThreadShown(source: nil) && !codexThreadShown(source: "subagent")
               && !codexThreadShown(source: "guardian_review"))
     check("the thread id comes from the file name", codexThreadId(path: rollout) == threadId)
+    check("ChatGPT's own process is what starts its Codex servers, not one of its helpers",
+          CodexWatcher.isChatGPTApp("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+              && !CodexWatcher.isChatGPTApp("/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)"))
     check("a long thread's file with a second id still gives the first",
           codexThreadId(path: codexDir + "/rollout-2026-10-14T10-02-20-\(threadId)_01a1f000-0000-7000-8000-000000000002.jsonl")
               == threadId)
@@ -7982,7 +8133,7 @@ func runSelfTest() {
                      + #"{"id":"a","thread_name":"Renamed","updated_at":"y"}"#) == ["a": "Renamed"])
     let finishedRow = codexRow(id: threadId, name: "Fix the export", cwd: head.cwd, scan: scan)
     check("a finished thread is a finished row that opens in ChatGPT",
-          finishedRow?.group == .done && finishedRow?.source == .chatGPT && finishedRow?.tags == [codexTag]
+          finishedRow?.group == .done && finishedRow?.source == .chatGPT && finishedRow?.tags == []
               && finishedRow?.openURL?.absoluteString == "codex://threads/\(threadId)" && finishedRow?.context == "web-app")
     check("it can't be tagged or snoozed", finishedRow.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
     append(codexLine("02:33:00.000", "event_msg", #""task_started","turn_id":"t2""#)
@@ -8043,8 +8194,8 @@ func runSelfTest() {
           cursorRunning?.group == .running && cursorRunning?.since == Date(timeIntervalSince1970: Double(ms(120)) / 1000)
               && cursorRunning?.activity == "Read Makefile, build.sh" && cursorRunning?.context == "build-tools"
               && cursorRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
-    check("it's Cursor's, labelled, and can't be tagged or snoozed",
-          cursorRunning?.source == .cursor && cursorRunning?.fromOtherApp == true && cursorRunning?.tags == [cursorTag]
+    check("it's Cursor's, says so, and can't be tagged or snoozed",
+          cursorRunning?.source == .cursor && cursorRunning?.fromOtherApp == true && cursorRunning?.tags == []
               && cursorRunning?.appName == "Cursor" && cursorRunning?.openLabel == "Switch to Cursor"
               && cursorRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
     check("a run waiting for approval waits on you", cursorRows["c-wait"]?.group == .yourTurn
