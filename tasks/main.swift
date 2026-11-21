@@ -4420,7 +4420,8 @@ struct FloatingRows {
     let finished: [Row]
     /// Sessions you put on hold, within the header's time choice; listed last.
     let onHold: [Row]
-    /// Sessions you snoozed, until they wake; listed after the finished ones.
+    /// Sessions you snoozed, until they wake: never listed, only a moon and
+    /// a count in the header (and the strip, bar and dots), whose menu wakes them.
     let snoozed: [Row]
     /// Waiting or review sessions older than the header's time choice.
     let hidden: Int
@@ -4436,7 +4437,7 @@ struct FloatingRows {
         hidden = (allWaiting + board.review).filter { now.timeIntervalSince($0.since) > limit }.count
     }
 
-    var all: [Row] { running + waiting + review + finished + snoozed + onHold }
+    var all: [Row] { running + waiting + review + finished + onHold }
 
     func rows(_ filter: RowFilter?) -> [Row] {
         switch filter {
@@ -4635,14 +4636,14 @@ struct FloatingView: View {
     static let corner: CGFloat = 16
 
     /// The cards ("Waiting on you"), then the other sessions under small
-    /// headings: Running, Needs you, Ready for review, Finished, Snoozed, On hold.
+    /// headings: Running, Needs you, Ready for review, Finished, On hold.
+    /// Snoozed sessions aren't listed: the header's moon counts them.
     private func content(_ carded: [Row], _ rows: [Row]) -> some View {
         let sections: [(title: String, rows: [Row])] = [
             ("Running", rows.filter { $0.group == .running && !$0.held }),
             ("Needs you", rows.filter { $0.group == .yourTurn && !$0.held }),
             ("Ready for review", rows.filter { $0.group == .review && !$0.held }),
             ("Finished", rows.filter { ($0.group == .justFinished || $0.group == .done) && !$0.held }),
-            ("Snoozed", rows.filter(\.snoozed)),
             ("On hold", rows.filter { $0.held && !$0.snoozed }),
         ].filter { !$0.rows.isEmpty }
         return VStack(alignment: .leading, spacing: 0) {
@@ -4746,16 +4747,22 @@ struct FloatingView: View {
             LimboMark(size: 16)
             // Full chips when they fit, then compact ones (mark and number),
             // then a check for Got it, then only the chosen filter's chip: the
-            // header never grows past the window.
+            // header never grows past the window. Snoozed sessions aren't
+            // listed: a moon counts them (its menu wakes them), and gives way
+            // to the counts when there isn't room for both.
             // (In a stack of its own: a priority set inside an `if` is lost.)
             HStack(spacing: 0) {
                 if counts {
                     ViewThatFits(in: .horizontal) {
-                        headerCounts(list, filter: active, fit: .full)
-                        headerCounts(list, filter: active, fit: .compact)
-                        headerCounts(list, filter: active, fit: .compactIcon)
-                        headerCounts(list, filter: active, fit: .minimal)
+                        headerCounts(list, filter: active, fit: .full, moon: true)
+                        headerCounts(list, filter: active, fit: .compact, moon: true)
+                        headerCounts(list, filter: active, fit: .compactIcon, moon: true)
+                        headerCounts(list, filter: active, fit: .compact, moon: false)
+                        headerCounts(list, filter: active, fit: .compactIcon, moon: false)
+                        headerCounts(list, filter: active, fit: .minimal, moon: false)
                     }
+                } else {
+                    headerMoon(list)
                 }
             }
             .layoutPriority(1)
@@ -4830,7 +4837,7 @@ struct FloatingView: View {
 
     /// The counts as chips that filter the list, "All finished" or "All
     /// caught up" when there are none, and Got it while it glows amber or green.
-    private func headerCounts(_ list: FloatingRows, filter active: RowFilter?, fit: HeaderFit) -> some View {
+    private func headerCounts(_ list: FloatingRows, filter active: RowFilter?, fit: HeaderFit, moon: Bool) -> some View {
         let all = RowFilter.allCases.filter { list.count($0) > 0 }
         let kinds = fit == .minimal ? all.filter { $0 == active } : all
         let compact = fit != .full
@@ -4890,8 +4897,15 @@ struct FloatingView: View {
                                            : "Got it: stop the amber glow without opening the session")
                 .accessibilityLabel("Got it")
             }
+            if moon { headerMoon(list) }
         }
         .fixedSize()
+    }
+
+    /// The header's moon: how many sessions are snoozed, none of them listed.
+    @ViewBuilder private func headerMoon(_ list: FloatingRows) -> some View {
+        snoozedChip(list.snoozed, height: 18)
+            .font(.system(size: 11, weight: .semibold).monospacedDigit())
     }
 
     private func chipTitle(_ kind: RowFilter, _ n: Int) -> String {
@@ -5506,7 +5520,7 @@ struct FloatingView: View {
                 columnDivider
                 column("Waiting on you", g.waiting + g.review)
                 columnDivider
-                column("Finished", g.finished + list.snoozed + list.onHold)
+                column("Finished", g.finished + list.onHold)
             }
             .fixedSize(horizontal: false, vertical: true)
             .padding(.bottom, 6)
@@ -8950,6 +8964,7 @@ func runSelfTest() {
     check("snoozed asking rows leave the strip",
           FloatingView.Compact(snoozedList).waiting.isEmpty && FloatingView.stripRows(snoozedList).shown.map(\.id) == ["local_z3"])
     check("Snoozed lists the soonest to wake first", snoozedList.snoozed.map(\.id) == ["local_z1", "local_z2"])
+    check("snoozed sessions aren't listed in the window", !snoozedList.all.contains(where: \.snoozed))
     check("a snooze is kept in the settings", Set(SessionSnoozes.load(snoozeDefaults).byId.keys) == ["local_z1", "local_z2"])
     check("a snooze leaves running rows alone",
           SessionSnoozes(byId: ["local_z3": .init(until: .distantFuture, at: Date())]).apply(to: [busy], now: Date())[0].snoozedUntil == nil)

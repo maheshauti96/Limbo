@@ -57,7 +57,7 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 
 A small window with the running sessions, the ones waiting for you or ready for review, and ones finished in the last 2 hours; the pin in the menu bar panel opens it. It stays above other windows, full-screen videos and games included, on every Space, and never takes keyboard focus, so it never interrupts what you type.
 
-- **Sections:** small capital headings with a count and a hairline: Waiting on you, Running, Needs you, Ready for review, Finished, Snoozed, On hold.
+- **Sections:** small capital headings with a count and a hairline: Waiting on you, Running, Needs you, Ready for review, Finished, On hold. Snoozed sessions aren't listed: a moon in the header counts them (see [Snooze](#snooze)).
 - **Look:** the system's glass background, like other macOS windows and alerts, darkened in Dark Mode the way Control Center's panels are (the blurred material before macOS 26), Apple's rounded system font, 16-point corners, a light blue backing behind running sessions, stronger titles for sessions still going, one line per finished session.
 - **A mark per state,** told apart by shape as well as colour: a turning blue ring (running), an hourglass (running but nothing written for 10 minutes), an exclamation (needs you), an eye (ready for review), a check (finished), a moon (snoozed), a pause mark (on hold). Every time uses one short style: "4m 12s" ticking for running sessions, "6m", "18h", "now" for the rest.
 - **Running sessions** show what they are doing now, like Claude's own status line ("Thinking", the command being run, the file being edited), with a light band sweeping across it. A session between turns that still has background tasks running shows "2 background tasks running" and counts as running.
@@ -161,7 +161,8 @@ The agent threads open in Orca's tabs show, led by their agent's icon (Claude's,
 
 Snooze a session that needs you (or is ready for review, or asked you something) when you don't want to deal with it yet: **For 1 Hour**, **For 3 Hours** or **Until Tomorrow Morning** (9:00). Pick it from the session's right-click menu, anywhere it shows, or from the **Snooze 1h 3h Tomorrow** buttons under a card in the strip, the bar and the dots.
 
-- A snoozed session moves to its own Snoozed section, dimmed with a moon and when it wakes ("Until 8:02 PM"). It no longer counts as needing you, in the header or the menu bar, and never starts a glow. The strip, the bar and the dots show a moon with how many are snoozed; its menu wakes one, or all, or opens one in Claude.
+- A snoozed session leaves the window's list. It no longer counts as needing you, in the header or the menu bar, and never starts a glow. A moon in the window's header (and in the strip, the bar and the dots) shows how many are snoozed; its menu says when each wakes, and wakes one, or all, or opens one in Claude. In a narrow window the moon gives way to the counts.
+- The menu bar panel keeps them in a folded Snoozed section, dimmed, with when each wakes ("Until 8:02 PM").
 - It wakes on its own at that time, back where it was; one that needs you glows amber again, as if it had just asked. It wakes early if the session moves on: you answer it, or it ends another turn. **Wake Now** in its right-click menu brings it back at once.
 - Snoozes live in Limbo's own settings, like tags; sessions started in a terminal can't be snoozed.
 
