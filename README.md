@@ -2,90 +2,30 @@
 
 <h1 align="center">Limbo</h1>
 
-<p align="center">macOS menu-bar board for Cursor, Claude, Grok, and Codex sessions.</p>
+<p align="center">Every AI agent session on your Mac, from Claude, ChatGPT, Cursor, Antigravity and Orca, grouped by what it needs from you: in a window that stays on top, a one-line strip that stays out of the way of what you're watching, or the menu bar.</p>
 
-A local Go watcher reads verified Mac signals and writes a JSON snapshot. The tray reads that file. No webhooks. No HTTP. No secrets in logs or files.
+<p align="center"><img src="docs/images/limbo-tasks/window.png" width="392" alt="The keep-on-top window: a Waiting on you card, then Running, Needs you and Finished sections, each row led by its app's icon (Claude, Cursor, ChatGPT, Antigravity)"></p>
 
-The watcher binary is still `session-watcher`.
-
-## Build
-
-```bash
-make build
-# → bin/session-watcher  (darwin/arm64)
-```
-
-Or:
-
-```bash
-GOOS=darwin GOARCH=arm64 go build -o bin/session-watcher ./cmd/session-watcher
-```
-
-## Test
-
-```bash
-make test
-# or: go test ./...
-```
-
-Tests inject fixture paths and process listings — they never hit a real home directory.
-
-## Run
-
-```bash
-# single snapshot
-./bin/session-watcher once
-
-# poll every 5s (default); override with -interval
-./bin/session-watcher watch
-./bin/session-watcher watch -interval 2s
-```
-
-### Outputs
-
-**1. Transition log** (`events.jsonl`) — one JSON line per `(tool,label)` state change, also printed to stdout:
-
-```json
-{"tool":"cursor","label":"Cursor","state":"idle","ts":"2026-09-16T10:00:00Z","source":"session-watcher"}
-```
-
-| Field | Values |
-|-------|--------|
-| `tool` | `cursor` \| `claude` \| `grok` \| `codex` |
-| `label` | Tool-specific (see signals docs) |
-| `state` | `running` \| `idle` \| `finished` |
-| `ts` | RFC3339 UTC |
-| `source` | `session-watcher` |
-
-**Log path:** `~/Library/Logs/session-watcher/events.jsonl`  
-Fallbacks: `$SESSION_WATCHER_LOG`, or `./events.jsonl` if `~/Library` is missing.
-
-**2. Tray snapshot** (`state.json`) — rewritten atomically on every `once` / watch tick with the **current live set only** (no finished rows):
-
-```json
-{"updated":"2026-09-16T10:00:00Z","sessions":[{"tool":"cursor","label":"Cursor","state":"idle","ts":"2026-09-16T10:00:00Z"}]}
-```
-
-**State path:** `~/Library/Application Support/session-watcher/state.json`  
-Fallbacks: `$SESSION_WATCHER_STATE`, or `./state.json` if `~/Library` is missing.
-
-The tray app should read `state.json` (not scrape processes itself).
-
-Dedup: emits only when `(tool, label)` state changes; disappeared → `finished` in the event log.
-
-## Limbo Tasks (Claude sessions, grouped by what they need from you)
+## Limbo Tasks
 
 ### The problem
 
-With several Claude Code sessions going at once, the Claude desktop app tells you that one has finished, or is waiting for your answer, with nothing more than a small grey dot next to its name in the sidebar. The dot is easy to miss in a long list, and it doesn't say whether the session needs you, finished, or only has new output. So you end up hopping from one session to the next just to see which ones have news, and the one that has been waiting for you sits unnoticed.
+With several Claude Code sessions going at once, the Claude desktop app tells you that one has finished, or is waiting for your answer, with nothing more than a small grey dot next to its name in the sidebar. The dot is easy to miss in a long list, and it doesn't say whether the session needs you, finished, or only has new output. So you end up hopping from one session to the next just to see which ones have news, and the one that has been waiting for you sits unnoticed. Add agents in ChatGPT, Cursor, Antigravity or Orca, each with its own list in its own window, and there are more places still to check.
 
 <p align="center"><img src="docs/images/limbo-tasks/claude-sidebar-dot.gif" width="370" alt="Claude's sidebar: small grey dots appear next to three sessions, the only sign that they have news"><br><sub>Claude's sidebar (example names): the grey dot is the only sign that a session has news.</sub></p>
 
 ### What Limbo Tasks does
 
-A small, separate menu bar app in [tasks/main.swift](tasks/main.swift) that shows every Claude Code session in the Claude desktop app by what it needs from you: what is running and what it is doing, what is waiting for your answer (with Claude's own buttons, so you can answer from it), what is ready for review and what just finished. A window that stays on top shows it at a glance, and its edge glows amber when a session needs you and green when everything has finished, so you can stay in one task and still notice the others. It does not need the Go watcher. All screenshots below use the app's built-in sample sessions (`--sample`).
+A small Mac app, in [tasks/main.swift](tasks/main.swift), that shows your agent sessions from Claude's desktop app, ChatGPT, Cursor, Antigravity and Orca by what they need from you: what is running and what it is doing, what is waiting for your answer (with Claude's own buttons, so you can answer from it), what is ready for review and what just finished.
 
-<p align="center"><img src="docs/images/limbo-tasks/window.png" width="392" alt="The keep-on-top window: Waiting on you cards, then Running, Ready for review, Finished and On hold sections"></p>
+- **A window that stays on top** of everything, full-screen apps included, and never takes the keyboard (above).
+- **A one-line strip** (or a thin bar, or dots) that fits in the black bar above or below a movie, so it never covers what you're watching. It can take over by itself whenever an app goes full screen.
+- **Glows** on the window's edge: amber when a session needs you, green when everything has finished, so you can stay in one task and still notice the others.
+- **The menu bar** shows the counts, with a panel listing every session from the last week.
+
+<p align="center"><img src="docs/images/limbo-tasks/strip.png" width="820" alt="The strip: one chip per session, led by its app's icon, with the card of the chip the pointer is on underneath"></p>
+
+It does not need the Go watcher below. The screenshots use the app's built-in made-up sessions (`--sample`; the first, the strip, Aurora and light mode add the other apps' with `--sample-apps`).
 
 ```bash
 make install-tasks     # build, install ~/Applications/Limbo Tasks.app, start at login, start now
@@ -99,35 +39,23 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 
 | | |
 |---|---|
-| **Menu bar** | The Claude mark with the number of sessions running and a speech bubble with the number waiting for you. |
-| **Menu bar panel** | Every session from the last 7 days in groups: Running, Your turn, Just finished, Ready for review, Snoozed, On hold, Done, In a terminal. |
 | **Keep-on-top window** | A small window above everything, full-screen apps included, that never takes the keyboard. |
+| **Layouts** | List, Strip, Bar, Dots, Columns or Pill; the strip fits above or below a movie, and can take over while an app is full screen. |
+| **Glows** | A calm rim while sessions run, amber when one needs you, green when everything finishes. |
 | **Waiting on you cards** | A session's question and the buttons from Claude's next-step box, with its latest reply one click away. |
 | **Answer from Cards** | Click a card's button and Limbo presses it in Claude for you, then puts your screens back. |
-| **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
 | **ChatGPT threads** | Codex threads in the ChatGPT app, running or just finished, beside Claude's sessions. |
 | **Cursor threads** | Cursor's agent threads, running, waiting on you, or finished, beside Claude's sessions. |
 | **Antigravity conversations** | Antigravity's agent conversations, running or finished, beside Claude's sessions. |
 | **Orca threads** | The agent threads open in Orca (Claude, Codex, Antigravity…), running or finished, beside Claude's sessions. |
+| **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
 | **Snooze** | Put a session away for an hour, three hours or until tomorrow morning; it comes back by itself. |
-| **Glows** | A calm rim while sessions run, amber when one needs you, green when everything finishes. |
-| **Layouts** | List, Strip, Bar, Dots, Columns or Pill; the strip can take over while an app is full screen. |
-
-#### Menu bar
-
-<img src="docs/images/limbo-tasks/menubar.png" width="91" alt="Menu bar item: 2 running, 2 waiting">
-
-The Claude mark with the number of sessions running, then a speech bubble with the number waiting for you (last 3 days); a check mark when neither. While sessions run, the mark turns once every 3 s (it holds still with Reduce Motion on and stops while the screens sleep). The mark is taken at run time from the installed Claude app's own menu bar icon, so nothing of Claude's is copied into this repo. Click it for the panel.
-
-#### Menu bar panel
-
-<img src="docs/images/limbo-tasks/panel.png" width="380" alt="The menu bar panel: Running, Your turn and Just finished groups">
-
-Every session from the last 7 days, grouped by what it needs from you (the rules are under [Session states](#session-states)). Each row shows the session, what it is doing or asking, its folder (or the session that started it) and how long ago. Click a row to open it in Claude; the pin button opens the keep-on-top window. Done, In a terminal, On hold and questions older than 3 days fold away; Start at login and Quit are at the bottom.
+| **Menu bar** | The Claude mark with the number of sessions running and a speech bubble with the number waiting for you. |
+| **Menu bar panel** | Every session from the last 7 days in groups: Running, Your turn, Just finished, Ready for review, Snoozed, On hold, Done, In a terminal. |
 
 #### Keep-on-top window
 
-The pin in the panel opens a small window with the running sessions, the ones waiting for you or ready for review, and ones finished in the last 2 hours. It stays above other windows, full-screen videos and games included, on every Space, and never takes keyboard focus, so it never interrupts what you type.
+A small window with the running sessions, the ones waiting for you or ready for review, and ones finished in the last 2 hours; the pin in the menu bar panel opens it. It stays above other windows, full-screen videos and games included, on every Space, and never takes keyboard focus, so it never interrupts what you type.
 
 - **Sections:** small capital headings with a count and a hairline: Waiting on you, Running, Needs you, Ready for review, Finished, Snoozed, On hold.
 - **Look:** the system's glass background, like other macOS windows and alerts, darkened in Dark Mode the way Control Center's panels are (the blurred material before macOS 26), Apple's rounded system font, 16-point corners, a light blue backing behind running sessions, stronger titles for sessions still going, one line per finished session.
@@ -136,10 +64,23 @@ The pin in the panel opens a small window with the running sessions, the ones wa
 - **Questions and summaries** show in full, wrapping onto more lines; a running status stays on one line so the row doesn't jump.
 - **Count chips filter the list:** click "1 needs you" to list only those sessions, click again for everything.
 
-<p><img src="docs/images/limbo-tasks/filter.png" width="332" alt="The window filtered to sessions that need you, with Showing 1 of 7 and Show all"></p>
+<p><img src="docs/images/limbo-tasks/filter.png" width="332" alt="The window filtered to sessions that need you, with Showing 1 of 9 and Show all"></p>
 
 - **Time range:** the "24 hr" menu sets how far back it shows sessions waiting for you (1 hour, 4 hours, 24 hours, 3 days, 7 days). Running sessions always show.
 - **Size and place:** drag it by its header; resize it from any edge or corner (the resize cursor shows near the border). The position and size are remembered. Right-click the header for Fit to Content and Default Size.
+
+#### Layouts
+
+The layout button in the window's header (and the right-click menu of the layouts without a header) picks the window's shape. The horizontal ones fit in the black bar above or below a widescreen movie, so they never cover what you're watching:
+
+- **List** (default): the window at the top of this page.
+- **Strip** (shown above): one line of chips, one per session (running, waiting, then ready for review, at most six), with how long ago, and finished ones as a count. Point at a chip for its card (its question and buttons, or its row) underneath, or above it in the lower half of the screen; click to open it.
+- **Bar:** a thin bar across the whole bottom of the screen, with what running sessions are doing and the first tag of the others. Cards open above it.
+- **Dots:** the smallest: one mark per session, in groups. Point at one for its card.
+- **Columns:** wide and short, with Running, Needs you and Finished side by side; drag its sides to resize it.
+- **Pill:** just the counts.
+
+Double-click the Limbo mark (or the bar's empty part) to go back to the list. **Strip while an app is full screen**, in the same menu, swaps the list or the columns for the strip whenever an app is full screen on the window's display, and puts your layout back when it leaves full screen; pick a layout while full screen and it stays until then. The app is taken to be full screen when its display shows a full-screen Space (or a window covers the whole display, as a game's does), so it works for videos in a browser or a player alike.
 
 #### Waiting on you cards and replies
 
@@ -239,18 +180,17 @@ The window's edge tells you the state from the corner of your eye. The sparkle m
 - **Other effects:** Aurora drift, Ember breath, Corner bloom, Tide sweep, Rising warmth, Heartbeat, Random (a new one every 5 seconds) or No glow, in red, orange, rose or green. A new choice plays for 4 seconds so you can see it. The amber and green signals each have an on/off switch in the same menu.
 - **Pill:** double-click the header's empty middle (or right-click it, Shrink to Pill) to shrink the window to just its counts and glow; double-click the pill to expand it.
 
-#### Layouts
+#### Menu bar
 
-The layout button in the window's header (and the right-click menu of the layouts without a header) picks the window's shape. The horizontal ones fit in the black bar above or below a widescreen movie, so they never cover what you're watching:
+<img src="docs/images/limbo-tasks/menubar.png" width="91" alt="Menu bar item: 2 running, 2 waiting">
 
-- **List** (default): the window above.
-- **Strip:** one line of chips, one per session (running, waiting, then ready for review, at most six), with how long ago, and finished ones as a count. Point at a chip for its card (its question and buttons, or its row) underneath, or above it in the lower half of the screen; click to open it.
-- **Bar:** a thin bar across the whole bottom of the screen, with what running sessions are doing and the first tag of the others. Cards open above it.
-- **Dots:** the smallest: one mark per session, in groups. Point at one for its card.
-- **Columns:** wide and short, with Running, Needs you and Finished side by side; drag its sides to resize it.
-- **Pill:** just the counts.
+The Claude mark with the number of sessions running, then a speech bubble with the number waiting for you (last 3 days); a check mark when neither. While sessions run, the mark turns once every 3 s (it holds still with Reduce Motion on and stops while the screens sleep). The mark is taken at run time from the installed Claude app's own menu bar icon, so nothing of Claude's is copied into this repo. Click it for the panel.
 
-Double-click the Limbo mark (or the bar's empty part) to go back to the list. **Strip while an app is full screen**, in the same menu, swaps the list or the columns for the strip whenever an app is full screen on the window's display, and puts your layout back when it leaves full screen; pick a layout while full screen and it stays until then. The app is taken to be full screen when its display shows a full-screen Space (or a window covers the whole display, as a game's does), so it works for videos in a browser or a player alike.
+#### Menu bar panel
+
+<img src="docs/images/limbo-tasks/panel.png" width="380" alt="The menu bar panel: Running, Your turn and Just finished groups">
+
+Every session from the last 7 days, grouped by what it needs from you (the rules are under [Session states](#session-states)). Each row shows the session, what it is doing or asking, its folder (or the session that started it) and how long ago. Click a row to open it in its app (Claude, ChatGPT, or a switch to Cursor, Antigravity or Orca); the pin button opens the keep-on-top window. Done, In a terminal, On hold and questions older than 3 days fold away; Start at login and Quit are at the bottom.
 
 #### Light mode and accessibility
 
@@ -339,16 +279,87 @@ kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/C
                                                     # and the glow's state (effect, active, animating, size) -> ...limbo-tasks.glow.json
 ```
 
-The screenshots in this README are made with `--snapshot … --sample`; `-tagStyle` and `-runningGlow` set those settings for one run.
+The screenshots in this README are made with `--snapshot … --sample` (the first, the strip, Aurora and light mode add `--sample-apps`, with `--live`); `-tagStyle` and `-runningGlow` set those settings for one run.
 
-## Signals
+## Session watcher (Go)
+
+An older, separate part of this repo, which Limbo Tasks does not need. A local Go watcher reads verified Mac signals and writes a JSON snapshot. The tray reads that file. No webhooks. No HTTP. No secrets in logs or files.
+
+The watcher binary is still `session-watcher`.
+
+### Build
+
+```bash
+make build
+# → bin/session-watcher  (darwin/arm64)
+```
+
+Or:
+
+```bash
+GOOS=darwin GOARCH=arm64 go build -o bin/session-watcher ./cmd/session-watcher
+```
+
+### Test
+
+```bash
+make test
+# or: go test ./...
+```
+
+Tests inject fixture paths and process listings — they never hit a real home directory.
+
+### Run
+
+```bash
+# single snapshot
+./bin/session-watcher once
+
+# poll every 5s (default); override with -interval
+./bin/session-watcher watch
+./bin/session-watcher watch -interval 2s
+```
+
+#### Outputs
+
+**1. Transition log** (`events.jsonl`) — one JSON line per `(tool,label)` state change, also printed to stdout:
+
+```json
+{"tool":"cursor","label":"Cursor","state":"idle","ts":"2026-09-16T10:00:00Z","source":"session-watcher"}
+```
+
+| Field | Values |
+|-------|--------|
+| `tool` | `cursor` \| `claude` \| `grok` \| `codex` |
+| `label` | Tool-specific (see signals docs) |
+| `state` | `running` \| `idle` \| `finished` |
+| `ts` | RFC3339 UTC |
+| `source` | `session-watcher` |
+
+**Log path:** `~/Library/Logs/session-watcher/events.jsonl`  
+Fallbacks: `$SESSION_WATCHER_LOG`, or `./events.jsonl` if `~/Library` is missing.
+
+**2. Tray snapshot** (`state.json`) — rewritten atomically on every `once` / watch tick with the **current live set only** (no finished rows):
+
+```json
+{"updated":"2026-09-16T10:00:00Z","sessions":[{"tool":"cursor","label":"Cursor","state":"idle","ts":"2026-09-16T10:00:00Z"}]}
+```
+
+**State path:** `~/Library/Application Support/session-watcher/state.json`  
+Fallbacks: `$SESSION_WATCHER_STATE`, or `./state.json` if `~/Library` is missing.
+
+The tray app should read `state.json` (not scrape processes itself).
+
+Dedup: emits only when `(tool, label)` state changes; disappeared → `finished` in the event log.
+
+### Signals
 
 See [docs/signals.md](docs/signals.md) and [VERIFIED_SIGNALS.md](VERIFIED_SIGNALS.md).
 
-## LaunchAgent (optional)
+### LaunchAgent (optional)
 
 Example plist: [deploy/com.maheshauti.session-watcher.plist](deploy/com.maheshauti.session-watcher.plist) (commented; install manually on the Mac).
 
-## Module
+### Module
 
 `github.com/maheshauti/session-watcher`
