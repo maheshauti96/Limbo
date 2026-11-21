@@ -318,7 +318,7 @@ The window is a non-activating panel that can never become the key window, so it
 
 ```bash
 limbo-tasks --dump                                  # group, age and title per row, plus counts
-limbo-tasks --snapshot out.png [--dark] [--sample] [--expand] [--rows N]
+limbo-tasks --snapshot out.png [--dark] [--sample [--sample-apps]] [--expand] [--rows N]   # --sample-apps: made-up sessions from every app
 limbo-tasks --snapshot out.png --floating [--glow calm|aurora|ember|corners|tide|rise|heartbeat] [--tint red|orange|rose|green] [--phase 1.5]
 limbo-tasks --snapshot out.png --floating --attention | --flash | --done [--phase 0.7]   # amber, green flash, all finished
 limbo-tasks --snapshot out.png --floating --size 440x260 | 440xauto              # the keep-on-top window at a size

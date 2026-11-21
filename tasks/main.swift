@@ -7997,6 +7997,38 @@ func sampleRows(now: Date) -> [Row] {
     ])
 }
 
+/// --sample-apps: made-up sessions from every app Limbo reads (Claude,
+/// ChatGPT, Cursor, Antigravity, Orca), for pictures of it.
+func sampleAppRows(now: Date) -> [Row] {
+    func minutesAgo(_ m: Double) -> Date { now.addingTimeInterval(-m * 60) }
+    return rowsInOrder([
+        Row(id: "local_a1", group: .yourTurn, title: "Fix the flaky checkout test", ask: "Commit and push this change?",
+            context: "web-app",
+            since: minutesAgo(0.3), link: "local_a1",
+            card: TurnCard(ask: "Commit and push this change?", actions: ["Commit and push", "Not yet"],
+                           recap: "The checkout test now waits for the cart total before paying; 20 runs in a row passed.",
+                           reply: "The test clicked Pay before the cart total had loaded. It now waits for the total, and 20 runs in a row passed locally.")),
+        Row(id: "cursor:a2", group: .yourTurn, title: "Rename the config keys", detail: "Waiting for your approval",
+            context: "settings", since: minutesAgo(2), link: cursorLinkPrefix + "a2"),
+        Row(id: "local_a3", group: .running, title: "Audit traffic before the old site goes", context: "web-platform",
+            since: minutesAgo(12), link: "local_a3", activity: "Scanning the app logs for scope errors",
+            lastOutput: minutesAgo(0)),
+        Row(id: "codex:a4", group: .running, title: "Refactor the payments client", context: "payments",
+            since: minutesAgo(3), link: "codex://threads/a4", activity: "Running a command", lastOutput: minutesAgo(0)),
+        Row(id: "cursor:a5", group: .running, title: "Tidy the build scripts", context: "build-tools",
+            since: minutesAgo(5), link: cursorLinkPrefix + "a5", activity: "Read Makefile, build.sh",
+            lastOutput: minutesAgo(0)),
+        Row(id: "agy:a6", group: .running, title: "Profile the image pipeline", context: "media",
+            since: minutesAgo(1.5), link: antigravityLinkPrefix + "a6", lastOutput: minutesAgo(0)),
+        Row(id: "orca:a7", group: .running, title: "Home · Ada", context: "Orca", since: minutesAgo(0.5),
+            link: orcaLinkPrefix + "a7", lastOutput: minutesAgo(0), agent: .claude),
+        Row(id: "codex:a8", group: .done, title: "Summarize this week's PRs", context: "web-app",
+            since: minutesAgo(35), link: "codex://threads/a8"),
+        Row(id: "agy:a9", group: .done, title: "Free up disk space", context: "Antigravity",
+            since: minutesAgo(70), link: antigravityLinkPrefix + "a9"),
+    ])
+}
+
 /// --size 380x260, or 380xauto: the keep-on-top window's size in a snapshot.
 func snapshotLayout() -> FloatingLayout {
     let parts = (argument(after: "--size") ?? "").split(separator: "x").map(String.init)
@@ -8014,7 +8046,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     // --live: the real turning rings and shimmering status lines, frozen mid-animation.
     staticIndicators = !arguments.contains("--live")
     let model = SessionModel()
-    let rows = sample ? sampleRows(now: Date()) : SessionEngine.scanOnce()
+    let rows = sample ? (arguments.contains("--sample-apps") ? sampleAppRows(now: Date()) : sampleRows(now: Date()))
+                      : SessionEngine.scanOnce()
     model.setRows(limit.map { Array(rows.prefix($0)) } ?? rows)
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     // The running glow, frozen at --phase seconds (default 1) into its loop.
