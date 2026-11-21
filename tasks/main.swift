@@ -101,6 +101,14 @@ func fileStamp(_ path: String) -> FileStamp? {
     return FileStamp(inode: UInt64(st.st_ino), mtime: mtime, size: Int64(st.st_size))
 }
 
+/// A file's or folder's stamp, for noticing a change; symlinks are not followed.
+func pathStamp(_ path: String) -> FileStamp? {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return nil }
+    let mtime = TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000
+    return FileStamp(inode: UInt64(st.st_ino), mtime: mtime, size: Int64(st.st_size))
+}
+
 /// Reads at most `limit` bytes; nil if the file is larger. Plain reads, no mmap.
 func readFile(_ path: String, limit: Int) -> Data? {
     guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
@@ -1337,49 +1345,58 @@ func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row
 }
 
 /// The app a row's session or thread is in.
-enum RowSource { case claude, chatGPT, cursor, antigravity }
+enum RowSource { case claude, chatGPT, cursor, antigravity, orca }
 
 extension Row {
     var source: RowSource {
         if id.hasPrefix("codex:") { return .chatGPT }
         if id.hasPrefix("cursor:") { return .cursor }
         if id.hasPrefix("agy:") { return .antigravity }
+        if id.hasPrefix("orca:") { return .orca }
         return .claude
     }
 
-    /// A thread in ChatGPT, Cursor or Antigravity: listed, never counted in the menu bar,
-    /// never tagged or snoozed.
+    /// A thread in ChatGPT, Cursor, Antigravity or Orca: listed, never
+    /// counted in the menu bar, never tagged or snoozed.
     var fromOtherApp: Bool { source != .claude }
 
-    /// Where a click goes: the session in Claude, the thread in ChatGPT, or
-    /// Cursor or Antigravity itself. Cursor has no link to one of its own
-    /// threads (its /agent link finds only cloud agents, and shows an error
-    /// otherwise); Antigravity's links are its window's own, unpublished.
-    var openURL: URL? {
+    /// The app a click goes to, from the link. Usually the row's own app;
+    /// a Claude session that Orca runs goes to Orca.
+    var linkApp: RowSource? {
         guard let link else { return nil }
-        if isSessionId(link) { return URL(string: "claude://claude.ai/epitaxy/\(link)") }
-        if link.hasPrefix("codex://threads/") { return URL(string: link) }
-        if link.hasPrefix(cursorLinkPrefix) || link.hasPrefix(antigravityLinkPrefix) {
-            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: source.bundleId)
-        }
+        if isSessionId(link) { return .claude }
+        if link.hasPrefix("codex://threads/") { return .chatGPT }
+        if link.hasPrefix(cursorLinkPrefix) { return .cursor }
+        if link.hasPrefix(antigravityLinkPrefix) { return .antigravity }
+        if link.hasPrefix(orcaLinkPrefix) { return .orca }
         return nil
     }
 
-    /// "Claude", "ChatGPT" or "Cursor".
-    var appName: String {
-        switch source {
-        case .claude: return "Claude"
-        case .chatGPT: return "ChatGPT"
-        case .cursor: return "Cursor"
-        case .antigravity: return "Antigravity"
+    /// Where a click goes: the session in Claude, the thread in ChatGPT, or
+    /// Cursor, Antigravity or Orca itself. Cursor has no link to one of its
+    /// own threads (its /agent link finds only cloud agents, and shows an
+    /// error otherwise); Antigravity's are its window's own, unpublished;
+    /// Orca's pair devices, open bots and share skills.
+    var openURL: URL? {
+        guard let link, let app = linkApp else { return nil }
+        switch app {
+        case .claude: return URL(string: "claude://claude.ai/epitaxy/\(link)")
+        case .chatGPT: return URL(string: link)
+        case .cursor, .antigravity, .orca: return NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleId)
         }
     }
 
-    /// The app comes forward, not the thread: Cursor and Antigravity.
-    var opensAppOnly: Bool { source == .cursor || source == .antigravity }
+    /// "Claude", "ChatGPT", "Cursor", "Antigravity" or "Orca": the app it's in.
+    var appName: String { source.name }
 
-    /// What a click does, for menus: "Open in Claude", or "Switch to Cursor".
-    var openLabel: String { opensAppOnly ? "Switch to \(appName)" : "Open in \(appName)" }
+    /// The app comes forward, not the thread: Cursor, Antigravity and Orca.
+    var opensAppOnly: Bool { [.cursor, .antigravity, .orca].contains(linkApp ?? source) }
+
+    /// What a click does, for menus: "Open in Claude", or "Switch to Orca".
+    var openLabel: String {
+        let app = (linkApp ?? source).name
+        return opensAppOnly ? "Switch to \(app)" : "Open in \(app)"
+    }
 
     /// ", in ChatGPT", ", in Cursor" or ", in Antigravity" for VoiceOver, which can't see the icon;
     /// nothing for Claude's own sessions.
@@ -1387,6 +1404,16 @@ extension Row {
 }
 
 extension RowSource {
+    var name: String {
+        switch self {
+        case .claude: return "Claude"
+        case .chatGPT: return "ChatGPT"
+        case .cursor: return "Cursor"
+        case .antigravity: return "Antigravity"
+        case .orca: return "Orca"
+        }
+    }
+
     /// The app's bundle id: where its icon comes from.
     var bundleId: String {
         switch self {
@@ -1394,6 +1421,7 @@ extension RowSource {
         case .chatGPT: return "com.openai.codex"
         case .cursor: return cursorBundleId
         case .antigravity: return antigravityBundleId
+        case .orca: return orcaBundleId
         }
     }
 }
@@ -1667,6 +1695,8 @@ final class AppThreadsWatcher {
     let database: String
     /// The rows from the app's list of threads, given now and when the app started.
     private let read: (_ now: Date, _ appStarted: Date) -> [Row]?
+    /// More files or folders whose change means read again (Antigravity's notes).
+    private let watched: () -> [String]
     private var app: (pid: pid_t, started: Date)?
     private var lookedForApp = Date.distantPast
     private var stamp: [FileStamp?]?
@@ -1674,9 +1704,11 @@ final class AppThreadsWatcher {
     /// Reads of the list of threads, for the bench.
     private(set) var reads = 0
 
-    init(executableSuffix: String, database: String, read: @escaping (_ now: Date, _ appStarted: Date) -> [Row]?) {
+    init(executableSuffix: String, database: String, watched: @escaping () -> [String] = { [] },
+         read: @escaping (_ now: Date, _ appStarted: Date) -> [Row]?) {
         self.executableSuffix = executableSuffix
         self.database = database
+        self.watched = watched
         self.read = read
     }
 
@@ -1691,9 +1723,39 @@ final class AppThreadsWatcher {
         }
     }
 
+    static let orcaDatabase = Paths.home.appendingPathComponent("Library/Application Support/orca/agent-session-domain.db").path
+    static let orcaWorktrees = Paths.home.appendingPathComponent("Library/Application Support/orca/orca-usage-worktree-history.json").path
+
+    /// Orca's: the threads open in its tabs, each under its worktree's name.
+    /// `adopted` gets the Orca thread for each agent's own id, so a Claude
+    /// session Orca runs is listed once.
+    static func orca(adopted: AdoptedIds) -> AppThreadsWatcher {
+        AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Orca", database: orcaDatabase,
+                          watched: { [orcaWorktrees] }) { _, _ in
+            guard var threads = readOrcaThreads(database: orcaDatabase) else { return nil }
+            let names = orcaWorktreeNames(readFile(orcaWorktrees, limit: 1 << 20))
+            for index in threads.indices { threads[index].worktree = names[threads[index].workspace] }
+            adopted.threads = Dictionary(threads.compactMap { t in t.nativeId.map { ($0, t.id) } }, uniquingKeysWith: { a, _ in a })
+            return threads.compactMap(orcaRow)
+        }
+    }
+
+    static let antigravityNotes = Paths.home.appendingPathComponent(".gemini/antigravity/annotations").path
+
+    /// Antigravity's: its list of conversations, less the ones you archived,
+    /// which it marks only in each conversation's note. The notes of the
+    /// conversations listed, and their folder, are watched too, so an
+    /// archive shows within a tick.
     static func antigravity() -> AppThreadsWatcher {
-        AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Antigravity", database: antigravityDatabase) { now, started in
-            readAntigravityConversations(database: antigravityDatabase, since: now.addingTimeInterval(-Board.window))?
+        final class Listed { var ids: [String] = [] }
+        let listed = Listed()
+        return AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Antigravity", database: antigravityDatabase,
+                                 watched: { [antigravityNotes] + listed.ids.map { antigravityNotePath($0) } }) { now, started in
+            guard let conversations = readAntigravityConversations(database: antigravityDatabase,
+                                                                   since: now.addingTimeInterval(-Board.window))
+            else { return nil }
+            listed.ids = conversations.map(\.id)
+            return conversations.filter { !antigravityArchived(note: readFile(antigravityNotePath($0.id), limit: 64 << 10)) }
                 .compactMap { antigravityRow($0, appStarted: started) }
         }
     }
@@ -1709,14 +1771,15 @@ final class AppThreadsWatcher {
             app = found
         }
         guard let app else { return clear() }
-        let current = [fileStamp(database), fileStamp(database + "-wal")]
+        let current = ([database, database + "-wal"] + watched()).map(pathStamp)
         guard current != stamp else { return false }
         guard let read = read(now, app.started) else {
             // Read again on the next tick: a read can fail while the app writes.
             stamp = nil
             return false
         }
-        stamp = current
+        // Taken again: the read can change what's watched (the conversations listed).
+        stamp = ([database, database + "-wal"] + watched()).map(pathStamp)
         reads += 1
         let fresh = rowsInOrder(read)
         guard fresh != rows else { return false }
@@ -1747,6 +1810,144 @@ final class AppThreadsWatcher {
             return (pid, Date(timeIntervalSince1970: started))
         }
         return nil
+    }
+}
+
+// MARK: - Orca threads
+
+/// Orca's bundle id: a click on one of its threads brings it forward (its
+/// orca:// links pair devices, open bots and share skills, none a thread).
+let orcaBundleId = "com.stablyai.orca"
+
+/// An Orca thread's link: not openable as is (see Row.openURL).
+let orcaLinkPrefix = "orca-thread:"
+
+/// The Orca thread for each agent's own id, kept by the engine so a Claude
+/// session Orca runs is listed once.
+final class AdoptedIds { var threads: [String: String] = [:] }
+
+/// Orca's names for its worktrees ("Tidy-up session"), by workspace
+/// id, from its small worktree history: {"worktrees": [[id, name], …]}.
+func orcaWorktreeNames(_ json: Data?) -> [String: String] {
+    guard let json, let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+          let pairs = object["worktrees"] as? [[Any]] else { return [:] }
+    var names: [String: String] = [:]
+    for pair in pairs where pair.count >= 2 {
+        if let id = pair[0] as? String, let name = (pair[1] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty {
+            names[id] = name
+        }
+    }
+    return names
+}
+
+/// Claude's rows and Orca's, with each Claude session that Orca runs listed
+/// once: as Claude's own row, which knows when the session waits on you and
+/// what it's doing, and whose click goes to Orca. `sessions` is each live
+/// terminal session's id by its pid; `orcaThreads` is the Orca thread for
+/// each agent's own id.
+func mergeOrca(claude: [Row], orca: [Row], sessions: [Int32: String], orcaThreads: [String: String]) -> [Row] {
+    var linked: [String: String] = [:]   // "pid:N" -> Orca thread
+    for (pid, session) in sessions {
+        if let thread = orcaThreads[session] { linked["pid:\(pid)"] = thread }
+    }
+    let present = Set(claude.map(\.id))
+    linked = linked.filter { present.contains($0.key) }
+    guard !linked.isEmpty else { return claude + orca }
+    let merged = Set(linked.values.map { "orca:\($0)" })
+    return claude.map { row in
+        guard let thread = linked[row.id] else { return row }
+        var row = row
+        row.link = orcaLinkPrefix + thread
+        return row
+    } + orca.filter { !merged.contains($0.id) }
+}
+
+/// One thread open in Orca: an agent (Claude, Codex, Antigravity…) Orca
+/// runs, from Orca's own record of it (agent_session_records).
+struct OrcaThread: Equatable {
+    let id: String
+    var agent: String          // provider: claude, codex, antigravity…
+    var name: String           // conversationName
+    var prompt: String         // the last turn's ask
+    var workspace: String      // location.workspaceId: "<id>::<folder>", or "folder:<id>"
+    var worktree: String? = nil // Orca's name for that worktree, if it has one
+    var turnOpen = false       // lastTurn.state "open": the turn is going
+    var turnAt: Date?          // when it started, or settled
+    var outcome: String = ""   // success, failure, cancellation…
+    var lastActivity: Date?    // journal_chat_state.last_activity_at
+    var nativeId: String?      // the agent's own id for it
+}
+
+/// "Claude", "Codex", "Antigravity" for an Orca agent.
+func orcaAgentName(_ agent: String) -> String {
+    switch agent {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    case "antigravity": return "Antigravity"
+    case "gemini": return "Gemini"
+    default: return agent.prefix(1).uppercased() + agent.dropFirst()
+    }
+}
+
+/// An Orca thread as a row: running while its turn is open, else finished
+/// ("Failed" or "Stopped" when it ended so). One never used is left out.
+func orcaRow(_ t: OrcaThread) -> Row? {
+    guard let turnAt = t.turnAt else { return nil }
+    let id = "orca:\(t.id)", link = orcaLinkPrefix + t.id
+    let ask = t.prompt.split(whereSeparator: \.isNewline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+    let title = [t.name.trimmingCharacters(in: .whitespacesAndNewlines), String(ask.prefix(80))].first { !$0.isEmpty }
+        ?? "Orca thread"
+    let folder = t.workspace.range(of: "::").map { String(t.workspace[$0.upperBound...]) }.flatMap { $0.isEmpty ? nil : $0 }
+    let place = t.worktree ?? folder.map(folderLabel)
+    let context = [place, orcaAgentName(t.agent)].compactMap { $0 }.joined(separator: " · ")
+    if t.turnOpen {
+        // Whole minutes, as the others: the quiet check needs no more.
+        let written = t.lastActivity.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
+        return Row(id: id, group: .running, title: title, context: context, since: turnAt, link: link, lastOutput: written)
+    }
+    let detail = t.outcome == "failure" ? "Failed" : t.outcome == "cancellation" ? "Stopped" : nil
+    return Row(id: id, group: .done, title: title, detail: detail, context: context, since: turnAt, link: link)
+}
+
+/// The threads open in Orca's tabs, from its session database, read-only
+/// (it's in WAL mode and Orca keeps it open). Only Orca's records and tabs
+/// are read, never the conversations. nil on any error.
+func readOrcaThreads(database path: String) -> [OrcaThread]? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    let sql = """
+        SELECT r.session_id, json_extract(r.record_json, '$.provider'), json_extract(r.record_json, '$.conversationName'),
+               substr(json_extract(r.record_json, '$.lastTurn.prompt'), 1, 300), json_extract(r.record_json, '$.location.workspaceId'),
+               json_extract(r.record_json, '$.lastTurn.state'), json_extract(r.record_json, '$.lastTurn.at'),
+               json_extract(r.record_json, '$.lastTurn.outcome'), c.last_activity_at, r.adopted_native_id
+        FROM agent_session_records r
+        LEFT JOIN journal_chat_state c ON c.session_id = r.session_id
+        WHERE r.session_id IN (SELECT session_id FROM agent_session_tabs) AND json_valid(r.record_json)
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+    defer { sqlite3_finalize(statement) }
+    func text(_ column: Int32) -> String { sqlite3_column_text(statement, column).map { String(cString: $0) } ?? "" }
+    func date(_ column: Int32) -> Date? {
+        guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
+        let ms = sqlite3_column_int64(statement, column)
+        return ms > 0 ? Date(timeIntervalSince1970: Double(ms) / 1000) : nil
+    }
+    var threads: [OrcaThread] = []
+    while true {
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return threads }
+        guard step == SQLITE_ROW else { return nil }
+        let native = text(9)
+        threads.append(OrcaThread(id: text(0), agent: text(1), name: text(2), prompt: text(3), workspace: text(4),
+                                  turnOpen: text(5) == "open", turnAt: date(6), outcome: text(7), lastActivity: date(8),
+                                  nativeId: native.isEmpty ? nil : native))
     }
 }
 
@@ -1811,6 +2012,16 @@ func antigravityFolder(_ workspaces: String) -> String? {
     return path.isEmpty ? nil : path
 }
 
+/// An Antigravity conversation's note: its title as you set it, when you
+/// last looked, and whether you archived it.
+func antigravityNotePath(_ id: String) -> String { AppThreadsWatcher.antigravityNotes + "/\(id).pbtxt" }
+
+/// Whether a note (text-format protobuf) says archived: `archived:true`.
+func antigravityArchived(note: Data?) -> Bool {
+    guard let note, let text = String(data: note, encoding: .utf8) else { return false }
+    return text.filter { !$0.isWhitespace }.contains("archived:true")
+}
+
 /// An Antigravity conversation as a row: running, or finished. A run whose
 /// last change came before this Antigravity started was cut short, so it
 /// counts as finished.
@@ -1831,8 +2042,10 @@ func antigravityRow(_ c: AntigravityConversation, appStarted: Date?) -> Row? {
                since: c.modified, link: link)
 }
 
-/// Antigravity's recent conversations, newest first: not a subagent's,
-/// changed since `since`. Read-only, like Cursor's. While Antigravity has
+/// Antigravity's recent conversations, newest first: not a subagent's, not
+/// run by its command-line agent (`agy`, which Orca runs too: Antigravity
+/// never marks those running, and Orca's own list has them), changed since
+/// `since`. Read-only, like Cursor's. While Antigravity has
 /// the database open, its write-ahead log is there and is read too; when it
 /// has closed it, the log is gone, a read-only reader can't make one, and
 /// the database file itself is current, so it's read as a snapshot that
@@ -1858,6 +2071,7 @@ private func queryAntigravity(_ uri: String, since: Date, limit: Int) -> [Antigr
         SELECT conversation_id, title, preview, workspace_uris, last_modified_time, last_user_input_time, status, killed
         FROM conversation_summaries
         WHERE nesting_depth = 0 AND parent_conversation_id = '' AND last_modified_time > ?
+          AND source != 'CORTEX_TRAJECTORY_SOURCE_CLI'
         ORDER BY last_modified_time DESC LIMIT ?
         """
     var statement: OpaquePointer?
@@ -1921,6 +2135,8 @@ final class SessionEngine {
     private let codex = CodexWatcher()
     private let cursor = AppThreadsWatcher.cursor()
     private let antigravity = AppThreadsWatcher.antigravity()
+    private let orcaAdopted = AdoptedIds()
+    private lazy var orca = AppThreadsWatcher.orca(adopted: orcaAdopted)
     private var otherApps: DispatchSourceTimer?
 
     func start() {
@@ -1956,10 +2172,10 @@ final class SessionEngine {
             engine.codex.refresh()
             engine.cursor.refresh()
             engine.antigravity.refresh()
-            return rowsInOrder(classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
-                                        activities: activities, cards: engine.currentCards(),
-                                        background: engine.backgroundWork())
-                               + engine.codex.rows + engine.cursor.rows + engine.antigravity.rows)
+            engine.orca.refresh()
+            let claude = classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
+                                  activities: activities, cards: engine.currentCards(), background: engine.backgroundWork())
+            return engine.withOtherApps(claude)
         }
     }
 
@@ -2004,7 +2220,7 @@ final class SessionEngine {
                 apps.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
                 apps.setEventHandler { [weak self] in
                     guard let self else { return }
-                    let changed = [self.codex.refresh(), self.cursor.refresh(), self.antigravity.refresh()]
+                    let changed = [self.codex.refresh(), self.cursor.refresh(), self.antigravity.refresh(), self.orca.refresh()]
                     if changed.contains(true) { self.publishIfChanged() }
                 }
                 apps.resume()
@@ -2015,6 +2231,7 @@ final class SessionEngine {
                 self.codex.clear()
                 self.cursor.clear()
                 self.antigravity.clear()
+                self.orca.clear()
             }
             self.syncActivityWatchers()
             self.publishIfChanged()
@@ -2151,11 +2368,20 @@ final class SessionEngine {
         }
     }
 
+    /// Claude's rows plus the other apps', each Claude session Orca runs listed once.
+    private func withOtherApps(_ claude: [Row]) -> [Row] {
+        let others = codex.rows + cursor.rows + antigravity.rows
+        guard !orca.rows.isEmpty else { return others.isEmpty ? claude : rowsInOrder(claude + others) }
+        let sessions = Dictionary(live.values.compactMap { r in r.cliSessionId.map { (r.pid, $0) } },
+                                  uniquingKeysWith: { a, _ in a })
+        return rowsInOrder(mergeOrca(claude: claude, orca: orca.rows, sessions: sessions, orcaThreads: orcaAdopted.threads)
+                           + others)
+    }
+
     private func publishIfChanged() {
         let claude = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
                               cards: currentCards(), background: backgroundWork())
-        let others = codex.rows + cursor.rows + antigravity.rows
-        let rows = others.isEmpty ? claude : rowsInOrder(claude + others)
+        let rows = withOtherApps(claude)
         guard rows != lastRows else { return }
         lastRows = rows
         let archived = Set(desk.values.compactMap { $0.record?.isArchived == true ? $0.record?.sessionId : nil })
@@ -3261,7 +3487,7 @@ struct SessionRow: View {
     private var tooltip: String {
         var parts = [row.title]
         if let line = secondLine { parts.append(line) }
-        parts.append(canOpen ? "Click to " + (row.opensAppOnly ? "switch to \(row.appName)" : "open in \(row.appName)") : "Started in a terminal, so it can't be opened from here")
+        parts.append(canOpen ? "Click to " + row.openLabel.prefix(1).lowercased() + row.openLabel.dropFirst() : "Started in a terminal, so it can't be opened from here")
         return parts.joined(separator: "\n\n")
     }
 
@@ -7830,11 +8056,16 @@ func runAppBench(_ watcher: AppThreadsWatcher, name: String) {
     let started = found?.started ?? Date()
     let read = clock.measure {
         for _ in 0..<reads {
-            reading = name == "Cursor"
-                ? readCursorThreads(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
+            switch name {
+            case "Cursor":
+                reading = readCursorThreads(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
                     .compactMap { cursorRow($0, cursorStarted: started) }
-                : readAntigravityConversations(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
+            case "Orca":
+                reading = readOrcaThreads(database: watcher.database)?.compactMap(orcaRow)
+            default:
+                reading = readAntigravityConversations(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
                     .compactMap { antigravityRow($0, appStarted: started) }
+            }
         }
     }
     print(found == nil ? "\(name) isn't running: no rows" : "\(name) threads shown: \(watcher.rows.count)"
@@ -8408,15 +8639,16 @@ func runSelfTest() {
     agyStamp.dateFormat = "yyyy-MM-dd HH:mm:ss.SSSSSS"
     func agyTimeText(_ secondsAgo: TimeInterval) -> String { agyStamp.string(from: now.addingTimeInterval(-secondsAgo)) + "+00:00" }
     func agyRow(_ id: String, title: String, preview: String = "", workspaces: String = "", modified: TimeInterval,
-                input: TimeInterval, status: String, killed: Int = 0, depth: Int = 0, parent: String = "") -> String {
+                input: TimeInterval, status: String, killed: Int = 0, depth: Int = 0, parent: String = "",
+                source: String = "") -> String {
         "INSERT INTO conversation_summaries VALUES ('\(id)', '\(title)', '\(preview)', '\(workspaces)', "
-            + "'\(agyTimeText(modified))', '\(agyTimeText(input))', '\(status)', \(killed), \(depth), '\(parent)');"
+            + "'\(agyTimeText(modified))', '\(agyTimeText(input))', '\(status)', \(killed), \(depth), '\(parent)', '\(source)');"
     }
     var agySetup: OpaquePointer?
     _ = sqlite3_open(agyDatabase, &agySetup)
     let agySQL = [
         "PRAGMA journal_mode = WAL;",
-        "CREATE TABLE conversation_summaries (conversation_id text, title text NOT NULL DEFAULT '', preview text NOT NULL DEFAULT '', workspace_uris text NOT NULL, last_modified_time datetime NOT NULL, last_user_input_time datetime NOT NULL, status text NOT NULL DEFAULT '', killed numeric NOT NULL DEFAULT false, nesting_depth integer NOT NULL DEFAULT 0, parent_conversation_id text NOT NULL DEFAULT '', PRIMARY KEY (conversation_id));",
+        "CREATE TABLE conversation_summaries (conversation_id text, title text NOT NULL DEFAULT '', preview text NOT NULL DEFAULT '', workspace_uris text NOT NULL, last_modified_time datetime NOT NULL, last_user_input_time datetime NOT NULL, status text NOT NULL DEFAULT '', killed numeric NOT NULL DEFAULT false, nesting_depth integer NOT NULL DEFAULT 0, parent_conversation_id text NOT NULL DEFAULT '', source text NOT NULL DEFAULT '', PRIMARY KEY (conversation_id));",
         agyRow("a-run", title: "Sort out the release notes", workspaces: "file:///tmp/web-app", modified: 30, input: 200,
                status: "CASCADE_RUN_STATUS_RUNNING"),
         agyRow("a-idle", title: "", preview: "Why is the cache cold?", modified: 3600, input: 3700, status: "CASCADE_RUN_STATUS_IDLE"),
@@ -8424,13 +8656,15 @@ func runSelfTest() {
         agyRow("a-stale", title: "Cut short", modified: 5000, input: 5100, status: "CASCADE_RUN_STATUS_RUNNING"),
         agyRow("a-sub", title: "A subagent", modified: 20, input: 20, status: "CASCADE_RUN_STATUS_RUNNING", depth: 1, parent: "a-run"),
         agyRow("a-old", title: "Last month", modified: 30 * 86400, input: 30 * 86400, status: "CASCADE_RUN_STATUS_IDLE"),
+        agyRow("a-cli", title: "", preview: "Run by the command-line agent", modified: 10, input: 10,
+               status: "CASCADE_RUN_STATUS_IDLE", source: "CORTEX_TRAJECTORY_SOURCE_CLI"),
     ]
     for sql in agySQL { _ = sqlite3_exec(agySetup, sql, nil, nil, nil) }
     sqlite3_close(agySetup)
     // Closing the last connection takes the log away, as when Antigravity has
     // the database closed: a read-only reader then can't open it normally.
     let agyConversations = readAntigravityConversations(database: agyDatabase, since: now.addingTimeInterval(-Board.window)) ?? []
-    check("Antigravity's list: recent conversations, newest first; no subagents or old ones, even with its log gone",
+    check("Antigravity's list: recent conversations, newest first; no subagents, old or command-line ones, even with its log gone",
           agyConversations.map(\.id) == ["a-run", "a-idle", "a-killed", "a-stale"])
     check("Antigravity's times read to the microsecond, in their own zone",
           antigravityTime("2026-11-21 07:18:46.384063+00:00").map { abs($0.timeIntervalSince1970 - 1795245526.384063) < 0.001 } == true
@@ -8452,7 +8686,80 @@ func runSelfTest() {
               && agyRows["a-idle"]?.context == "Antigravity")
     check("a stopped one says so", agyRows["a-killed"]?.group == .done && agyRows["a-killed"]?.detail == "Stopped")
     check("a run last changed before Antigravity started was cut short: finished", agyRows["a-stale"]?.group == .done)
+    check("an archived conversation's note says so; an unarchived or missing one doesn't",
+          antigravityArchived(note: Data(#"title:"Bump the SDK" archived:true archival_status_timestamp:{seconds:1}"#.utf8))
+              && antigravityArchived(note: Data("title:\"x\"\narchived: true\n".utf8))
+              && !antigravityArchived(note: Data(#"title:"x" archived:false archival_status_timestamp:{seconds:1}"#.utf8))
+              && !antigravityArchived(note: Data(#"title:"x" plan_execute:true"#.utf8)) && !antigravityArchived(note: nil))
     for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: agyDatabase + suffix) }
+
+    // Orca threads: the ones open in its tabs, in a database shaped like Orca's.
+    let orcaDb = NSTemporaryDirectory() + "limbo-orca-\(getpid()).db"
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: orcaDb + suffix) }
+    func orcaMs(_ secondsAgo: TimeInterval) -> Int64 { Int64(now.addingTimeInterval(-secondsAgo).timeIntervalSince1970 * 1000) }
+    func orcaRecord(_ id: String, _ json: String) -> String {
+        "INSERT INTO agent_session_records(session_id, record_json) VALUES ('\(id)', '\(json)');"
+    }
+    var orcaSetup: OpaquePointer?
+    _ = sqlite3_open(orcaDb, &orcaSetup)
+    let orcaSQL = [
+        """
+        CREATE TABLE agent_session_records (session_id TEXT PRIMARY KEY, record_json TEXT NOT NULL,
+          adopted_native_id TEXT GENERATED ALWAYS AS (CASE WHEN json_valid(record_json) THEN COALESCE(
+            json_extract(record_json,'$.providerHandleChain[#-1].handle.nativeId'),
+            json_extract(record_json,'$.providerHandleChain[#-1].handle.sessionId')) END) VIRTUAL);
+        """,
+        "CREATE TABLE agent_session_tabs (tab_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, position INTEGER NOT NULL);",
+        "CREATE TABLE journal_chat_state (session_id TEXT PRIMARY KEY, last_activity_at INTEGER NOT NULL DEFAULT 0);",
+        orcaRecord("o-run", #"{"provider":"antigravity","conversationName":"Tidy the README","location":{"workspaceId":"w1::/tmp/web-app"},"providerHandleChain":[{"handle":{"nativeId":"n-agy"}}],"lastTurn":{"state":"open","at":\#(orcaMs(300)),"prompt":"tidy it"}}"#),
+        orcaRecord("o-done", #"{"provider":"claude","conversationName":"","location":{"workspaceId":"folder:abc"},"providerHandleChain":[{"handle":{"sessionId":"n-claude"}}],"lastTurn":{"state":"settled","at":\#(orcaMs(600)),"outcome":"success","prompt":"Explain the build\nin detail"}}"#),
+        orcaRecord("o-fail", #"{"provider":"codex","conversationName":"Bump the SDK","location":{"workspaceId":"w2::/tmp/sdk"},"providerHandleChain":[],"lastTurn":{"state":"settled","at":\#(orcaMs(900)),"outcome":"failure","prompt":"bump"}}"#),
+        orcaRecord("o-new", #"{"provider":"claude","conversationName":"","location":{"workspaceId":"w1::/tmp/web-app"},"providerHandleChain":[]}"#),
+        orcaRecord("o-closed", #"{"provider":"claude","conversationName":"Closed tab","location":{"workspaceId":"w1::/tmp/web-app"},"providerHandleChain":[],"lastTurn":{"state":"open","at":\#(orcaMs(60))}}"#),
+        "INSERT INTO agent_session_tabs VALUES ('t1', 'o-run', 0), ('t2', 'o-done', 1), ('t3', 'o-fail', 2), ('t4', 'o-new', 3);",
+        "INSERT INTO journal_chat_state VALUES ('o-run', \(orcaMs(45)));",
+    ]
+    for sql in orcaSQL { _ = sqlite3_exec(orcaSetup, sql, nil, nil, nil) }
+    sqlite3_close(orcaSetup)
+    let orcaThreads = readOrcaThreads(database: orcaDb) ?? []
+    check("Orca's list: only the threads open in its tabs", Set(orcaThreads.map(\.id)) == ["o-run", "o-done", "o-fail", "o-new"])
+    check("each with the agent's own id for it, when it has one",
+          Set(orcaThreads.compactMap(\.nativeId)) == ["n-agy", "n-claude"])
+    let orcaRows = Dictionary(uniqueKeysWithValues: orcaThreads.compactMap { t in orcaRow(t).map { (t.id, $0) } })
+    let orcaRunning = orcaRows["o-run"]
+    check("an open turn is a running row, in its folder and with its agent",
+          orcaRunning?.group == .running && orcaRunning?.title == "Tidy the README" && orcaRunning?.context == "web-app · Antigravity"
+              && orcaRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    check("it's Orca's, switches to it, and can't be tagged or snoozed",
+          orcaRunning?.source == .orca && orcaRunning?.openLabel == "Switch to Orca"
+              && orcaRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    check("a settled one is finished, named from its ask's first line when it has no name",
+          orcaRows["o-done"]?.group == .done && orcaRows["o-done"]?.title == "Explain the build"
+              && orcaRows["o-done"]?.context == "Claude")
+    check("a failed one says so", orcaRows["o-fail"]?.group == .done && orcaRows["o-fail"]?.detail == "Failed")
+    check("a thread never used isn't listed", orcaRows["o-new"] == nil)
+    check("Orca's worktree names, by workspace",
+          orcaWorktreeNames(Data(#"{"schemaVersion":1,"worktrees":[["w1::/tmp/web-app","Tidy-up session"],["w2::/tmp/sdk",""]]}"#.utf8))
+              == ["w1::/tmp/web-app": "Tidy-up session"])
+    var named = orcaThreads.first { $0.id == "o-run" }
+    named?.worktree = "Tidy-up session"
+    check("a thread sits under its worktree's name when Orca has one",
+          named.flatMap(orcaRow)?.context == "Tidy-up session · Antigravity")
+    let waitingClaude = Row(id: "pid:42", group: .yourTurn, title: "Fix the flaky test", ask: "Allow the edit?",
+                            context: "web-app", since: now, terminal: true)
+    let orcaClaude = Row(id: "orca:o-done", group: .running, title: "Fix the flaky test", context: "web-app · Claude",
+                         since: now, link: orcaLinkPrefix + "o-done")
+    let merged = mergeOrca(claude: [waitingClaude], orca: [orcaClaude, orcaRunning!],
+                           sessions: [42: "n-claude"], orcaThreads: ["n-claude": "o-done", "n-agy": "o-run"])
+    check("a Claude session Orca runs is listed once, as Claude's own row, still waiting on you",
+          merged.map(\.id) == ["pid:42", "orca:o-run"] && merged.first?.group == .yourTurn)
+    check("and a click on it switches to Orca",
+          merged.first?.linkApp == .orca && merged.first?.openLabel == "Switch to Orca" && merged.first?.source == .claude
+              && !SessionTags.taggable(merged.first!))
+    check("a terminal session Orca doesn't run keeps no link",
+          mergeOrca(claude: [waitingClaude], orca: [orcaClaude], sessions: [42: "other"], orcaThreads: ["n-claude": "o-done"])
+              .first?.link == nil)
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: orcaDb + suffix) }
 
     // Snooze: held until a time you pick, or until the session moves on.
     let snoozeSuite = "limbo-tasks-selftest-snooze"
@@ -8915,6 +9222,10 @@ if arguments.contains("--codex-bench") {
 }
 if arguments.contains("--cursor-bench") {
     runAppBench(AppThreadsWatcher.cursor(), name: "Cursor")
+    exit(0)
+}
+if arguments.contains("--orca-bench") {
+    runAppBench(AppThreadsWatcher.orca(adopted: AdoptedIds()), name: "Orca")
     exit(0)
 }
 if arguments.contains("--antigravity-bench") {

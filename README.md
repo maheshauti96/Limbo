@@ -108,6 +108,7 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 | **ChatGPT threads** | Codex threads in the ChatGPT app, running or just finished, beside Claude's sessions. |
 | **Cursor threads** | Cursor's agent threads, running, waiting on you, or finished, beside Claude's sessions. |
 | **Antigravity conversations** | Antigravity's agent conversations, running or finished, beside Claude's sessions. |
+| **Orca threads** | The agent threads open in Orca (Claude, Codex, Antigravity…), running or finished, beside Claude's sessions. |
 | **Snooze** | Put a session away for an hour, three hours or until tomorrow morning; it comes back by itself. |
 | **Glows** | A calm rim while sessions run, amber when one needs you, green when everything finishes. |
 | **Layouts** | List, Strip, Bar, Dots, Columns or Pill; the strip can take over while an app is full screen. |
@@ -174,7 +175,7 @@ Tags stay until you remove them or archive the session in Claude. They live in L
 
 #### Which app
 
-Every row starts with the icon of the app its session or thread is in (Claude, ChatGPT, Cursor or Antigravity), with its state on the icon's bottom-right corner, cut out of the icon: the turning blue ring while it runs, a still amber ring once it has written nothing for 10 minutes, the amber "!" when it needs you, a blue dot for review, a green tick when it's done, and a moon or pause sign, with the icon faded, when it's snoozed or on hold. The icons are the installed apps' own, read from macOS (no app's logo is kept in this repo); if an app isn't installed, its rows show the state mark alone. VoiceOver says which app ("…, in Cursor").
+Every row starts with the icon of the app its session or thread is in (Claude, ChatGPT, Cursor, Antigravity or Orca), with its state on the icon's bottom-right corner, cut out of the icon: the turning blue ring while it runs, a still amber ring once it has written nothing for 10 minutes, the amber "!" when it needs you, a blue dot for review, a green tick when it's done, and a moon or pause sign, with the icon faded, when it's snoozed or on hold. The icons are the installed apps' own, read from macOS (no app's logo is kept in this repo); if an app isn't installed, its rows show the state mark alone. VoiceOver says which app ("…, in Cursor").
 
 #### ChatGPT threads
 
@@ -199,9 +200,20 @@ Cursor's agent threads from the last week show, led by Cursor's icon, while Curs
 Antigravity's agent conversations from the last week show, led by Antigravity's icon, while Antigravity is running: running ones from your last message, and finished ones from when they last changed ("Stopped" when you stopped one). Click one to switch to Antigravity: its links are its own window's and aren't published, so it opens wherever you left it.
 
 - They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
-- Subagents' conversations are left out.
+- Archived conversations and subagents' conversations are left out. Antigravity marks an archive only in the conversation's note (`~/.gemini/antigravity/annotations/<id>.pbtxt`), so those notes are read too, and watched, so an archived conversation goes within a tick.
 - A run whose last change came before Antigravity last started was cut short, so it shows as finished.
 - A conversation waiting for your approval shows as running: Antigravity's list doesn't say so.
+- Conversations run by Antigravity's command-line agent (`agy`, which Orca also runs) are left out: Antigravity never marks those running. Orca's own list shows the ones Orca runs.
+- They can't be tagged or snoozed.
+
+#### Orca threads
+
+The agent threads open in Orca's tabs show, led by Orca's icon, while Orca is running: running while their turn is open, finished once it settles ("Failed" or "Stopped" when it ended so). Under each is its worktree's name in Orca (else its folder) and its agent ("Tidy-up session · Antigravity"), from Orca's small worktree history (`orca-usage-worktree-history.json`). Click one to switch to Orca: its links pair devices, open bots and share skills, but none opens a thread, so it opens wherever you left it.
+
+- They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
+- A Claude session Orca runs is listed once, as Claude's own terminal session (which knows when it waits on you and what it's doing), and a click on it switches to Orca.
+- Threads you've closed in Orca, and ones never used, are left out.
+- A thread waiting for your approval shows as running: Orca's record doesn't say so.
 - They can't be tagged or snoozed.
 
 #### Snooze
@@ -275,7 +287,8 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 - ChatGPT's Codex threads, only while the panel or the window is showing: which rollout files (`~/.codex/sessions/…/rollout-…-<id>.jsonl`) the ChatGPT app's Codex server holds open (via `libproc`, every 2 s), the first 16 KB of each once (its folder, and whether you started it), then only the lines it gains, checking the start of each for a turn starting or ending and the kind of step. Names come from `~/.codex/session_index.jsonl`, read again only when it changes. It looks for ChatGPT's Codex server every 10 s while none is running, and every 30 s otherwise. On this Mac a check with nothing new takes under 0.1 ms, looking for the server about 2 ms, and the first read of two open threads about 110 ms (`--codex-bench`).
 - Cursor's agent threads, only while the panel or the window is showing and Cursor is running: a stat every 2 s of Cursor's state database (`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`) and its write-ahead log, and, only when one of them changed (about every 15 s while Cursor works), one indexed query on its small list of threads (`composerHeaders`: name, folder, the line Cursor shows under it, whether a run is going or waits for approval). The database is opened read-only and closed straight after each query, so no read is left open while Cursor writes. Conversations themselves are never read. It looks for Cursor every 10 s while it isn't running, and every 30 s otherwise. On this Mac a tick with nothing new takes about 0.004 ms and a read of the list about 0.2 ms (`--cursor-bench`).
 - Antigravity's agent conversations, only while the panel or the window is showing and Antigravity is running: a stat every 2 s of its list of conversations (`~/.gemini/antigravity/conversation_summaries.db`) and that database's write-ahead log, and, only when one of them changed, one query on it (title, folder, run status, when it last changed and when you last wrote). It's opened read-only and closed straight after; when Antigravity has the database closed, its log is gone and the file itself is current, so it's read then as a snapshot that takes no lock. Conversations themselves are never read. On this Mac a tick with nothing new takes about 0.003 ms and a read about 0.3 ms (`--antigravity-bench`).
-- It never opens the `*.key` files, and never changes Claude's, ChatGPT's, Cursor's or Antigravity's files.
+- Orca's threads, only while the panel or the window is showing and Orca is running: a stat every 2 s of Orca's session database (`~/Library/Application Support/orca/agent-session-domain.db`) and its write-ahead log, and, only when one of them changed, one query for the threads open in its tabs (agent, name, folder, the last turn's state and outcome, the last activity, the agent's own id for it), plus its worktree names. It's opened read-only and closed straight after. Conversations themselves are never read. On this Mac a tick with nothing new takes about 0.004 ms and a read about 0.7 ms (`--orca-bench`); while an Orca agent is busy its database changes about every tick, so that's a read every 2 s, under 0.04% of a core.
+- It never opens the `*.key` files, and never changes Claude's, ChatGPT's, Cursor's, Antigravity's or Orca's files.
 
 Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`, snoozes under `sessionSnoozes`.
 
@@ -315,11 +328,12 @@ limbo-tasks --snapshot out.png --floating --response local_s7 [--live] [-tagStyl
 limbo-tasks --glow-cycle 16                         # Random in an offscreen window: effect each second, then CPU used
 limbo-tasks --gesture-check                         # chips, cards, replies, snooze, the New Tag box, close, pill, layouts (off screen)
 limbo-tasks --resize-check                          # dragging the edges, and never becoming the front app
-limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks, ChatGPT, Cursor and Antigravity threads
+limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks, ChatGPT, Cursor, Antigravity and Orca threads
 limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
 limbo-tasks --codex-bench                           # what reading ChatGPT's threads costs, on this Mac's open threads
 limbo-tasks --cursor-bench                          # what reading Cursor's threads costs, on this Mac's Cursor
 limbo-tasks --antigravity-bench                     # what reading Antigravity's conversations costs, on this Mac
+limbo-tasks --orca-bench                            # what reading Orca's threads costs, on this Mac
 kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json,
                                                     # a picture of the menu bar button -> ...limbo-tasks.menubar.png,
                                                     # and the glow's state (effect, active, animating, size) -> ...limbo-tasks.glow.json
