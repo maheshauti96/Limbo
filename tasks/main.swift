@@ -778,6 +778,7 @@ struct Row: Identifiable, Equatable {
     var seen: Date? = nil       // when it last came into view in the Claude app
     var tags: [String] = []     // your tags on it, kept by Limbo (SessionTags)
     var snoozedUntil: Date? = nil // snoozed by you until then (SessionSnoozes)
+    var agent: RowSource? = nil   // the agent behind a thread another app runs (Orca's), for its icon
 
     /// Tagged On hold, or snoozed: listed apart, not counted, no glow. A
     /// running session still shows as running, and goes on hold when it stops.
@@ -1389,6 +1390,10 @@ extension Row {
     /// "Claude", "ChatGPT", "Cursor", "Antigravity" or "Orca": the app it's in.
     var appName: String { source.name }
 
+    /// Whose icon leads the row: the agent's for a thread Orca runs (Claude's,
+    /// Antigravity's…), else the app's it's in.
+    var iconSource: RowSource { agent ?? source }
+
     /// The app comes forward, not the thread: Cursor, Antigravity and Orca.
     var opensAppOnly: Bool { [.cursor, .antigravity, .orca].contains(linkApp ?? source) }
 
@@ -1400,7 +1405,11 @@ extension Row {
 
     /// ", in ChatGPT", ", in Cursor" or ", in Antigravity" for VoiceOver, which can't see the icon;
     /// nothing for Claude's own sessions.
-    var spokenApp: String { fromOtherApp ? ", in \(appName)" : "" }
+    var spokenApp: String {
+        guard fromOtherApp else { return "" }
+        if let agent, agent != source { return ", \(agent.name) in \(appName)" }
+        return ", in \(appName)"
+    }
 }
 
 extension RowSource {
@@ -1726,15 +1735,42 @@ final class AppThreadsWatcher {
     static let orcaDatabase = Paths.home.appendingPathComponent("Library/Application Support/orca/agent-session-domain.db").path
     static let orcaWorktrees = Paths.home.appendingPathComponent("Library/Application Support/orca/orca-usage-worktree-history.json").path
 
-    /// Orca's: the threads open in its tabs, each under its worktree's name.
-    /// `adopted` gets the Orca thread for each agent's own id, so a Claude
-    /// session Orca runs is listed once.
+    /// Orca's profile database, which names its folder workspaces and bots.
+    static var orcaProfile: String {
+        let orca = Paths.home.appendingPathComponent("Library/Application Support/orca")
+        let index = readFile(orca.appendingPathComponent("orca-profile-index.json").path, limit: 1 << 20)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let profile = (index?["activeProfileId"] as? String).flatMap { id in
+            id.allSatisfy { isASCIIAlnum($0) || $0 == "-" || $0 == "_" } && !id.isEmpty ? id : nil
+        } ?? "local-default"
+        return orca.appendingPathComponent("profiles/\(profile)/profile-state.db").path
+    }
+
+    /// Orca's: the threads open in its tabs, each under its worktree's name,
+    /// a bot's chats with the bot's name. `adopted` gets the Orca thread for
+    /// each agent's own id, so a Claude session Orca runs is listed once.
+    /// The folder workspaces' names are read again only when Orca's profile
+    /// changed.
     static func orca(adopted: AdoptedIds) -> AppThreadsWatcher {
-        AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Orca", database: orcaDatabase,
-                          watched: { [orcaWorktrees] }) { _, _ in
+        final class Folders { var stamp: [FileStamp?]?; var names: [String: (name: String, bot: Bool)] = [:] }
+        let folders = Folders()
+        return AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Orca", database: orcaDatabase,
+                                 watched: { [orcaWorktrees] }) { _, _ in
             guard var threads = readOrcaThreads(database: orcaDatabase) else { return nil }
             let names = orcaWorktreeNames(readFile(orcaWorktrees, limit: 1 << 20))
-            for index in threads.indices { threads[index].worktree = names[threads[index].workspace] }
+            let profile = orcaProfile
+            let stamp = [pathStamp(profile), pathStamp(profile + "-wal")]
+            if stamp != folders.stamp {
+                folders.names = readOrcaFolderWorkspaces(database: profile)
+                folders.stamp = stamp
+            }
+            for index in threads.indices {
+                let workspace = threads[index].workspace
+                threads[index].worktree = names[workspace]
+                if workspace.hasPrefix("folder:"), let folder = folders.names[String(workspace.dropFirst(7))] {
+                    if folder.bot { threads[index].bot = folder.name } else { threads[index].worktree = folder.name }
+                }
+            }
             adopted.threads = Dictionary(threads.compactMap { t in t.nativeId.map { ($0, t.id) } }, uniquingKeysWith: { a, _ in a })
             return threads.compactMap(orcaRow)
         }
@@ -1841,6 +1877,39 @@ func orcaWorktreeNames(_ json: Data?) -> [String: String] {
     return names
 }
 
+/// Orca's folder workspaces by id: their names, and whether each is a bot
+/// (kept under ~/.orca/bots). From Orca's profile database, read-only.
+func readOrcaFolderWorkspaces(database path: String) -> [String: (name: String, bot: Bool)] {
+    var db: OpaquePointer?
+    guard FileManager.default.fileExists(atPath: path),
+          sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return [:]
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, "SELECT payload FROM profile_state_documents WHERE domain = 'folderWorkspaces'", -1,
+                             &statement, nil) == SQLITE_OK, let statement else { return [:] }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else { return [:] }
+    return orcaFolderWorkspaces(Data(String(cString: text).utf8))
+}
+
+/// Folder workspaces from their JSON: [{"id", "name", "folderPath"}, …].
+func orcaFolderWorkspaces(_ json: Data) -> [String: (name: String, bot: Bool)] {
+    guard let list = try? JSONSerialization.jsonObject(with: json) as? [[String: Any]] else { return [:] }
+    var names: [String: (name: String, bot: Bool)] = [:]
+    for workspace in list {
+        guard let id = workspace["id"] as? String,
+              let name = (workspace["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty
+        else { continue }
+        let folder = workspace["folderPath"] as? String ?? ""
+        names[id] = (name, folder.contains("/.orca/bots/"))
+    }
+    return names
+}
+
 /// Claude's rows and Orca's, with each Claude session that Orca runs listed
 /// once: as Claude's own row, which knows when the session waits on you and
 /// what it's doing, and whose click goes to Orca. `sessions` is each live
@@ -1855,10 +1924,18 @@ func mergeOrca(claude: [Row], orca: [Row], sessions: [Int32: String], orcaThread
     linked = linked.filter { present.contains($0.key) }
     guard !linked.isEmpty else { return claude + orca }
     let merged = Set(linked.values.map { "orca:\($0)" })
+    let orcaById = Dictionary(orca.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
     return claude.map { row in
         guard let thread = linked[row.id] else { return row }
         var row = row
         row.link = orcaLinkPrefix + thread
+        // Orca's name for it ("Home · Ada") and where it runs, with Claude's own state.
+        if let named = orcaById["orca:\(thread)"] {
+            row = Row(id: row.id, group: row.group, title: named.title, ask: row.ask, detail: row.detail, context: named.context,
+                      since: row.since, link: row.link, terminal: row.terminal, activity: row.activity,
+                      lastOutput: row.lastOutput, card: row.card, seen: row.seen, tags: row.tags,
+                      snoozedUntil: row.snoozedUntil, agent: row.agent)
+        }
         return row
     } + orca.filter { !merged.contains($0.id) }
 }
@@ -1872,11 +1949,24 @@ struct OrcaThread: Equatable {
     var prompt: String         // the last turn's ask
     var workspace: String      // location.workspaceId: "<id>::<folder>", or "folder:<id>"
     var worktree: String? = nil // Orca's name for that worktree, if it has one
+    var bot: String? = nil      // the bot's name, for a bot's chat ("Ada")
     var turnOpen = false       // lastTurn.state "open": the turn is going
     var turnAt: Date?          // when it started, or settled
     var outcome: String = ""   // success, failure, cancellation…
     var lastActivity: Date?    // journal_chat_state.last_activity_at
     var nativeId: String?      // the agent's own id for it
+}
+
+/// The app whose icon an Orca agent shows: Claude's, ChatGPT's for Codex,
+/// Antigravity's, Cursor's. Another agent shows Orca's.
+func orcaAgentIcon(_ agent: String) -> RowSource? {
+    switch agent {
+    case "claude": return .claude
+    case "codex": return .chatGPT
+    case "antigravity": return .antigravity
+    case "cursor": return .cursor
+    default: return nil
+    }
 }
 
 /// "Claude", "Codex", "Antigravity" for an Orca agent.
@@ -1896,18 +1986,24 @@ func orcaRow(_ t: OrcaThread) -> Row? {
     guard let turnAt = t.turnAt else { return nil }
     let id = "orca:\(t.id)", link = orcaLinkPrefix + t.id
     let ask = t.prompt.split(whereSeparator: \.isNewline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
-    let title = [t.name.trimmingCharacters(in: .whitespacesAndNewlines), String(ask.prefix(80))].first { !$0.isEmpty }
+    let base = [t.name.trimmingCharacters(in: .whitespacesAndNewlines), String(ask.prefix(80))].first { !$0.isEmpty }
         ?? "Orca thread"
+    // A bot's chats are all "Home": the bot's name says whose.
+    let title = t.bot.map { "\(base) · \($0)" } ?? base
     let folder = t.workspace.range(of: "::").map { String(t.workspace[$0.upperBound...]) }.flatMap { $0.isEmpty ? nil : $0 }
     let place = t.worktree ?? folder.map(folderLabel)
-    let context = [place, orcaAgentName(t.agent)].compactMap { $0 }.joined(separator: " · ")
+    // The agent's icon leads, so the line under it says where it runs; an
+    // agent with no icon of its own is named.
+    let agent = orcaAgentIcon(t.agent)
+    let context = [place, agent == nil ? "\(orcaAgentName(t.agent)) in Orca" : "Orca"].compactMap { $0 }.joined(separator: " · ")
     if t.turnOpen {
         // Whole minutes, as the others: the quiet check needs no more.
         let written = t.lastActivity.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
-        return Row(id: id, group: .running, title: title, context: context, since: turnAt, link: link, lastOutput: written)
+        return Row(id: id, group: .running, title: title, context: context, since: turnAt, link: link, lastOutput: written,
+                   agent: agent)
     }
     let detail = t.outcome == "failure" ? "Failed" : t.outcome == "cancellation" ? "Stopped" : nil
-    return Row(id: id, group: .done, title: title, detail: detail, context: context, since: turnAt, link: link)
+    return Row(id: id, group: .done, title: title, detail: detail, context: context, since: turnAt, link: link, agent: agent)
 }
 
 /// The threads open in Orca's tabs, from its session database, read-only
@@ -3291,10 +3387,11 @@ struct Indicator: View {
     var quiet = false
     var held = false
     var snoozed = false
-    /// The app the session is in: its icon leads, with the state on the
-    /// icon's bottom-right corner. nil, or the app not installed: the state
-    /// mark alone.
+    /// Whose icon leads, with the state on its bottom-right corner: the
+    /// agent's for a thread Orca runs, else the app's it's in. Not installed:
+    /// `fallback`'s (the app it's in), else the state mark alone.
     var source: RowSource? = nil
+    var fallback: RowSource? = nil
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.highContrast) private var forcedContrast
@@ -3303,7 +3400,7 @@ struct Indicator: View {
 
     var body: some View {
         SwiftUI.Group {
-            if let source, let icon = appIcon(source) {
+            if let icon = source.flatMap(appIcon) ?? fallback.flatMap(appIcon) {
                 badged(icon)
             } else {
                 mark
@@ -3494,7 +3591,8 @@ struct SessionRow: View {
     var body: some View {
         Button { if canOpen { open(row) } } label: {
             HStack(alignment: .top, spacing: 10) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed, source: row.source)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed,
+                          source: row.iconSource, fallback: row.source)
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -3938,7 +4036,8 @@ struct CompactRow: View {
         let active = !row.held && (row.group == .running || row.group == .yourTurn)
         return Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed, source: row.source)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed,
+                          source: row.iconSource, fallback: row.source)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         let title = Text(row.title)
@@ -4140,7 +4239,7 @@ struct AnswerCard: View {
             HStack(spacing: 4) {
                 Button { open(row) } label: {
                     HStack(spacing: 6) {
-                        Indicator(group: row.group, source: row.source)
+                        Indicator(group: row.group, source: row.iconSource, fallback: row.source)
                         Text(row.title)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(p.text2)
@@ -4973,7 +5072,7 @@ struct FloatingView: View {
     /// asked you something shows the amber "!", whatever its state.
     private func compactMark(_ row: Row) -> some View {
         Indicator(group: Self.asks(row) ? .yourTurn : row.group, quiet: row.quiet(now: model.now) != nil,
-                  held: row.held, snoozed: row.snoozed, source: row.source)
+                  held: row.held, snoozed: row.snoozed, source: row.iconSource, fallback: row.source)
             .frame(width: 16, height: 16)
     }
 
@@ -8728,14 +8827,20 @@ func runSelfTest() {
     let orcaRows = Dictionary(uniqueKeysWithValues: orcaThreads.compactMap { t in orcaRow(t).map { (t.id, $0) } })
     let orcaRunning = orcaRows["o-run"]
     check("an open turn is a running row, in its folder and with its agent",
-          orcaRunning?.group == .running && orcaRunning?.title == "Tidy the README" && orcaRunning?.context == "web-app · Antigravity"
+          orcaRunning?.group == .running && orcaRunning?.title == "Tidy the README" && orcaRunning?.context == "web-app · Orca"
               && orcaRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    check("it shows its agent's icon, and VoiceOver says both",
+          orcaRunning?.iconSource == .antigravity && orcaRunning?.spokenApp == ", Antigravity in Orca")
     check("it's Orca's, switches to it, and can't be tagged or snoozed",
           orcaRunning?.source == .orca && orcaRunning?.openLabel == "Switch to Orca"
               && orcaRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
     check("a settled one is finished, named from its ask's first line when it has no name",
           orcaRows["o-done"]?.group == .done && orcaRows["o-done"]?.title == "Explain the build"
-              && orcaRows["o-done"]?.context == "Claude")
+              && orcaRows["o-done"]?.context == "Orca" && orcaRows["o-done"]?.iconSource == .claude)
+    check("Codex shows ChatGPT's icon; an agent with no app of its own shows Orca's, and is named",
+          orcaRows["o-fail"]?.iconSource == .chatGPT
+              && orcaRow(OrcaThread(id: "o-x", agent: "grok", name: "x", prompt: "", workspace: "w::/tmp/a", turnAt: now))
+                  .map { $0.iconSource == .orca && $0.context == "a · Grok in Orca" } == true)
     check("a failed one says so", orcaRows["o-fail"]?.group == .done && orcaRows["o-fail"]?.detail == "Failed")
     check("a thread never used isn't listed", orcaRows["o-new"] == nil)
     check("Orca's worktree names, by workspace",
@@ -8744,15 +8849,24 @@ func runSelfTest() {
     var named = orcaThreads.first { $0.id == "o-run" }
     named?.worktree = "Tidy-up session"
     check("a thread sits under its worktree's name when Orca has one",
-          named.flatMap(orcaRow)?.context == "Tidy-up session · Antigravity")
+          named.flatMap(orcaRow)?.context == "Tidy-up session · Orca")
+    let folderNames = orcaFolderWorkspaces(Data(#"[{"id":"b1","name":"Ada","folderPath":"/Users/x/.orca/bots/ada-1"},{"id":"f1","name":"Notes","folderPath":"/Users/x/notes"},{"id":"f2","name":""}]"#.utf8))
+    check("Orca's folder workspaces: bots by their folder, others by name",
+          folderNames["b1"]?.name == "Ada" && folderNames["b1"]?.bot == true && folderNames["f1"]?.bot == false
+              && folderNames["f2"] == nil)
+    var botChat = orcaThreads.first { $0.id == "o-done" }
+    botChat?.name = "Home"
+    botChat?.bot = "Ada"
+    check("a bot's chat carries the bot's name", botChat.flatMap(orcaRow)?.title == "Home · Ada")
     let waitingClaude = Row(id: "pid:42", group: .yourTurn, title: "Fix the flaky test", ask: "Allow the edit?",
                             context: "web-app", since: now, terminal: true)
-    let orcaClaude = Row(id: "orca:o-done", group: .running, title: "Fix the flaky test", context: "web-app · Claude",
+    let orcaClaude = Row(id: "orca:o-done", group: .running, title: "Home · Ada", context: "Orca",
                          since: now, link: orcaLinkPrefix + "o-done")
     let merged = mergeOrca(claude: [waitingClaude], orca: [orcaClaude, orcaRunning!],
                            sessions: [42: "n-claude"], orcaThreads: ["n-claude": "o-done", "n-agy": "o-run"])
-    check("a Claude session Orca runs is listed once, as Claude's own row, still waiting on you",
-          merged.map(\.id) == ["pid:42", "orca:o-run"] && merged.first?.group == .yourTurn)
+    check("a Claude session Orca runs is listed once, as Claude's own row, still waiting on you, by Orca's name",
+          merged.map(\.id) == ["pid:42", "orca:o-run"] && merged.first?.group == .yourTurn
+              && merged.first?.ask == "Allow the edit?" && merged.first?.title == "Home · Ada" && merged.first?.context == "Orca")
     check("and a click on it switches to Orca",
           merged.first?.linkApp == .orca && merged.first?.openLabel == "Switch to Orca" && merged.first?.source == .claude
               && !SessionTags.taggable(merged.first!))

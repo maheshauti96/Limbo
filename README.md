@@ -208,7 +208,7 @@ Antigravity's agent conversations from the last week show, led by Antigravity's 
 
 #### Orca threads
 
-The agent threads open in Orca's tabs show, led by Orca's icon, while Orca is running: running while their turn is open, finished once it settles ("Failed" or "Stopped" when it ended so). Under each is its worktree's name in Orca (else its folder) and its agent ("Tidy-up session · Antigravity"), from Orca's small worktree history (`orca-usage-worktree-history.json`). Click one to switch to Orca: its links pair devices, open bots and share skills, but none opens a thread, so it opens wherever you left it.
+The agent threads open in Orca's tabs show, led by their agent's icon (Claude's, Antigravity's, ChatGPT's for Codex, Cursor's; Orca's for another agent), while Orca is running: running while their turn is open, finished once it settles ("Failed" or "Stopped" when it ended so). Under each is its worktree's name in Orca (else its folder) and where it runs ("Tidy-up session · Orca"), from Orca's small worktree history (`orca-usage-worktree-history.json`). A bot's chat carries the bot's name ("Home · Ada"), from Orca's profile (its folder workspaces), read again only when that changes. Click one to switch to Orca: its links pair devices, open bots and share skills, but none opens a thread, so it opens wherever you left it.
 
 - They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
 - A Claude session Orca runs is listed once, as Claude's own terminal session (which knows when it waits on you and what it's doing), and a click on it switches to Orca.
