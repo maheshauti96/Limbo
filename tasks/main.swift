@@ -1337,27 +1337,31 @@ func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row
 }
 
 /// The app a row's session or thread is in.
-enum RowSource { case claude, chatGPT, cursor }
+enum RowSource { case claude, chatGPT, cursor, antigravity }
 
 extension Row {
     var source: RowSource {
         if id.hasPrefix("codex:") { return .chatGPT }
         if id.hasPrefix("cursor:") { return .cursor }
+        if id.hasPrefix("agy:") { return .antigravity }
         return .claude
     }
 
-    /// A thread in ChatGPT or Cursor: listed, never counted in the menu bar,
+    /// A thread in ChatGPT, Cursor or Antigravity: listed, never counted in the menu bar,
     /// never tagged or snoozed.
     var fromOtherApp: Bool { source != .claude }
 
     /// Where a click goes: the session in Claude, the thread in ChatGPT, or
-    /// Cursor itself. Cursor has no link to one of its own threads (its
-    /// /agent link finds only cloud agents, and shows an error otherwise).
+    /// Cursor or Antigravity itself. Cursor has no link to one of its own
+    /// threads (its /agent link finds only cloud agents, and shows an error
+    /// otherwise); Antigravity's links are its window's own, unpublished.
     var openURL: URL? {
         guard let link else { return nil }
         if isSessionId(link) { return URL(string: "claude://claude.ai/epitaxy/\(link)") }
         if link.hasPrefix("codex://threads/") { return URL(string: link) }
-        if link.hasPrefix(cursorLinkPrefix) { return NSWorkspace.shared.urlForApplication(withBundleIdentifier: cursorBundleId) }
+        if link.hasPrefix(cursorLinkPrefix) || link.hasPrefix(antigravityLinkPrefix) {
+            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: source.bundleId)
+        }
         return nil
     }
 
@@ -1367,13 +1371,17 @@ extension Row {
         case .claude: return "Claude"
         case .chatGPT: return "ChatGPT"
         case .cursor: return "Cursor"
+        case .antigravity: return "Antigravity"
         }
     }
 
-    /// What a click does, for menus: "Open in Claude", or "Switch to Cursor".
-    var openLabel: String { source == .cursor ? "Switch to Cursor" : "Open in \(appName)" }
+    /// The app comes forward, not the thread: Cursor and Antigravity.
+    var opensAppOnly: Bool { source == .cursor || source == .antigravity }
 
-    /// ", in ChatGPT" or ", in Cursor" for VoiceOver, which can't see the icon;
+    /// What a click does, for menus: "Open in Claude", or "Switch to Cursor".
+    var openLabel: String { opensAppOnly ? "Switch to \(appName)" : "Open in \(appName)" }
+
+    /// ", in ChatGPT", ", in Cursor" or ", in Antigravity" for VoiceOver, which can't see the icon;
     /// nothing for Claude's own sessions.
     var spokenApp: String { fromOtherApp ? ", in \(appName)" : "" }
 }
@@ -1385,6 +1393,7 @@ extension RowSource {
         case .claude: return "com.anthropic.claudefordesktop"
         case .chatGPT: return "com.openai.codex"
         case .cursor: return cursorBundleId
+        case .antigravity: return antigravityBundleId
         }
     }
 }
@@ -1392,12 +1401,14 @@ extension RowSource {
 /// Each app's icon as macOS shows it, looked up once per app. nil when the
 /// app isn't installed: its rows then show the state mark alone, as before.
 /// Read from the installed app, so no app's logo is kept in this repo.
-private var appIcons: [RowSource: NSImage?] = [:]
+private var appIcons: [RowSource: (icon: NSImage?, at: Date)] = [:]
 func appIcon(_ source: RowSource) -> NSImage? {
-    if let known = appIcons[source] { return known }
+    // One not found is looked for again a minute later: an app just installed,
+    // or opened from its disk image.
+    if let known = appIcons[source], known.icon != nil || Date().timeIntervalSince(known.at) < 60 { return known.icon }
     let icon = NSWorkspace.shared.urlForApplication(withBundleIdentifier: source.bundleId)
         .map { NSWorkspace.shared.icon(forFile: $0.path) }
-    appIcons[source] = icon
+    appIcons[source] = (icon, Date())
     return icon
 }
 
@@ -1642,15 +1653,20 @@ func readCursorThreads(database path: String, since: Date, limit: Int = 30) -> [
     }
 }
 
-/// Reads Cursor's agent threads, on the engine's queue, on the engine's
-/// two-second tick while a panel shows. Each tick: is Cursor still running
-/// (one call), and a stat of its state database and of that database's log;
-/// the list of threads is read only when one of them changed, about every
-/// 15 s while Cursor works. It looks for Cursor every 10 s while it isn't
-/// running, and every 30 s otherwise. Rows show only while Cursor runs.
-final class CursorWatcher {
-    static let database = Paths.home
-        .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb").path
+/// Reads one app's threads from the app's own database (Cursor's,
+/// Antigravity's), on the engine's queue, on the engine's two-second tick
+/// while a panel shows. Each tick: is the app still running (one call), and
+/// a stat of the database and of its log; the list is read only when one of
+/// them changed (about every 15 s while Cursor works), and tried again on
+/// the next tick when a read fails. It looks for the app every 10 s while
+/// it isn't running, and every 30 s otherwise. Rows show only while the app
+/// runs.
+final class AppThreadsWatcher {
+    /// The app's main executable ends so: ".app/Contents/MacOS/Cursor".
+    let executableSuffix: String
+    let database: String
+    /// The rows from the app's list of threads, given now and when the app started.
+    private let read: (_ now: Date, _ appStarted: Date) -> [Row]?
     private var app: (pid: pid_t, started: Date)?
     private var lookedForApp = Date.distantPast
     private var stamp: [FileStamp?]?
@@ -1658,31 +1674,57 @@ final class CursorWatcher {
     /// Reads of the list of threads, for the bench.
     private(set) var reads = 0
 
+    init(executableSuffix: String, database: String, read: @escaping (_ now: Date, _ appStarted: Date) -> [Row]?) {
+        self.executableSuffix = executableSuffix
+        self.database = database
+        self.read = read
+    }
+
+    static let cursorDatabase = Paths.home
+        .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb").path
+    static let antigravityDatabase = Paths.home.appendingPathComponent(".gemini/antigravity/conversation_summaries.db").path
+
+    static func cursor() -> AppThreadsWatcher {
+        AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Cursor", database: cursorDatabase) { now, started in
+            readCursorThreads(database: cursorDatabase, since: now.addingTimeInterval(-Board.window))?
+                .compactMap { cursorRow($0, cursorStarted: started) }
+        }
+    }
+
+    static func antigravity() -> AppThreadsWatcher {
+        AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Antigravity", database: antigravityDatabase) { now, started in
+            readAntigravityConversations(database: antigravityDatabase, since: now.addingTimeInterval(-Board.window))?
+                .compactMap { antigravityRow($0, appStarted: started) }
+        }
+    }
+
     /// One tick; true if the rows changed.
     @discardableResult
     func refresh(now: Date = Date()) -> Bool {
         if let app, kill(app.pid, 0) != 0 { self.app = nil }
         if now.timeIntervalSince(lookedForApp) >= (app == nil ? 10 : 30) {
             lookedForApp = now
-            let found = Self.findCursor()
+            let found = Self.findApp(suffix: executableSuffix)
             if found?.pid != app?.pid { stamp = nil }
             app = found
         }
         guard let app else { return clear() }
-        let current = [fileStamp(Self.database), fileStamp(Self.database + "-wal")]
+        let current = [fileStamp(database), fileStamp(database + "-wal")]
         guard current != stamp else { return false }
-        // Kept even when the read fails: it's tried again when Cursor next writes.
+        guard let read = read(now, app.started) else {
+            // Read again on the next tick: a read can fail while the app writes.
+            stamp = nil
+            return false
+        }
         stamp = current
-        guard let threads = readCursorThreads(database: Self.database, since: now.addingTimeInterval(-Board.window))
-        else { return false }
         reads += 1
-        let fresh = rowsInOrder(threads.compactMap { cursorRow($0, cursorStarted: app.started) })
+        let fresh = rowsInOrder(read)
         guard fresh != rows else { return false }
         rows = fresh
         return true
     }
 
-    /// No panel shows, or Cursor quit: drop the rows.
+    /// No panel shows, or the app quit: drop the rows.
     @discardableResult
     func clear() -> Bool {
         stamp = nil
@@ -1691,13 +1733,13 @@ final class CursorWatcher {
         return true
     }
 
-    /// Cursor's main process, and when it started.
-    static func findCursor() -> (pid: pid_t, started: Date)? {
+    /// The app's main process, and when it started.
+    static func findApp(suffix: String) -> (pid: pid_t, started: Date)? {
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
         guard count > 0 else { return nil }
         for pid in pids.prefix(min(count, pids.count)) where pid > 0 {
-            guard executablePath(pid).hasSuffix(".app/Contents/MacOS/Cursor") else { continue }
+            guard executablePath(pid).hasSuffix(suffix) else { continue }
             var info = proc_bsdinfo()
             let size = Int32(MemoryLayout<proc_bsdinfo>.size)
             guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { continue }
@@ -1705,6 +1747,138 @@ final class CursorWatcher {
             return (pid, Date(timeIntervalSince1970: started))
         }
         return nil
+    }
+}
+
+// MARK: - Antigravity conversations
+
+/// Antigravity's bundle id: a click on one of its conversations brings it forward.
+let antigravityBundleId = "com.google.antigravity"
+
+/// An Antigravity conversation's link: not openable as is (see Row.openURL).
+let antigravityLinkPrefix = "antigravity-conversation:"
+
+/// One Antigravity conversation, from Antigravity's own list of them
+/// (conversation_summaries in ~/.gemini/antigravity), a row per conversation.
+struct AntigravityConversation: Equatable {
+    let id: String
+    var title: String
+    var preview: String
+    var workspaces: String    // workspace_uris: file:// URIs, or empty outside a project
+    var modified: Date        // last_modified_time: moves as a run goes
+    var lastInput: Date?      // last_user_input_time: your last message
+    var status: String        // CASCADE_RUN_STATUS_IDLE, _RUNNING, _BUSY, _CANCELING
+    var killed = false
+}
+
+/// Antigravity's times: "2026-11-21 07:18:46.384063+00:00".
+func antigravityTime(_ text: String) -> Date? {
+    let chars = Array(text)
+    guard chars.count >= 19 else { return nil }
+    var parts = DateComponents()
+    func number(_ range: Range<Int>) -> Int? { Int(String(chars[range])) }
+    guard let year = number(0..<4), let month = number(5..<7), let day = number(8..<10),
+          let hour = number(11..<13), let minute = number(14..<16), let second = number(17..<19) else { return nil }
+    parts.year = year; parts.month = month; parts.day = day
+    parts.hour = hour; parts.minute = minute; parts.second = second
+    var index = 19
+    var fraction = 0.0
+    if index < chars.count, chars[index] == "." {
+        index += 1
+        var digits = ""
+        while index < chars.count, chars[index].isNumber { digits.append(chars[index]); index += 1 }
+        fraction = Double("0." + digits) ?? 0
+    }
+    var offset = 0
+    if index < chars.count, chars[index] == "+" || chars[index] == "-" {
+        let sign = chars[index] == "-" ? -1 : 1
+        let rest = String(chars[(index + 1)...]).replacingOccurrences(of: ":", with: "")
+        guard rest.count >= 4, let hours = Int(rest.prefix(2)), let minutes = Int(rest.dropFirst(2).prefix(2)) else { return nil }
+        offset = sign * (hours * 3600 + minutes * 60)
+    } else if index < chars.count, chars[index] == "Z" {
+        offset = 0
+    }
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: offset) ?? .gmt
+    return calendar.date(from: parts)?.addingTimeInterval(fraction)
+}
+
+/// The folder of an Antigravity conversation's first workspace, if any.
+func antigravityFolder(_ workspaces: String) -> String? {
+    let first = workspaces.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" }).first.map(String.init) ?? ""
+    guard !first.isEmpty else { return nil }
+    let path = URL(string: first)?.path ?? first
+    return path.isEmpty ? nil : path
+}
+
+/// An Antigravity conversation as a row: running, or finished. A run whose
+/// last change came before this Antigravity started was cut short, so it
+/// counts as finished.
+func antigravityRow(_ c: AntigravityConversation, appStarted: Date?) -> Row? {
+    let id = "agy:\(c.id)", link = antigravityLinkPrefix + c.id
+    let title = [c.title, c.preview].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty }
+        ?? "Antigravity conversation"
+    let context = antigravityFolder(c.workspaces).map(folderLabel) ?? "Antigravity"
+    let busy = ["CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY", "CASCADE_RUN_STATUS_CANCELING"].contains(c.status)
+    let current = appStarted.map { c.modified >= $0.addingTimeInterval(-60) } ?? true
+    if busy && !c.killed && current {
+        // Whole minutes, as the others: the quiet check needs no more.
+        let written = Date(timeIntervalSince1970: (c.modified.timeIntervalSince1970 / 60).rounded(.down) * 60)
+        return Row(id: id, group: .running, title: title, context: context, since: c.lastInput ?? c.modified, link: link,
+                   lastOutput: written)
+    }
+    return Row(id: id, group: .done, title: title, detail: c.killed ? "Stopped" : nil, context: context,
+               since: c.modified, link: link)
+}
+
+/// Antigravity's recent conversations, newest first: not a subagent's,
+/// changed since `since`. Read-only, like Cursor's. While Antigravity has
+/// the database open, its write-ahead log is there and is read too; when it
+/// has closed it, the log is gone, a read-only reader can't make one, and
+/// the database file itself is current, so it's read as a snapshot that
+/// takes no lock (`immutable=1`). nil on any error.
+func readAntigravityConversations(database path: String, since: Date, limit: Int = 30) -> [AntigravityConversation]? {
+    guard FileManager.default.fileExists(atPath: path) else { return nil }
+    let escaped = path.replacingOccurrences(of: "%", with: "%25").replacingOccurrences(of: "?", with: "%3f")
+        .replacingOccurrences(of: "#", with: "%23")
+    return queryAntigravity("file:\(escaped)", since: since, limit: limit)
+        ?? queryAntigravity("file:\(escaped)?immutable=1", since: since, limit: limit)
+}
+
+private func queryAntigravity(_ uri: String, since: Date, limit: Int) -> [AntigravityConversation]? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
+          let db else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    let sql = """
+        SELECT conversation_id, title, preview, workspace_uris, last_modified_time, last_user_input_time, status, killed
+        FROM conversation_summaries
+        WHERE nesting_depth = 0 AND parent_conversation_id = '' AND last_modified_time > ?
+        ORDER BY last_modified_time DESC LIMIT ?
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+    defer { sqlite3_finalize(statement) }
+    let cutoff = DateFormatter()
+    cutoff.locale = Locale(identifier: "en_US_POSIX")
+    cutoff.timeZone = .gmt
+    cutoff.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    sqlite3_bind_text(statement, 1, cutoff.string(from: since), -1, transient)
+    sqlite3_bind_int(statement, 2, Int32(limit))
+    func text(_ column: Int32) -> String { sqlite3_column_text(statement, column).map { String(cString: $0) } ?? "" }
+    var conversations: [AntigravityConversation] = []
+    while true {
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return conversations }
+        guard step == SQLITE_ROW, let modified = antigravityTime(text(4)) else { return nil }
+        conversations.append(AntigravityConversation(id: text(0), title: text(1), preview: text(2), workspaces: text(3),
+                                                     modified: modified, lastInput: antigravityTime(text(5)),
+                                                     status: text(6), killed: sqlite3_column_int(statement, 7) != 0))
     }
 }
 
@@ -1745,7 +1919,8 @@ final class SessionEngine {
     private var cardCheck: DispatchSourceTimer?
     /// ChatGPT's and Cursor's threads, read every 2 s, only while a panel shows.
     private let codex = CodexWatcher()
-    private let cursor = CursorWatcher()
+    private let cursor = AppThreadsWatcher.cursor()
+    private let antigravity = AppThreadsWatcher.antigravity()
     private var otherApps: DispatchSourceTimer?
 
     func start() {
@@ -1780,9 +1955,11 @@ final class SessionEngine {
             engine.activityWanted = true
             engine.codex.refresh()
             engine.cursor.refresh()
+            engine.antigravity.refresh()
             return rowsInOrder(classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
                                         activities: activities, cards: engine.currentCards(),
-                                        background: engine.backgroundWork()) + engine.codex.rows + engine.cursor.rows)
+                                        background: engine.backgroundWork())
+                               + engine.codex.rows + engine.cursor.rows + engine.antigravity.rows)
         }
     }
 
@@ -1827,8 +2004,8 @@ final class SessionEngine {
                 apps.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
                 apps.setEventHandler { [weak self] in
                     guard let self else { return }
-                    let chatGPT = self.codex.refresh(), cursor = self.cursor.refresh()
-                    if chatGPT || cursor { self.publishIfChanged() }
+                    let changed = [self.codex.refresh(), self.cursor.refresh(), self.antigravity.refresh()]
+                    if changed.contains(true) { self.publishIfChanged() }
                 }
                 apps.resume()
                 self.otherApps = apps
@@ -1837,6 +2014,7 @@ final class SessionEngine {
                 self.otherApps = nil
                 self.codex.clear()
                 self.cursor.clear()
+                self.antigravity.clear()
             }
             self.syncActivityWatchers()
             self.publishIfChanged()
@@ -1976,7 +2154,7 @@ final class SessionEngine {
     private func publishIfChanged() {
         let claude = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
                               cards: currentCards(), background: backgroundWork())
-        let others = codex.rows + cursor.rows
+        let others = codex.rows + cursor.rows + antigravity.rows
         let rows = others.isEmpty ? claude : rowsInOrder(claude + others)
         guard rows != lastRows else { return }
         lastRows = rows
@@ -3083,7 +3261,7 @@ struct SessionRow: View {
     private var tooltip: String {
         var parts = [row.title]
         if let line = secondLine { parts.append(line) }
-        parts.append(canOpen ? "Click to " + (row.source == .cursor ? "switch to Cursor" : "open in \(row.appName)") : "Started in a terminal, so it can't be opened from here")
+        parts.append(canOpen ? "Click to " + (row.opensAppOnly ? "switch to \(row.appName)" : "open in \(row.appName)") : "Started in a terminal, so it can't be opened from here")
         return parts.joined(separator: "\n\n")
     }
 
@@ -7636,27 +7814,38 @@ func runCodexBench() {
                  ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
 }
 
-/// --cursor-bench: what reading Cursor's threads costs, on this Mac's real
-/// Cursor: the first read, a tick when nothing changed, and one read.
-func runCursorBench() {
+/// --cursor-bench and --antigravity-bench: what reading an app's threads
+/// costs, on this Mac's real app: the first read, a tick when nothing
+/// changed, and one read of its list.
+func runAppBench(_ watcher: AppThreadsWatcher, name: String) {
     let clock = ContinuousClock()
     func ms(_ d: Duration) -> Double { Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15 }
-    let look = clock.measure { _ = CursorWatcher.findCursor() }
-    let watcher = CursorWatcher()
+    var found: (pid: pid_t, started: Date)?
+    let look = clock.measure { found = AppThreadsWatcher.findApp(suffix: watcher.executableSuffix) }
     let first = clock.measure { watcher.refresh() }
     let ticks = 200
     let rest = clock.measure { for _ in 0..<ticks { watcher.refresh() } }
+    var reading: [Row]?
     let reads = 20
-    let since = Date().addingTimeInterval(-Board.window)
-    let read = clock.measure { for _ in 0..<reads { _ = readCursorThreads(database: CursorWatcher.database, since: since) } }
-    print(CursorWatcher.findCursor() == nil ? "Cursor isn't running: no rows" : "Cursor threads shown: \(watcher.rows.count)"
+    let started = found?.started ?? Date()
+    let read = clock.measure {
+        for _ in 0..<reads {
+            reading = name == "Cursor"
+                ? readCursorThreads(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
+                    .compactMap { cursorRow($0, cursorStarted: started) }
+                : readAntigravityConversations(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
+                    .compactMap { antigravityRow($0, appStarted: started) }
+        }
+    }
+    print(found == nil ? "\(name) isn't running: no rows" : "\(name) threads shown: \(watcher.rows.count)"
           + " (\(watcher.rows.filter { $0.group == .running }.count) running)")
-    print(String(format: "looking for Cursor (every 30 s): %.1f ms", ms(look)))
-    print(String(format: "first read (finds Cursor, reads its list of threads): %.1f ms", ms(first)))
-    print(String(format: "reading the list (open, query, close; only when Cursor wrote): %.2f ms", ms(read) / Double(reads)))
-    print(String(format: "a tick when Cursor wrote nothing: %.3f ms (%.4f%% of one core at one tick every 2 s)",
+    print(reading == nil ? "reading the list failed" : "rows read from the list: \(reading?.count ?? 0)")
+    print(String(format: "looking for \(name) (every 30 s): %.1f ms", ms(look)))
+    print(String(format: "first read (finds \(name), reads its list): %.1f ms", ms(first)))
+    print(String(format: "reading the list (open, query, close; only when \(name) wrote): %.2f ms", ms(read) / Double(reads)))
+    print(String(format: "a tick when \(name) wrote nothing: %.3f ms (%.4f%% of one core at one tick every 2 s)",
                  ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
-    print("reads during \(ticks) ticks: \(watcher.reads - 1)")
+    print("reads during \(ticks) ticks: \(max(0, watcher.reads - 1))")
 }
 
 func runDump() {
@@ -8210,6 +8399,61 @@ func runSelfTest() {
               && Row(id: "local_a1", group: .done, title: "t", context: "", since: now).source == .claude)
     try? FileManager.default.removeItem(atPath: cursorDatabase)
 
+    // Antigravity conversations: its list, in a database shaped like Antigravity's.
+    let agyDatabase = NSTemporaryDirectory() + "limbo-agy-\(getpid()).db"
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: agyDatabase + suffix) }
+    let agyStamp = DateFormatter()
+    agyStamp.locale = Locale(identifier: "en_US_POSIX")
+    agyStamp.timeZone = .gmt
+    agyStamp.dateFormat = "yyyy-MM-dd HH:mm:ss.SSSSSS"
+    func agyTimeText(_ secondsAgo: TimeInterval) -> String { agyStamp.string(from: now.addingTimeInterval(-secondsAgo)) + "+00:00" }
+    func agyRow(_ id: String, title: String, preview: String = "", workspaces: String = "", modified: TimeInterval,
+                input: TimeInterval, status: String, killed: Int = 0, depth: Int = 0, parent: String = "") -> String {
+        "INSERT INTO conversation_summaries VALUES ('\(id)', '\(title)', '\(preview)', '\(workspaces)', "
+            + "'\(agyTimeText(modified))', '\(agyTimeText(input))', '\(status)', \(killed), \(depth), '\(parent)');"
+    }
+    var agySetup: OpaquePointer?
+    _ = sqlite3_open(agyDatabase, &agySetup)
+    let agySQL = [
+        "PRAGMA journal_mode = WAL;",
+        "CREATE TABLE conversation_summaries (conversation_id text, title text NOT NULL DEFAULT '', preview text NOT NULL DEFAULT '', workspace_uris text NOT NULL, last_modified_time datetime NOT NULL, last_user_input_time datetime NOT NULL, status text NOT NULL DEFAULT '', killed numeric NOT NULL DEFAULT false, nesting_depth integer NOT NULL DEFAULT 0, parent_conversation_id text NOT NULL DEFAULT '', PRIMARY KEY (conversation_id));",
+        agyRow("a-run", title: "Sort out the release notes", workspaces: "file:///tmp/web-app", modified: 30, input: 200,
+               status: "CASCADE_RUN_STATUS_RUNNING"),
+        agyRow("a-idle", title: "", preview: "Why is the cache cold?", modified: 3600, input: 3700, status: "CASCADE_RUN_STATUS_IDLE"),
+        agyRow("a-killed", title: "Bump the SDK", modified: 4000, input: 4100, status: "CASCADE_RUN_STATUS_IDLE", killed: 1),
+        agyRow("a-stale", title: "Cut short", modified: 5000, input: 5100, status: "CASCADE_RUN_STATUS_RUNNING"),
+        agyRow("a-sub", title: "A subagent", modified: 20, input: 20, status: "CASCADE_RUN_STATUS_RUNNING", depth: 1, parent: "a-run"),
+        agyRow("a-old", title: "Last month", modified: 30 * 86400, input: 30 * 86400, status: "CASCADE_RUN_STATUS_IDLE"),
+    ]
+    for sql in agySQL { _ = sqlite3_exec(agySetup, sql, nil, nil, nil) }
+    sqlite3_close(agySetup)
+    // Closing the last connection takes the log away, as when Antigravity has
+    // the database closed: a read-only reader then can't open it normally.
+    let agyConversations = readAntigravityConversations(database: agyDatabase, since: now.addingTimeInterval(-Board.window)) ?? []
+    check("Antigravity's list: recent conversations, newest first; no subagents or old ones, even with its log gone",
+          agyConversations.map(\.id) == ["a-run", "a-idle", "a-killed", "a-stale"])
+    check("Antigravity's times read to the microsecond, in their own zone",
+          antigravityTime("2026-11-21 07:18:46.384063+00:00").map { abs($0.timeIntervalSince1970 - 1795245526.384063) < 0.001 } == true
+              && antigravityTime("2026-11-21 12:48:46+05:30").map { abs($0.timeIntervalSince1970 - 1795245526) < 0.001 } == true)
+    let agyStarted = now.addingTimeInterval(-1800)
+    let agyRows = Dictionary(uniqueKeysWithValues: agyConversations.compactMap { c in
+        antigravityRow(c, appStarted: agyStarted).map { (c.id, $0) }
+    })
+    let agyRunning = agyRows["a-run"]
+    check("a running conversation is a running row, from your last message, in its folder",
+          agyRunning?.group == .running && agyRunning?.context == "web-app"
+              && agyRunning.map { abs($0.since.timeIntervalSince(now.addingTimeInterval(-200))) < 0.01 } == true
+              && agyRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    check("it's Antigravity's, switches to it, and can't be tagged or snoozed",
+          agyRunning?.source == .antigravity && agyRunning?.openLabel == "Switch to Antigravity"
+              && agyRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    check("an idle one is finished, named from its first ask when it has no title",
+          agyRows["a-idle"]?.group == .done && agyRows["a-idle"]?.title == "Why is the cache cold?"
+              && agyRows["a-idle"]?.context == "Antigravity")
+    check("a stopped one says so", agyRows["a-killed"]?.group == .done && agyRows["a-killed"]?.detail == "Stopped")
+    check("a run last changed before Antigravity started was cut short: finished", agyRows["a-stale"]?.group == .done)
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: agyDatabase + suffix) }
+
     // Snooze: held until a time you pick, or until the session moves on.
     let snoozeSuite = "limbo-tasks-selftest-snooze"
     let snoozeDefaults = UserDefaults(suiteName: snoozeSuite)!
@@ -8670,7 +8914,11 @@ if arguments.contains("--codex-bench") {
     exit(0)
 }
 if arguments.contains("--cursor-bench") {
-    runCursorBench()
+    runAppBench(AppThreadsWatcher.cursor(), name: "Cursor")
+    exit(0)
+}
+if arguments.contains("--antigravity-bench") {
+    runAppBench(AppThreadsWatcher.antigravity(), name: "Antigravity")
     exit(0)
 }
 if arguments.contains("--dump") {
