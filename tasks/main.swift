@@ -27,6 +27,7 @@
 import AppKit
 import ApplicationServices
 import CoreServices
+import SQLite3
 import SwiftUI
 
 // MARK: - Paths and names
@@ -96,6 +97,14 @@ struct FileStamp: Equatable {
 func fileStamp(_ path: String) -> FileStamp? {
     var st = stat()
     guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return nil }
+    let mtime = TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000
+    return FileStamp(inode: UInt64(st.st_ino), mtime: mtime, size: Int64(st.st_size))
+}
+
+/// A file's or folder's stamp, for noticing a change; symlinks are not followed.
+func pathStamp(_ path: String) -> FileStamp? {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return nil }
     let mtime = TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000
     return FileStamp(inode: UInt64(st.st_ino), mtime: mtime, size: Int64(st.st_size))
 }
@@ -601,17 +610,23 @@ func latestWrite(transcript path: String) -> Date? {
 }
 
 /// How many of a session's background tasks (Bash commands left running,
-/// monitors) are still running: their output files, …/<session>/tasks/<id>.output,
-/// held open by the session's own child shells. Its process can be idle the
-/// whole time, between turns. A few system calls per idle session; no process
-/// is started and nothing is read.
+/// monitors) are still running. A Bash command holds its output file,
+/// …/<session>/tasks/<id>.output, open; a monitor streams to Claude instead,
+/// so it is a shell Claude started (its command sources one of Claude's
+/// shell snapshots) holding no such file. Either way a child of the session's
+/// own process, which can be idle the whole time, between turns. A few system
+/// calls per idle session; no process is started, and of a shell's command
+/// only whether it has the marker is kept.
 func runningBackgroundTasks(parent: Int32, session: String) -> Int {
     var children = [pid_t](repeating: 0, count: 64)
     let count = Int(proc_listchildpids(parent, &children, Int32(children.count * MemoryLayout<pid_t>.stride)))
     guard count > 0 else { return 0 }
     let marker = "/\(session)/tasks/"
     var files = Set<String>()
+    var shells = 0
     for child in children.prefix(min(count, children.count)) {
+        let before = files.count
+        defer { if files.count == before && isClaudeShell(child) { shells += 1 } }
         let bytes = proc_pidinfo(child, PROC_PIDLISTFDS, 0, nil, 0)
         guard bytes > 0 else { continue }
         var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride)
@@ -625,7 +640,26 @@ func runningBackgroundTasks(parent: Int32, session: String) -> Int {
             if path.hasSuffix(".output"), path.contains(marker) { files.insert(path) }
         }
     }
-    return files.count
+    return files.count + shells
+}
+
+/// A shell started by Claude's Bash or Monitor tool: its command line
+/// sources one of Claude's shell snapshots (~/.claude/shell-snapshots/).
+/// Only shells are looked at (not MCP servers), and nothing of the command
+/// is kept.
+func isClaudeShell(_ pid: pid_t) -> Bool {
+    var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return false }
+    let exe = String(cString: path)
+    guard ["/zsh", "/bash", "/sh"].contains(where: exe.hasSuffix) else { return false }
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return false }
+    var args = [UInt8](repeating: 0, count: size)
+    guard sysctl(&mib, 3, &args, &size, nil, 0) == 0 else { return false }
+    return args.prefix(size).withUnsafeBytes { raw in
+        raw.firstRange(of: Array("/.claude/shell-snapshots/snapshot-".utf8)) != nil
+    }
 }
 
 /// "2 background tasks running"
@@ -743,10 +777,15 @@ struct Row: Identifiable, Equatable {
     var card: TurnCard? = nil   // how its latest turn ended: question, buttons, reply
     var seen: Date? = nil       // when it last came into view in the Claude app
     var tags: [String] = []     // your tags on it, kept by Limbo (SessionTags)
+    var snoozedUntil: Date? = nil // snoozed by you until then (SessionSnoozes)
+    var agent: RowSource? = nil   // the agent behind a thread another app runs (Orca's), for its icon
 
-    /// Tagged On hold: listed apart, not counted, no glow. A running session
-    /// still shows as running, and goes on hold when it stops.
-    var held: Bool { group != .running && tags.contains(SessionTags.onHold) }
+    /// Tagged On hold, or snoozed: listed apart, not counted, no glow. A
+    /// running session still shows as running, and goes on hold when it stops.
+    var held: Bool { group != .running && (snoozedUntil != nil || tags.contains(SessionTags.onHold)) }
+
+    /// Snoozed: held until a time you picked, then back where it was.
+    var snoozed: Bool { group != .running && snoozedUntil != nil }
 
     /// How long a running session has written nothing, once that passes
     /// `quietAfter`: possibly stuck, or in one long command.
@@ -913,10 +952,15 @@ struct Board {
     var done: [Row] = []
     var terminal: [Row] = []
     var onHold: [Row] = []
+    var snoozed: [Row] = []
 
     init(rows: [Row], now: Date) {
         for r in rows {
             let age = now.timeIntervalSince(r.since)
+            if r.snoozed {
+                snoozed.append(r)
+                continue
+            }
             if r.held {
                 if age <= Board.window { onHold.append(r) }
                 continue
@@ -936,7 +980,7 @@ struct Board {
 
     var isEmpty: Bool {
         yourTurn.isEmpty && older.isEmpty && running.isEmpty && justFinished.isEmpty
-            && review.isEmpty && done.isEmpty && terminal.isEmpty && onHold.isEmpty
+            && review.isEmpty && done.isEmpty && terminal.isEmpty && onHold.isEmpty && snoozed.isEmpty
     }
 }
 
@@ -1014,6 +1058,1140 @@ struct SessionTags: Equatable {
     static func taggable(_ row: Row) -> Bool { row.link.map(isSessionId) ?? false }
 }
 
+/// Sessions you snoozed: held (out of the counts and the glow) until the
+/// time you picked, or until the session moves on (you answer it, or it
+/// ends another turn), whichever comes first. Kept in Limbo's settings by
+/// session id, like your tags.
+struct SessionSnoozes: Equatable {
+    static let key = "sessionSnoozes"
+
+    struct Entry: Equatable {
+        var until: Date
+        var at: Date        // when you snoozed it: a turn after this ends the snooze
+    }
+
+    var byId: [String: Entry] = [:]
+
+    static func load(_ defaults: UserDefaults = .standard) -> SessionSnoozes {
+        let raw = defaults.dictionary(forKey: key) as? [String: [String: Double]] ?? [:]
+        var snoozes = SessionSnoozes()
+        for (id, e) in raw {
+            guard let until = e["until"], let at = e["at"] else { continue }
+            snoozes.byId[id] = Entry(until: Date(timeIntervalSince1970: until), at: Date(timeIntervalSince1970: at))
+        }
+        return snoozes
+    }
+
+    func save(_ defaults: UserDefaults = .standard) {
+        defaults.set(byId.mapValues { ["until": $0.until.timeIntervalSince1970, "at": $0.at.timeIntervalSince1970] },
+                     forKey: Self.key)
+    }
+
+    mutating func snooze(_ id: String, until: Date, at: Date) { byId[id] = Entry(until: until, at: at) }
+
+    mutating func wake(_ id: String) { byId[id] = nil }
+
+    /// Ends the snoozes that ran out by `now`: their ids and when each ran out.
+    mutating func expire(now: Date) -> [String: Date] {
+        let ended = byId.filter { $0.value.until <= now }
+        for id in ended.keys { byId[id] = nil }
+        return ended.mapValues(\.until)
+    }
+
+    /// Ends the snoozes of sessions that moved on since (running again, or a
+    /// newer turn); true if any ended.
+    mutating func prune(_ rows: [Row]) -> Bool {
+        let moved = rows.filter { row in byId[row.id].map { row.since > $0.at } ?? false }
+        for row in moved { byId[row.id] = nil }
+        return !moved.isEmpty
+    }
+
+    /// The rows, with the snoozed ones marked.
+    func apply(to rows: [Row], now: Date) -> [Row] {
+        guard !byId.isEmpty else { return rows }
+        return rows.map { row in
+            guard let e = byId[row.id], e.until > now, row.since <= e.at, row.group != .running else { return row }
+            var snoozed = row
+            snoozed.snoozedUntil = e.until
+            return snoozed
+        }
+    }
+
+    /// When the next snooze runs out.
+    var nextEnd: Date? { byId.values.map(\.until).min() }
+
+    /// Drops the snoozes of these sessions (archived in the Claude app); true if any went.
+    mutating func forget(_ ids: Set<String>) -> Bool {
+        let before = byId.count
+        for id in ids { byId[id] = nil }
+        return byId.count != before
+    }
+
+    /// What can be snoozed: a Claude app session that counts or asks you
+    /// something (needs you, to review, just finished), and isn't on hold.
+    static func snoozable(_ row: Row) -> Bool {
+        guard SessionTags.taggable(row), row.group != .running, !row.held else { return false }
+        return row.group == .yourTurn || row.group == .review || row.group == .justFinished || row.card?.ask != nil
+    }
+}
+
+/// How long to snooze: the right-click menu's and the cards' choices.
+enum SnoozeChoice: String, CaseIterable, Identifiable {
+    case hour, threeHours, tomorrow
+    var id: String { rawValue }
+
+    /// For menus.
+    var title: String {
+        switch self {
+        case .hour: return "For 1 Hour"
+        case .threeHours: return "For 3 Hours"
+        case .tomorrow: return "Until Tomorrow Morning"
+        }
+    }
+
+    /// For the small buttons on a card.
+    var short: String {
+        switch self {
+        case .hour: return "1h"
+        case .threeHours: return "3h"
+        case .tomorrow: return "Tomorrow"
+        }
+    }
+
+    /// Tomorrow morning is 9:00 the next day.
+    func until(from now: Date, calendar: Calendar = .current) -> Date {
+        switch self {
+        case .hour: return now.addingTimeInterval(3600)
+        case .threeHours: return now.addingTimeInterval(3 * 3600)
+        case .tomorrow:
+            let start = calendar.startOfDay(for: now)
+            return calendar.date(byAdding: DateComponents(day: 1, hour: 9), to: start) ?? now.addingTimeInterval(86400)
+        }
+    }
+}
+
+/// "until 3:40 PM", "until tomorrow 9:00 AM", "until Fri 9:00 AM".
+func snoozeWhen(_ until: Date, now: Date, calendar: Calendar = .current) -> String {
+    let time = until.formatted(date: .omitted, time: .shortened)
+    if calendar.isDate(until, inSameDayAs: now) { return "until \(time)" }
+    if let next = calendar.date(byAdding: .day, value: 1, to: now), calendar.isDate(until, inSameDayAs: next) {
+        return "until tomorrow \(time)"
+    }
+    return "until " + until.formatted(.dateTime.weekday(.abbreviated)) + " \(time)"
+}
+
+// MARK: - ChatGPT (Codex) threads
+
+/// Codex threads in the ChatGPT app. Its Codex server keeps each loaded
+/// thread's rollout file (~/.codex/sessions/…/rollout-…-<id>.jsonl) open;
+/// a turn's start and end are lines in it ("task_started", "task_complete",
+/// "turn_aborted"). Read only while the window or the panel shows: which
+/// files the server holds (a few system calls), then only the new lines of
+/// a file that grew. Thread names come from ~/.codex/session_index.jsonl.
+enum CodexMarker: Equatable { case started, complete, aborted }
+
+/// What a rollout file has said so far, read up to `offset` (a line end).
+struct RolloutScan: Equatable {
+    var offset: UInt64 = 0
+    var marker: CodexMarker?
+    var markerTime: Date?
+    var activity: String?       // the last step since the turn started
+    var lastWrite: Date?        // the last line's time
+}
+
+let codexTime: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+/// Reads the complete lines a rollout file gained since `scan`. The first
+/// read of a big file starts in its last 16 MB; a half-written last line is
+/// left for next time. Only each line's first bytes are looked at: the
+/// structure there ("type":"event_msg","payload":{"type":"task_started")
+/// comes before any text, so words inside a message never count.
+func scanRollout(path: String, from scan: RolloutScan) -> RolloutScan {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return scan }
+    defer { try? handle.close() }
+    guard let end = try? handle.seekToEnd() else { return scan }
+    var next = scan
+    if end < scan.offset { next = RolloutScan() }   // rewritten: start over
+    var start = next.offset
+    if start == 0 && end > 16 << 20 { start = end - (16 << 20) }
+    guard end > start else { return next }
+    guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.read(upToCount: Int(end - start)),
+          let lastNewline = data.lastIndex(of: 0x0A) else { return next }
+    let body = data[data.startIndex...lastNewline]
+    var lineStart = body.startIndex
+    // Starting mid-file: the first piece is part of a line.
+    if start > 0 && start != scan.offset, let first = body.firstIndex(of: 0x0A) { lineStart = first + 1 }
+    while lineStart < body.endIndex {
+        let lineEnd = body[lineStart...].firstIndex(of: 0x0A) ?? body.endIndex
+        readRolloutLine(body[lineStart..<lineEnd], into: &next)
+        lineStart = lineEnd + 1
+    }
+    next.offset = start + UInt64(lastNewline - data.startIndex + 1)
+    return next
+}
+
+private let eventPrefix = Array(#""type":"event_msg","payload":{"type":""#.utf8)
+private let itemPrefix = Array(#""type":"response_item","payload":{"type":""#.utf8)
+
+/// One rollout line: a turn marker, or a step that says what a running thread is doing.
+func readRolloutLine(_ line: Data, into scan: inout RolloutScan) {
+    let head = line.prefix(400)
+    guard head.starts(with: Array(#"{"timestamp":""#.utf8)) else { return }
+    let time = head.dropFirst(14).prefix(30).split(separator: UInt8(ascii: "\""), maxSplits: 1).first
+        .flatMap { codexTime.date(from: String(decoding: $0, as: UTF8.self)) }
+    if let time { scan.lastWrite = time }
+    func kind(after prefix: [UInt8]) -> String? {
+        guard let range = head.firstRange(of: prefix) else { return nil }
+        let rest = head[range.upperBound...]
+        guard let close = rest.firstIndex(of: UInt8(ascii: "\"")) else { return nil }
+        return String(decoding: rest[..<close], as: UTF8.self)
+    }
+    if let event = kind(after: eventPrefix) {
+        let marker: CodexMarker? = event == "task_started" ? .started : event == "task_complete" ? .complete
+            : event == "turn_aborted" ? .aborted : nil
+        if let marker {
+            scan.marker = marker
+            scan.markerTime = time
+            scan.activity = nil
+        }
+    } else if let item = kind(after: itemPrefix), scan.marker == .started {
+        switch item {
+        case "reasoning": scan.activity = "Thinking"
+        case "message":
+            if head.firstRange(of: Array(#""role":"assistant""#.utf8)) != nil { scan.activity = "Writing" }
+        case "web_search_call": scan.activity = "Searching the web"
+        case "function_call", "custom_tool_call":
+            let name = head.firstRange(of: Array(#""name":""#.utf8)).map { range -> String in
+                let rest = head[range.upperBound...]
+                return String(decoding: rest.prefix { $0 != UInt8(ascii: "\"") }, as: UTF8.self)
+            } ?? ""
+            scan.activity = codexToolPhrase(name)
+        default: break
+        }
+    }
+}
+
+/// "Running a command", "Editing files", … for a Codex tool call.
+func codexToolPhrase(_ name: String) -> String {
+    switch name {
+    case "exec", "exec_command", "shell", "shell_command", "local_shell": return "Running a command"
+    case "apply_patch": return "Editing files"
+    case "wait", "write_stdin": return "Waiting on a command"
+    case "update_plan": return "Planning"
+    case "view_image": return "Looking at an image"
+    default: return "Using a tool"
+    }
+}
+
+/// The first line of a rollout: the thread's id, its folder, and who started
+/// it (thread_source). Read from its first 16 KB, which come before the long
+/// instructions it carries.
+func rolloutHeader(path: String) -> (id: String?, cwd: String?, source: String?) {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, nil, nil) }
+    defer { try? handle.close() }
+    guard let data = try? handle.read(upToCount: 16 << 10) else { return (nil, nil, nil) }
+    let head = data.prefix { $0 != 0x0A }
+    func value(_ key: String) -> String? {
+        guard let range = head.firstRange(of: Array("\"\(key)\":\"".utf8)) else { return nil }
+        var bytes: [UInt8] = [UInt8(ascii: "\"")]
+        var escaped = false
+        for byte in head[range.upperBound...] {
+            bytes.append(byte)
+            if escaped { escaped = false } else if byte == UInt8(ascii: "\\") { escaped = true }
+            else if byte == UInt8(ascii: "\"") { break }
+        }
+        return (try? JSONSerialization.jsonObject(with: Data(bytes), options: .fragmentsAllowed)) as? String
+    }
+    return (value("id"), value("cwd"), value("thread_source"))
+}
+
+/// Threads you started (not Codex's own agents, reviewers or voice sessions).
+func codexThreadShown(source: String?) -> Bool {
+    guard let source else { return true }
+    return !["subagent", "guardian_review", "realtime_voice"].contains(source)
+}
+
+/// The thread id in a rollout file's name, right after its start time:
+/// rollout-2026-10-14T10-02-20-<id>.jsonl. A long thread's file can carry a
+/// second id after it (<id>_<other>.jsonl), so it's the first, not the last.
+func codexThreadId(path: String) -> String? {
+    let name = (path as NSString).lastPathComponent
+    let start = "rollout-2026-10-14T10-02-20-".count
+    guard name.hasPrefix("rollout-"), name.hasSuffix(".jsonl"), name.count >= start + 36 + 6 else { return nil }
+    let id = String(name.dropFirst(start).prefix(36))
+    return id.allSatisfy { isASCIIAlnum($0) || $0 == "-" } ? id : nil
+}
+
+/// A Codex thread as a row: running, or finished (stopped) with when.
+func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row? {
+    guard let marker = scan.marker, let since = scan.markerTime else { return nil }
+    let title = name.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+        ?? "Codex thread"
+    let context = cwd.map(folderLabel) ?? "ChatGPT"
+    let link = "codex://threads/\(id)"
+    switch marker {
+    case .started:
+        // Written at most once a minute, as Claude's are: the quiet check needs no more.
+        let written = scan.lastWrite.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
+        return Row(id: "codex:\(id)", group: .running, title: title, context: context, since: since, link: link,
+                   activity: scan.activity, lastOutput: written)
+    case .complete, .aborted:
+        return Row(id: "codex:\(id)", group: .done, title: title, detail: marker == .aborted ? "Stopped" : nil,
+                   context: context, since: since, link: link)
+    }
+}
+
+/// The app a row's session or thread is in.
+enum RowSource { case claude, chatGPT, cursor, antigravity, orca }
+
+extension Row {
+    var source: RowSource {
+        if id.hasPrefix("codex:") { return .chatGPT }
+        if id.hasPrefix("cursor:") { return .cursor }
+        if id.hasPrefix("agy:") { return .antigravity }
+        if id.hasPrefix("orca:") { return .orca }
+        return .claude
+    }
+
+    /// A thread in ChatGPT, Cursor, Antigravity or Orca: listed, never
+    /// counted in the menu bar, never tagged or snoozed.
+    var fromOtherApp: Bool { source != .claude }
+
+    /// The app a click goes to, from the link. Usually the row's own app;
+    /// a Claude session that Orca runs goes to Orca.
+    var linkApp: RowSource? {
+        guard let link else { return nil }
+        if isSessionId(link) { return .claude }
+        if link.hasPrefix("codex://threads/") { return .chatGPT }
+        if link.hasPrefix(cursorLinkPrefix) { return .cursor }
+        if link.hasPrefix(antigravityLinkPrefix) { return .antigravity }
+        if link.hasPrefix(orcaLinkPrefix) { return .orca }
+        return nil
+    }
+
+    /// Where a click goes: the session in Claude, the thread in ChatGPT, or
+    /// Cursor, Antigravity or Orca itself. Cursor has no link to one of its
+    /// own threads (its /agent link finds only cloud agents, and shows an
+    /// error otherwise); Antigravity's are its window's own, unpublished;
+    /// Orca's pair devices, open bots and share skills.
+    var openURL: URL? {
+        guard let link, let app = linkApp else { return nil }
+        switch app {
+        case .claude: return URL(string: "claude://claude.ai/epitaxy/\(link)")
+        case .chatGPT: return URL(string: link)
+        case .cursor, .antigravity, .orca: return NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleId)
+        }
+    }
+
+    /// "Claude", "ChatGPT", "Cursor", "Antigravity" or "Orca": the app it's in.
+    var appName: String { source.name }
+
+    /// Whose icon leads the row: the agent's for a thread Orca runs (Claude's,
+    /// Antigravity's…), else the app's it's in.
+    var iconSource: RowSource { agent ?? source }
+
+    /// The app comes forward, not the thread: Cursor, Antigravity and Orca.
+    var opensAppOnly: Bool { [.cursor, .antigravity, .orca].contains(linkApp ?? source) }
+
+    /// What a click does, for menus: "Open in Claude", or "Switch to Orca".
+    var openLabel: String {
+        let app = (linkApp ?? source).name
+        return opensAppOnly ? "Switch to \(app)" : "Open in \(app)"
+    }
+
+    /// ", in ChatGPT", ", in Cursor" or ", in Antigravity" for VoiceOver, which can't see the icon;
+    /// nothing for Claude's own sessions.
+    var spokenApp: String {
+        guard fromOtherApp else { return "" }
+        if let agent, agent != source { return ", \(agent.name) in \(appName)" }
+        return ", in \(appName)"
+    }
+}
+
+extension RowSource {
+    var name: String {
+        switch self {
+        case .claude: return "Claude"
+        case .chatGPT: return "ChatGPT"
+        case .cursor: return "Cursor"
+        case .antigravity: return "Antigravity"
+        case .orca: return "Orca"
+        }
+    }
+
+    /// The app's bundle id: where its icon comes from.
+    var bundleId: String {
+        switch self {
+        case .claude: return "com.anthropic.claudefordesktop"
+        case .chatGPT: return "com.openai.codex"
+        case .cursor: return cursorBundleId
+        case .antigravity: return antigravityBundleId
+        case .orca: return orcaBundleId
+        }
+    }
+}
+
+/// Each app's icon as macOS shows it, looked up once per app. nil when the
+/// app isn't installed: its rows then show the state mark alone, as before.
+/// Read from the installed app, so no app's logo is kept in this repo.
+private var appIcons: [RowSource: (icon: NSImage?, at: Date)] = [:]
+func appIcon(_ source: RowSource) -> NSImage? {
+    // One not found is looked for again a minute later: an app just installed,
+    // or opened from its disk image.
+    if let known = appIcons[source], known.icon != nil || Date().timeIntervalSince(known.at) < 60 { return known.icon }
+    let icon = NSWorkspace.shared.urlForApplication(withBundleIdentifier: source.bundleId)
+        .map { NSWorkspace.shared.icon(forFile: $0.path) }
+    appIcons[source] = (icon, Date())
+    return icon
+}
+
+/// A process's executable path, or "" if it's gone.
+func executablePath(_ pid: pid_t) -> String {
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    return proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
+}
+
+/// Reads the ChatGPT app's Codex threads, on the engine's queue, on the
+/// engine's two-second tick while a panel shows. Each tick: is the app's Codex server still
+/// there (one call), which rollout files it holds (one call per open file),
+/// and a stat of each; a file is read only when it grew, from where the
+/// last read stopped. It looks for ChatGPT's servers every 10 s while it
+/// knows none, and every 30 s otherwise.
+final class CodexWatcher {
+    private var servers: [pid_t] = []
+    private var lookedForServers = Date.distantPast
+    private var scans: [String: RolloutScan] = [:]
+    private var headers: [String: (id: String?, cwd: String?, source: String?)] = [:]
+    private var names: [String: String] = [:]
+    private var namesStamp: FileStamp?
+    private(set) var rows: [Row] = []
+
+    static let indexPath = Paths.home.appendingPathComponent(".codex/session_index.jsonl").path
+
+    /// No panel shows: drop the rows (what was read stays, for next time).
+    @discardableResult
+    func clear() -> Bool {
+        guard !rows.isEmpty else { return false }
+        rows = []
+        return true
+    }
+
+    /// Reads once; true if the rows changed.
+    @discardableResult
+    func refresh() -> Bool {
+        let now = Date()
+        servers = servers.filter { kill($0, 0) == 0 }
+        // Every 10 s while none is known, and every 30 s anyway: ChatGPT can
+        // start a new server (after an update) while an old helper lives on.
+        if now.timeIntervalSince(lookedForServers) >= (servers.isEmpty ? 10 : 30) {
+            lookedForServers = now
+            servers = Self.findServers()
+        }
+        var held = Set<String>()
+        for pid in servers { held.formUnion(Self.heldRollouts(pid)) }
+        for path in scans.keys where !held.contains(path) {
+            scans[path] = nil
+            headers[path] = nil
+        }
+        if !held.isEmpty { loadNames() }
+        var fresh: [Row] = []
+        for path in held {
+            let header = headers[path] ?? rolloutHeader(path: path)
+            headers[path] = header
+            // The id inside the file is the thread's; the name is the fallback.
+            guard let id = header.id ?? codexThreadId(path: path), codexThreadShown(source: header.source)
+            else { continue }
+            let before = scans[path] ?? RolloutScan()
+            let size = fileStamp(path)?.size ?? 0
+            let scan = UInt64(size) == before.offset ? before : scanRollout(path: path, from: before)
+            scans[path] = scan
+            if let row = codexRow(id: id, name: names[id], cwd: header.cwd, scan: scan) { fresh.append(row) }
+        }
+        fresh = rowsInOrder(fresh)
+        guard fresh != rows else { return false }
+        rows = fresh
+        return true
+    }
+
+    /// The ChatGPT app's Codex servers: `codex` processes started by the app
+    /// (com.openai.codex, named ChatGPT), directly or through one of its
+    /// helpers: since November 2026 the server that holds the threads is
+    /// started by "Codex (Aperitif)" inside the app, so it's the app's
+    /// grandchild. Looks at every process's path, so only when none is known,
+    /// at most every 10 s, and every 30 s otherwise.
+    static func findServers() -> [pid_t] {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
+        guard count > 0 else { return [] }
+        var found: [pid_t] = []
+        for pid in pids.prefix(min(count, pids.count)) where pid > 0 {
+            let exe = executablePath(pid)
+            guard exe.hasSuffix("/MacOS/codex"), exe.contains(".app/Contents/") else { continue }
+            if startedByChatGPT(pid) { found.append(pid) }
+        }
+        return found
+    }
+
+    /// Whether the ChatGPT app is among a process's parent, grandparent or
+    /// great-grandparent.
+    static func startedByChatGPT(_ pid: pid_t) -> Bool {
+        var current = pid
+        for _ in 0..<3 {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(current, PROC_PIDTBSDINFO, 0, &info, size) == size, info.pbi_ppid > 1 else { return false }
+            current = pid_t(info.pbi_ppid)
+            if isChatGPTApp(executablePath(current)) { return true }
+        }
+        return false
+    }
+
+    /// The ChatGPT app's own executable, wherever the app is.
+    static func isChatGPTApp(_ path: String) -> Bool { path.hasSuffix(".app/Contents/MacOS/ChatGPT") }
+
+    /// The rollout files a process holds open.
+    static func heldRollouts(_ pid: pid_t) -> Set<String> {
+        let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard bytes > 0 else { return [] }
+        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride)
+        let got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, bytes)
+        guard got > 0 else { return [] }
+        var paths = Set<String>()
+        for fd in fds.prefix(Int(got) / MemoryLayout<proc_fdinfo>.stride) where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
+            var info = vnode_fdinfowithpath()
+            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+            guard proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size) == size else { continue }
+            let path = withUnsafeBytes(of: &info.pvip.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            if path.contains("/.codex/sessions/"), path.hasSuffix(".jsonl") { paths.insert(path) }
+        }
+        return paths
+    }
+
+    /// Thread names: the last name each id got in session_index.jsonl. Read
+    /// again only when the file changes.
+    private func loadNames() {
+        let stamp = fileStamp(Self.indexPath)
+        guard stamp != namesStamp else { return }
+        namesStamp = stamp
+        names = codexNames(index: (try? String(contentsOfFile: Self.indexPath, encoding: .utf8)) ?? "")
+    }
+}
+
+/// The last name each thread id got, from session_index.jsonl's lines.
+func codexNames(index: String) -> [String: String] {
+    var names: [String: String] = [:]
+    for line in index.split(separator: "\n") {
+        guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let id = object["id"] as? String, let name = object["thread_name"] as? String else { continue }
+        names[id] = name
+    }
+    return names
+}
+
+// MARK: - Cursor threads
+
+/// Cursor's bundle id: a click on one of its threads brings it forward.
+let cursorBundleId = "com.todesktop.230313mzl4w4u92"
+
+/// A Cursor thread's link: not openable as is (see Row.openURL).
+let cursorLinkPrefix = "cursor-thread:"
+
+/// One Cursor agent thread, from Cursor's own list of them: the small
+/// composerHeaders table in its state database, a row per thread.
+struct CursorThread: Equatable {
+    let id: String
+    var name: String?
+    var subtitle: String?     // what Cursor shows under it: the last step, or your first ask
+    var folder: String?
+    var updated: Date         // lastUpdatedAt: your last message
+    var checkpoint: Date?     // checkpointAt: moves as a run goes, and stamps its end
+    var runStarted: Date?     // unfinishedRunAt: set while a run goes, cleared when it ends
+    var needsApproval = false // hasBlockingPendingActions
+    var planReady = false     // hasPendingPlan
+}
+
+/// A Cursor thread as a row: running, waiting on you, or finished. A run
+/// that began before this Cursor started was cut short (it quit or
+/// crashed mid-run), so it counts as finished.
+func cursorRow(_ thread: CursorThread, cursorStarted: Date?) -> Row? {
+    let name = thread.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let runStart = thread.runStarted.flatMap { start in
+        cursorStarted.map { start >= $0.addingTimeInterval(-60) } ?? true ? start : nil
+    }
+    guard !name.isEmpty || runStart != nil else { return nil }
+    let id = "cursor:\(thread.id)", link = cursorLinkPrefix + thread.id
+    let title = name.isEmpty ? "Cursor thread" : name
+    let context = thread.folder.map(folderLabel) ?? "Cursor"
+    let ended = max(thread.updated, thread.checkpoint ?? thread.updated)
+    if let runStart {
+        if thread.needsApproval {
+            return Row(id: id, group: .yourTurn, title: title, detail: "Waiting for your approval", context: context,
+                       since: thread.checkpoint ?? runStart, link: link)
+        }
+        let activity = thread.subtitle?.split(whereSeparator: \.isNewline).first
+            .map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
+        // Whole minutes, as Claude's and ChatGPT's: the quiet check needs no more.
+        let written = thread.checkpoint.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
+        return Row(id: id, group: .running, title: title, context: context, since: runStart, link: link,
+                   activity: activity, lastOutput: written)
+    }
+    if thread.planReady {
+        return Row(id: id, group: .yourTurn, title: title, detail: "Plan ready to review", context: context,
+                   since: ended, link: link)
+    }
+    return Row(id: id, group: .done, title: title, context: context, since: ended, link: link)
+}
+
+/// Cursor's recent threads, newest first: not archived, not a subagent's,
+/// not an unsent draft, touched since `since`. One indexed query on a small
+/// table. The database is opened read-only and closed straight after, so
+/// no read is left open to hold up Cursor's own writes. nil on any error.
+func readCursorThreads(database path: String, since: Date, limit: Int = 30) -> [CursorThread]? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    let sql = """
+        SELECT composerId, lastUpdatedAt, checkpointAt, json_extract(value, '$.name'),
+               json_extract(value, '$.subtitle'), json_extract(value, '$.workspaceIdentifier.uri.fsPath'),
+               json_extract(value, '$.unfinishedRunAt'), json_extract(value, '$.hasBlockingPendingActions'),
+               json_extract(value, '$.hasPendingPlan')
+        FROM composerHeaders
+        WHERE isArchived = 0 AND isSubagent = 0 AND recency > ?
+          AND coalesce(json_extract(value, '$.isDraft'), 0) = 0
+        ORDER BY recency DESC LIMIT ?
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, Int64(since.timeIntervalSince1970 * 1000))
+    sqlite3_bind_int(statement, 2, Int32(limit))
+    func text(_ column: Int32) -> String? { sqlite3_column_text(statement, column).map { String(cString: $0) } }
+    func date(_ column: Int32) -> Date? {
+        guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
+        return Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, column)) / 1000)
+    }
+    var threads: [CursorThread] = []
+    while true {
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return threads }
+        guard step == SQLITE_ROW, let id = text(0) else { return nil }
+        threads.append(CursorThread(id: id, name: text(3), subtitle: text(4), folder: text(5),
+                                    updated: date(1) ?? .distantPast, checkpoint: date(2), runStarted: date(6),
+                                    needsApproval: sqlite3_column_int(statement, 7) != 0,
+                                    planReady: sqlite3_column_int(statement, 8) != 0))
+    }
+}
+
+/// Reads one app's threads from the app's own database (Cursor's,
+/// Antigravity's), on the engine's queue, on the engine's two-second tick
+/// while a panel shows. Each tick: is the app still running (one call), and
+/// a stat of the database and of its log; the list is read only when one of
+/// them changed (about every 15 s while Cursor works), and tried again on
+/// the next tick when a read fails. It looks for the app every 10 s while
+/// it isn't running, and every 30 s otherwise. Rows show only while the app
+/// runs.
+final class AppThreadsWatcher {
+    /// The app's main executable ends so: ".app/Contents/MacOS/Cursor".
+    let executableSuffix: String
+    let database: String
+    /// The rows from the app's list of threads, given now and when the app started.
+    private let read: (_ now: Date, _ appStarted: Date) -> [Row]?
+    /// More files or folders whose change means read again (Antigravity's notes).
+    private let watched: () -> [String]
+    private var app: (pid: pid_t, started: Date)?
+    private var lookedForApp = Date.distantPast
+    private var stamp: [FileStamp?]?
+    private(set) var rows: [Row] = []
+    /// Reads of the list of threads, for the bench.
+    private(set) var reads = 0
+
+    init(executableSuffix: String, database: String, watched: @escaping () -> [String] = { [] },
+         read: @escaping (_ now: Date, _ appStarted: Date) -> [Row]?) {
+        self.executableSuffix = executableSuffix
+        self.database = database
+        self.watched = watched
+        self.read = read
+    }
+
+    static let cursorDatabase = Paths.home
+        .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb").path
+    static let antigravityDatabase = Paths.home.appendingPathComponent(".gemini/antigravity/conversation_summaries.db").path
+
+    static func cursor() -> AppThreadsWatcher {
+        AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Cursor", database: cursorDatabase) { now, started in
+            readCursorThreads(database: cursorDatabase, since: now.addingTimeInterval(-Board.window))?
+                .compactMap { cursorRow($0, cursorStarted: started) }
+        }
+    }
+
+    static let orcaDatabase = Paths.home.appendingPathComponent("Library/Application Support/orca/agent-session-domain.db").path
+    static let orcaWorktrees = Paths.home.appendingPathComponent("Library/Application Support/orca/orca-usage-worktree-history.json").path
+
+    /// Orca's profile database, which names its folder workspaces and bots.
+    static var orcaProfile: String {
+        let orca = Paths.home.appendingPathComponent("Library/Application Support/orca")
+        let index = readFile(orca.appendingPathComponent("orca-profile-index.json").path, limit: 1 << 20)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let profile = (index?["activeProfileId"] as? String).flatMap { id in
+            id.allSatisfy { isASCIIAlnum($0) || $0 == "-" || $0 == "_" } && !id.isEmpty ? id : nil
+        } ?? "local-default"
+        return orca.appendingPathComponent("profiles/\(profile)/profile-state.db").path
+    }
+
+    /// Orca's: the threads open in its tabs, each under its worktree's name,
+    /// a bot's chats with the bot's name. `adopted` gets the Orca thread for
+    /// each agent's own id, so a Claude session Orca runs is listed once.
+    /// The folder workspaces' names are read again only when Orca's profile
+    /// changed.
+    static func orca(adopted: AdoptedIds) -> AppThreadsWatcher {
+        final class Folders { var stamp: [FileStamp?]?; var names: [String: (name: String, bot: Bool)] = [:] }
+        let folders = Folders()
+        return AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Orca", database: orcaDatabase,
+                                 watched: { [orcaWorktrees] }) { _, _ in
+            guard var threads = readOrcaThreads(database: orcaDatabase) else { return nil }
+            let names = orcaWorktreeNames(readFile(orcaWorktrees, limit: 1 << 20))
+            let profile = orcaProfile
+            let stamp = [pathStamp(profile), pathStamp(profile + "-wal")]
+            if stamp != folders.stamp {
+                folders.names = readOrcaFolderWorkspaces(database: profile)
+                folders.stamp = stamp
+            }
+            for index in threads.indices {
+                let workspace = threads[index].workspace
+                threads[index].worktree = names[workspace]
+                if workspace.hasPrefix("folder:"), let folder = folders.names[String(workspace.dropFirst(7))] {
+                    if folder.bot { threads[index].bot = folder.name } else { threads[index].worktree = folder.name }
+                }
+            }
+            adopted.threads = Dictionary(threads.compactMap { t in t.nativeId.map { ($0, t.id) } }, uniquingKeysWith: { a, _ in a })
+            return threads.compactMap(orcaRow)
+        }
+    }
+
+    static let antigravityNotes = Paths.home.appendingPathComponent(".gemini/antigravity/annotations").path
+
+    /// Antigravity's: its list of conversations, less the ones you archived,
+    /// which it marks only in each conversation's note. The notes of the
+    /// conversations listed, and their folder, are watched too, so an
+    /// archive shows within a tick.
+    static func antigravity() -> AppThreadsWatcher {
+        final class Listed { var ids: [String] = [] }
+        let listed = Listed()
+        return AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Antigravity", database: antigravityDatabase,
+                                 watched: { [antigravityNotes] + listed.ids.map { antigravityNotePath($0) } }) { now, started in
+            guard let conversations = readAntigravityConversations(database: antigravityDatabase,
+                                                                   since: now.addingTimeInterval(-Board.window))
+            else { return nil }
+            listed.ids = conversations.map(\.id)
+            return conversations.filter { !antigravityArchived(note: readFile(antigravityNotePath($0.id), limit: 64 << 10)) }
+                .compactMap { antigravityRow($0, appStarted: started) }
+        }
+    }
+
+    /// One tick; true if the rows changed.
+    @discardableResult
+    func refresh(now: Date = Date()) -> Bool {
+        if let app, kill(app.pid, 0) != 0 { self.app = nil }
+        if now.timeIntervalSince(lookedForApp) >= (app == nil ? 10 : 30) {
+            lookedForApp = now
+            let found = Self.findApp(suffix: executableSuffix)
+            if found?.pid != app?.pid { stamp = nil }
+            app = found
+        }
+        guard let app else { return clear() }
+        let current = ([database, database + "-wal"] + watched()).map(pathStamp)
+        guard current != stamp else { return false }
+        guard let read = read(now, app.started) else {
+            // Read again on the next tick: a read can fail while the app writes.
+            stamp = nil
+            return false
+        }
+        // Taken again: the read can change what's watched (the conversations listed).
+        stamp = ([database, database + "-wal"] + watched()).map(pathStamp)
+        reads += 1
+        let fresh = rowsInOrder(read)
+        guard fresh != rows else { return false }
+        rows = fresh
+        return true
+    }
+
+    /// No panel shows, or the app quit: drop the rows.
+    @discardableResult
+    func clear() -> Bool {
+        stamp = nil
+        guard !rows.isEmpty else { return false }
+        rows = []
+        return true
+    }
+
+    /// The app's main process, and when it started.
+    static func findApp(suffix: String) -> (pid: pid_t, started: Date)? {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
+        guard count > 0 else { return nil }
+        for pid in pids.prefix(min(count, pids.count)) where pid > 0 {
+            guard executablePath(pid).hasSuffix(suffix) else { continue }
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { continue }
+            let started = TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1_000_000
+            return (pid, Date(timeIntervalSince1970: started))
+        }
+        return nil
+    }
+}
+
+// MARK: - Orca threads
+
+/// Orca's bundle id: a click on one of its threads brings it forward (its
+/// orca:// links pair devices, open bots and share skills, none a thread).
+let orcaBundleId = "com.stablyai.orca"
+
+/// An Orca thread's link: not openable as is (see Row.openURL).
+let orcaLinkPrefix = "orca-thread:"
+
+/// The Orca thread for each agent's own id, kept by the engine so a Claude
+/// session Orca runs is listed once.
+final class AdoptedIds { var threads: [String: String] = [:] }
+
+/// Orca's names for its worktrees ("Tidy-up session"), by workspace
+/// id, from its small worktree history: {"worktrees": [[id, name], …]}.
+func orcaWorktreeNames(_ json: Data?) -> [String: String] {
+    guard let json, let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+          let pairs = object["worktrees"] as? [[Any]] else { return [:] }
+    var names: [String: String] = [:]
+    for pair in pairs where pair.count >= 2 {
+        if let id = pair[0] as? String, let name = (pair[1] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty {
+            names[id] = name
+        }
+    }
+    return names
+}
+
+/// Orca's folder workspaces by id: their names, and whether each is a bot
+/// (kept under ~/.orca/bots). From Orca's profile database, read-only.
+func readOrcaFolderWorkspaces(database path: String) -> [String: (name: String, bot: Bool)] {
+    var db: OpaquePointer?
+    guard FileManager.default.fileExists(atPath: path),
+          sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return [:]
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, "SELECT payload FROM profile_state_documents WHERE domain = 'folderWorkspaces'", -1,
+                             &statement, nil) == SQLITE_OK, let statement else { return [:] }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else { return [:] }
+    return orcaFolderWorkspaces(Data(String(cString: text).utf8))
+}
+
+/// Folder workspaces from their JSON: [{"id", "name", "folderPath"}, …].
+func orcaFolderWorkspaces(_ json: Data) -> [String: (name: String, bot: Bool)] {
+    guard let list = try? JSONSerialization.jsonObject(with: json) as? [[String: Any]] else { return [:] }
+    var names: [String: (name: String, bot: Bool)] = [:]
+    for workspace in list {
+        guard let id = workspace["id"] as? String,
+              let name = (workspace["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty
+        else { continue }
+        let folder = workspace["folderPath"] as? String ?? ""
+        names[id] = (name, folder.contains("/.orca/bots/"))
+    }
+    return names
+}
+
+/// Claude's rows and Orca's, with each Claude session that Orca runs listed
+/// once: as Claude's own row, which knows when the session waits on you and
+/// what it's doing, and whose click goes to Orca. `sessions` is each live
+/// terminal session's id by its pid; `orcaThreads` is the Orca thread for
+/// each agent's own id.
+func mergeOrca(claude: [Row], orca: [Row], sessions: [Int32: String], orcaThreads: [String: String]) -> [Row] {
+    var linked: [String: String] = [:]   // "pid:N" -> Orca thread
+    for (pid, session) in sessions {
+        if let thread = orcaThreads[session] { linked["pid:\(pid)"] = thread }
+    }
+    let present = Set(claude.map(\.id))
+    linked = linked.filter { present.contains($0.key) }
+    guard !linked.isEmpty else { return claude + orca }
+    let merged = Set(linked.values.map { "orca:\($0)" })
+    let orcaById = Dictionary(orca.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    return claude.map { row in
+        guard let thread = linked[row.id] else { return row }
+        var row = row
+        row.link = orcaLinkPrefix + thread
+        // Orca's name for it ("Home · Ada") and where it runs, with Claude's own state.
+        if let named = orcaById["orca:\(thread)"] {
+            row = Row(id: row.id, group: row.group, title: named.title, ask: row.ask, detail: row.detail, context: named.context,
+                      since: row.since, link: row.link, terminal: row.terminal, activity: row.activity,
+                      lastOutput: row.lastOutput, card: row.card, seen: row.seen, tags: row.tags,
+                      snoozedUntil: row.snoozedUntil, agent: row.agent)
+        }
+        return row
+    } + orca.filter { !merged.contains($0.id) }
+}
+
+/// One thread open in Orca: an agent (Claude, Codex, Antigravity…) Orca
+/// runs, from Orca's own record of it (agent_session_records).
+struct OrcaThread: Equatable {
+    let id: String
+    var agent: String          // provider: claude, codex, antigravity…
+    var name: String           // conversationName
+    var prompt: String         // the last turn's ask
+    var workspace: String      // location.workspaceId: "<id>::<folder>", or "folder:<id>"
+    var worktree: String? = nil // Orca's name for that worktree, if it has one
+    var bot: String? = nil      // the bot's name, for a bot's chat ("Ada")
+    var turnOpen = false       // lastTurn.state "open": the turn is going
+    var turnAt: Date?          // when it started, or settled
+    var outcome: String = ""   // success, failure, cancellation…
+    var lastActivity: Date?    // journal_chat_state.last_activity_at
+    var nativeId: String?      // the agent's own id for it
+}
+
+/// The app whose icon an Orca agent shows: Claude's, ChatGPT's for Codex,
+/// Antigravity's, Cursor's. Another agent shows Orca's.
+func orcaAgentIcon(_ agent: String) -> RowSource? {
+    switch agent {
+    case "claude": return .claude
+    case "codex": return .chatGPT
+    case "antigravity": return .antigravity
+    case "cursor": return .cursor
+    default: return nil
+    }
+}
+
+/// "Claude", "Codex", "Antigravity" for an Orca agent.
+func orcaAgentName(_ agent: String) -> String {
+    switch agent {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    case "antigravity": return "Antigravity"
+    case "gemini": return "Gemini"
+    default: return agent.prefix(1).uppercased() + agent.dropFirst()
+    }
+}
+
+/// An Orca thread as a row: running while its turn is open, else finished
+/// ("Failed" or "Stopped" when it ended so). One never used is left out.
+func orcaRow(_ t: OrcaThread) -> Row? {
+    guard let turnAt = t.turnAt else { return nil }
+    let id = "orca:\(t.id)", link = orcaLinkPrefix + t.id
+    let ask = t.prompt.split(whereSeparator: \.isNewline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+    let base = [t.name.trimmingCharacters(in: .whitespacesAndNewlines), String(ask.prefix(80))].first { !$0.isEmpty }
+        ?? "Orca thread"
+    // A bot's chats are all "Home": the bot's name says whose.
+    let title = t.bot.map { "\(base) · \($0)" } ?? base
+    let folder = t.workspace.range(of: "::").map { String(t.workspace[$0.upperBound...]) }.flatMap { $0.isEmpty ? nil : $0 }
+    let place = t.worktree ?? folder.map(folderLabel)
+    // The agent's icon leads, so the line under it says where it runs; an
+    // agent with no icon of its own is named.
+    let agent = orcaAgentIcon(t.agent)
+    let context = [place, agent == nil ? "\(orcaAgentName(t.agent)) in Orca" : "Orca"].compactMap { $0 }.joined(separator: " · ")
+    if t.turnOpen {
+        // Whole minutes, as the others: the quiet check needs no more.
+        let written = t.lastActivity.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
+        return Row(id: id, group: .running, title: title, context: context, since: turnAt, link: link, lastOutput: written,
+                   agent: agent)
+    }
+    let detail = t.outcome == "failure" ? "Failed" : t.outcome == "cancellation" ? "Stopped" : nil
+    return Row(id: id, group: .done, title: title, detail: detail, context: context, since: turnAt, link: link, agent: agent)
+}
+
+/// The threads open in Orca's tabs, from its session database, read-only
+/// (it's in WAL mode and Orca keeps it open). Only Orca's records and tabs
+/// are read, never the conversations. nil on any error.
+func readOrcaThreads(database path: String) -> [OrcaThread]? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    let sql = """
+        SELECT r.session_id, json_extract(r.record_json, '$.provider'), json_extract(r.record_json, '$.conversationName'),
+               substr(json_extract(r.record_json, '$.lastTurn.prompt'), 1, 300), json_extract(r.record_json, '$.location.workspaceId'),
+               json_extract(r.record_json, '$.lastTurn.state'), json_extract(r.record_json, '$.lastTurn.at'),
+               json_extract(r.record_json, '$.lastTurn.outcome'), c.last_activity_at, r.adopted_native_id
+        FROM agent_session_records r
+        LEFT JOIN journal_chat_state c ON c.session_id = r.session_id
+        WHERE r.session_id IN (SELECT session_id FROM agent_session_tabs) AND json_valid(r.record_json)
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+    defer { sqlite3_finalize(statement) }
+    func text(_ column: Int32) -> String { sqlite3_column_text(statement, column).map { String(cString: $0) } ?? "" }
+    func date(_ column: Int32) -> Date? {
+        guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
+        let ms = sqlite3_column_int64(statement, column)
+        return ms > 0 ? Date(timeIntervalSince1970: Double(ms) / 1000) : nil
+    }
+    var threads: [OrcaThread] = []
+    while true {
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return threads }
+        guard step == SQLITE_ROW else { return nil }
+        let native = text(9)
+        threads.append(OrcaThread(id: text(0), agent: text(1), name: text(2), prompt: text(3), workspace: text(4),
+                                  turnOpen: text(5) == "open", turnAt: date(6), outcome: text(7), lastActivity: date(8),
+                                  nativeId: native.isEmpty ? nil : native))
+    }
+}
+
+// MARK: - Antigravity conversations
+
+/// Antigravity's bundle id: a click on one of its conversations brings it forward.
+let antigravityBundleId = "com.google.antigravity"
+
+/// An Antigravity conversation's link: not openable as is (see Row.openURL).
+let antigravityLinkPrefix = "antigravity-conversation:"
+
+/// One Antigravity conversation, from Antigravity's own list of them
+/// (conversation_summaries in ~/.gemini/antigravity), a row per conversation.
+struct AntigravityConversation: Equatable {
+    let id: String
+    var title: String
+    var preview: String
+    var workspaces: String    // workspace_uris: file:// URIs, or empty outside a project
+    var modified: Date        // last_modified_time: moves as a run goes
+    var lastInput: Date?      // last_user_input_time: your last message
+    var status: String        // CASCADE_RUN_STATUS_IDLE, _RUNNING, _BUSY, _CANCELING
+    var killed = false
+}
+
+/// Antigravity's times: "2026-11-21 07:18:46.384063+00:00".
+func antigravityTime(_ text: String) -> Date? {
+    let chars = Array(text)
+    guard chars.count >= 19 else { return nil }
+    var parts = DateComponents()
+    func number(_ range: Range<Int>) -> Int? { Int(String(chars[range])) }
+    guard let year = number(0..<4), let month = number(5..<7), let day = number(8..<10),
+          let hour = number(11..<13), let minute = number(14..<16), let second = number(17..<19) else { return nil }
+    parts.year = year; parts.month = month; parts.day = day
+    parts.hour = hour; parts.minute = minute; parts.second = second
+    var index = 19
+    var fraction = 0.0
+    if index < chars.count, chars[index] == "." {
+        index += 1
+        var digits = ""
+        while index < chars.count, chars[index].isNumber { digits.append(chars[index]); index += 1 }
+        fraction = Double("0." + digits) ?? 0
+    }
+    var offset = 0
+    if index < chars.count, chars[index] == "+" || chars[index] == "-" {
+        let sign = chars[index] == "-" ? -1 : 1
+        let rest = String(chars[(index + 1)...]).replacingOccurrences(of: ":", with: "")
+        guard rest.count >= 4, let hours = Int(rest.prefix(2)), let minutes = Int(rest.dropFirst(2).prefix(2)) else { return nil }
+        offset = sign * (hours * 3600 + minutes * 60)
+    } else if index < chars.count, chars[index] == "Z" {
+        offset = 0
+    }
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: offset) ?? .gmt
+    return calendar.date(from: parts)?.addingTimeInterval(fraction)
+}
+
+/// The folder of an Antigravity conversation's first workspace, if any.
+func antigravityFolder(_ workspaces: String) -> String? {
+    let first = workspaces.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" }).first.map(String.init) ?? ""
+    guard !first.isEmpty else { return nil }
+    let path = URL(string: first)?.path ?? first
+    return path.isEmpty ? nil : path
+}
+
+/// An Antigravity conversation's note: its title as you set it, when you
+/// last looked, and whether you archived it.
+func antigravityNotePath(_ id: String) -> String { AppThreadsWatcher.antigravityNotes + "/\(id).pbtxt" }
+
+/// Whether a note (text-format protobuf) says archived: `archived:true`.
+func antigravityArchived(note: Data?) -> Bool {
+    guard let note, let text = String(data: note, encoding: .utf8) else { return false }
+    return text.filter { !$0.isWhitespace }.contains("archived:true")
+}
+
+/// An Antigravity conversation as a row: running, or finished. A run whose
+/// last change came before this Antigravity started was cut short, so it
+/// counts as finished.
+func antigravityRow(_ c: AntigravityConversation, appStarted: Date?) -> Row? {
+    let id = "agy:\(c.id)", link = antigravityLinkPrefix + c.id
+    let title = [c.title, c.preview].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty }
+        ?? "Antigravity conversation"
+    let context = antigravityFolder(c.workspaces).map(folderLabel) ?? "Antigravity"
+    let busy = ["CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY", "CASCADE_RUN_STATUS_CANCELING"].contains(c.status)
+    let current = appStarted.map { c.modified >= $0.addingTimeInterval(-60) } ?? true
+    if busy && !c.killed && current {
+        // Whole minutes, as the others: the quiet check needs no more.
+        let written = Date(timeIntervalSince1970: (c.modified.timeIntervalSince1970 / 60).rounded(.down) * 60)
+        return Row(id: id, group: .running, title: title, context: context, since: c.lastInput ?? c.modified, link: link,
+                   lastOutput: written)
+    }
+    return Row(id: id, group: .done, title: title, detail: c.killed ? "Stopped" : nil, context: context,
+               since: c.modified, link: link)
+}
+
+/// Antigravity's recent conversations, newest first: not a subagent's, not
+/// run by its command-line agent (`agy`, which Orca runs too: Antigravity
+/// never marks those running, and Orca's own list has them), changed since
+/// `since`. Read-only, like Cursor's. While Antigravity has
+/// the database open, its write-ahead log is there and is read too; when it
+/// has closed it, the log is gone, a read-only reader can't make one, and
+/// the database file itself is current, so it's read as a snapshot that
+/// takes no lock (`immutable=1`). nil on any error.
+func readAntigravityConversations(database path: String, since: Date, limit: Int = 30) -> [AntigravityConversation]? {
+    guard FileManager.default.fileExists(atPath: path) else { return nil }
+    let escaped = path.replacingOccurrences(of: "%", with: "%25").replacingOccurrences(of: "?", with: "%3f")
+        .replacingOccurrences(of: "#", with: "%23")
+    return queryAntigravity("file:\(escaped)", since: since, limit: limit)
+        ?? queryAntigravity("file:\(escaped)?immutable=1", since: since, limit: limit)
+}
+
+private func queryAntigravity(_ uri: String, since: Date, limit: Int) -> [AntigravityConversation]? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
+          let db else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    let sql = """
+        SELECT conversation_id, title, preview, workspace_uris, last_modified_time, last_user_input_time, status, killed
+        FROM conversation_summaries
+        WHERE nesting_depth = 0 AND parent_conversation_id = '' AND last_modified_time > ?
+          AND source != 'CORTEX_TRAJECTORY_SOURCE_CLI'
+        ORDER BY last_modified_time DESC LIMIT ?
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+    defer { sqlite3_finalize(statement) }
+    let cutoff = DateFormatter()
+    cutoff.locale = Locale(identifier: "en_US_POSIX")
+    cutoff.timeZone = .gmt
+    cutoff.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    sqlite3_bind_text(statement, 1, cutoff.string(from: since), -1, transient)
+    sqlite3_bind_int(statement, 2, Int32(limit))
+    func text(_ column: Int32) -> String { sqlite3_column_text(statement, column).map { String(cString: $0) } ?? "" }
+    var conversations: [AntigravityConversation] = []
+    while true {
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return conversations }
+        guard step == SQLITE_ROW, let modified = antigravityTime(text(4)) else { return nil }
+        conversations.append(AntigravityConversation(id: text(0), title: text(1), preview: text(2), workspaces: text(3),
+                                                     modified: modified, lastInput: antigravityTime(text(5)),
+                                                     status: text(6), killed: sqlite3_column_int(statement, 7) != 0))
+    }
+}
+
 // MARK: - Engine
 
 /// Owns all file access, on one low-priority serial queue.
@@ -1049,6 +2227,13 @@ final class SessionEngine {
     /// A record is written about 2 s after its transcript ends, which triggers a
     /// look; this also looks every 30 s in case a transcript ends later.
     private var cardCheck: DispatchSourceTimer?
+    /// ChatGPT's and Cursor's threads, read every 2 s, only while a panel shows.
+    private let codex = CodexWatcher()
+    private let cursor = AppThreadsWatcher.cursor()
+    private let antigravity = AppThreadsWatcher.antigravity()
+    private let orcaAdopted = AdoptedIds()
+    private lazy var orca = AppThreadsWatcher.orca(adopted: orcaAdopted)
+    private var otherApps: DispatchSourceTimer?
 
     func start() {
         queue.async {
@@ -1080,8 +2265,13 @@ final class SessionEngine {
                 }
             }
             engine.activityWanted = true
-            return classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
-                            activities: activities, cards: engine.currentCards(), background: engine.backgroundWork())
+            engine.codex.refresh()
+            engine.cursor.refresh()
+            engine.antigravity.refresh()
+            engine.orca.refresh()
+            let claude = classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
+                                  activities: activities, cards: engine.currentCards(), background: engine.backgroundWork())
+            return engine.withOtherApps(claude)
         }
     }
 
@@ -1122,6 +2312,22 @@ final class SessionEngine {
                 timer.setEventHandler { [weak self] in self?.publishIfChanged() }
                 timer.resume()
                 self.cardCheck = timer
+                let apps = DispatchSource.makeTimerSource(queue: self.queue)
+                apps.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
+                apps.setEventHandler { [weak self] in
+                    guard let self else { return }
+                    let changed = [self.codex.refresh(), self.cursor.refresh(), self.antigravity.refresh(), self.orca.refresh()]
+                    if changed.contains(true) { self.publishIfChanged() }
+                }
+                apps.resume()
+                self.otherApps = apps
+            } else {
+                self.otherApps?.cancel()
+                self.otherApps = nil
+                self.codex.clear()
+                self.cursor.clear()
+                self.antigravity.clear()
+                self.orca.clear()
             }
             self.syncActivityWatchers()
             self.publishIfChanged()
@@ -1258,9 +2464,20 @@ final class SessionEngine {
         }
     }
 
+    /// Claude's rows plus the other apps', each Claude session Orca runs listed once.
+    private func withOtherApps(_ claude: [Row]) -> [Row] {
+        let others = codex.rows + cursor.rows + antigravity.rows
+        guard !orca.rows.isEmpty else { return others.isEmpty ? claude : rowsInOrder(claude + others) }
+        let sessions = Dictionary(live.values.compactMap { r in r.cliSessionId.map { (r.pid, $0) } },
+                                  uniquingKeysWith: { a, _ in a })
+        return rowsInOrder(mergeOrca(claude: claude, orca: orca.rows, sessions: sessions, orcaThreads: orcaAdopted.threads)
+                           + others)
+    }
+
     private func publishIfChanged() {
-        let rows = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
-                            cards: currentCards(), background: backgroundWork())
+        let claude = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
+                              cards: currentCards(), background: backgroundWork())
+        let rows = withOtherApps(claude)
         guard rows != lastRows else { return }
         lastRows = rows
         let archived = Set(desk.values.compactMap { $0.record?.isArchived == true ? $0.record?.sessionId : nil })
@@ -1330,15 +2547,78 @@ final class SessionModel: ObservableObject {
     /// The rows as the engine made them, before your tags.
     private var sourceRows: [Row] = []
     private(set) var tags = SessionTags.load()
-    /// After a tag changes: counts, glow and the window's size follow.
+    private(set) var snoozes: SessionSnoozes
+    /// When each snooze ran out on its own: the session glows amber again
+    /// for a while, as if it had just asked.
+    private(set) var wokeAt: [String: Date] = [:]
+    private var wakeTimer: Timer?
+    private let defaults: UserDefaults
+    /// After a tag or a snooze changes: counts, glow and the window's size follow.
     var onTagsChanged: (() -> Void)?
     /// New Tag…: asks for the name.
     var onNewTag: ((Row) -> Void)?
 
-    /// Sets the rows, with your tags on them.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        snoozes = SessionSnoozes.load(defaults)
+    }
+
+    /// Sets the rows, with your tags and snoozes on them.
     func setRows(_ rows: [Row]) {
         sourceRows = rows
-        self.rows = tags.apply(to: rows)
+        let ended = snoozes.expire(now: Date())
+        wokeAt.merge(ended) { $1 }
+        if snoozes.prune(rows) || !ended.isEmpty { snoozes.save(defaults) }
+        self.rows = decorated()
+        scheduleWake()
+    }
+
+    private func decorated() -> [Row] { snoozes.apply(to: tags.apply(to: sourceRows), now: Date()) }
+
+    /// Holds the session until then, or until it moves on.
+    func snooze(_ row: Row, until: Date) {
+        snoozes.snooze(row.id, until: until, at: Date())
+        wokeAt[row.id] = nil
+        snoozesChanged()
+    }
+
+    func wake(_ row: Row) {
+        snoozes.wake(row.id)
+        snoozesChanged()
+    }
+
+    func wakeAll() {
+        snoozes.byId.removeAll()
+        snoozesChanged()
+    }
+
+    /// Ends the snoozes that ran out. The timer calls it, and so does the
+    /// Mac waking from sleep (a timer can run late across sleep).
+    func wakeDue() {
+        let now = Date()
+        let ended = snoozes.expire(now: now)
+        guard !ended.isEmpty else { scheduleWake(); return }
+        wokeAt.merge(ended) { $1 }
+        self.now = now
+        snoozesChanged()
+    }
+
+    private func snoozesChanged() {
+        snoozes.save(defaults)
+        rows = decorated()
+        scheduleWake()
+        onTagsChanged?()
+    }
+
+    private func scheduleWake() {
+        wakeTimer?.invalidate()
+        wakeTimer = nil
+        guard let next = snoozes.nextEnd else { return }
+        let timer = Timer(fire: max(next, Date()).addingTimeInterval(0.5), interval: 0, repeats: false) { [weak self] _ in
+            self?.wakeDue()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        wakeTimer = timer
     }
 
     func toggleTag(_ tag: String, on row: Row) {
@@ -1359,13 +2639,19 @@ final class SessionModel: ObservableObject {
 
     /// A session archived in the Claude app loses its tags.
     func forgetArchived(_ ids: Set<String>) {
-        guard tags.forget(ids) else { return }
-        tagsChanged()
+        let snoozeGone = snoozes.forget(ids)
+        if snoozeGone { snoozes.save(defaults) }
+        if tags.forget(ids) {
+            tagsChanged()
+        } else if snoozeGone {
+            rows = decorated()
+            onTagsChanged?()
+        }
     }
 
     private func tagsChanged() {
         tags.save()
-        rows = tags.apply(to: sourceRows)
+        rows = decorated()
         onTagsChanged?()
     }
 
@@ -1374,7 +2660,9 @@ final class SessionModel: ObservableObject {
         TagActions(enabled: true, known: tags.known(among: Set(sourceRows.map(\.id))),
                    toggle: { [weak self] row, tag in self?.toggleTag(tag, on: row) },
                    newTag: { [weak self] row in self?.onNewTag?(row) },
-                   clear: { [weak self] row in self?.clearTags(on: row) })
+                   clear: { [weak self] row in self?.clearTags(on: row) },
+                   snooze: { [weak self] row, until in self?.snooze(row, until: until) },
+                   wake: { [weak self] row in self?.wake(row) })
     }
     /// Drives the "3 min ago" labels. Ticks only while a panel is showing.
     @Published var now = Date()
@@ -1409,7 +2697,9 @@ final class SessionModel: ObservableObject {
     func freshNeedsYou(_ board: Board) -> [Row] {
         board.yourTurn.filter { row in
             let opened = [openedAt[row.id], row.seen].compactMap { $0 }.max()
-            return now.timeIntervalSince(row.since) <= freshFor && (opened.map { $0 < row.since } ?? true)
+            // A snooze that ran out counts as asking again then.
+            let asked = max(row.since, wokeAt[row.id] ?? .distantPast)
+            return now.timeIntervalSince(asked) <= freshFor && (opened.map { $0 < asked } ?? true)
         }
     }
     let freshFor: TimeInterval = 3600
@@ -1599,23 +2889,28 @@ var staticIndicators = false
 final class SpinnerView: NSView {
     private let track = CAShapeLayer()
     private let arc = CAShapeLayer()
+    private let size: CGFloat
     var color: NSColor = .systemBlue {
         didSet { if color != oldValue { applyColors() } }
     }
 
-    override init(frame: NSRect) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
+    /// A ring of `ring` points across, `lineWidth` thick, centred in a square
+    /// of `size`: 16, 11 and 2 for a row's mark; smaller on an app's icon.
+    init(size: CGFloat = 16, ring: CGFloat = 11, lineWidth: CGFloat = 2) {
+        self.size = size
+        super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
         wantsLayer = true
         // Set up as is, or the arc animates in from a full ring.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
-        let ring = CGPath(ellipseIn: CGRect(x: 2.5, y: 2.5, width: 11, height: 11), transform: nil)
+        let inset = (size - ring) / 2
+        let path = CGPath(ellipseIn: CGRect(x: inset, y: inset, width: ring, height: ring), transform: nil)
         for shape in [track, arc] {
-            shape.frame = CGRect(x: 0, y: 0, width: 16, height: 16)
-            shape.path = ring
+            shape.frame = CGRect(x: 0, y: 0, width: size, height: size)
+            shape.path = path
             shape.fillColor = nil
-            shape.lineWidth = 2
+            shape.lineWidth = lineWidth
             shape.lineCap = .round
             layer?.addSublayer(shape)
         }
@@ -1625,7 +2920,7 @@ final class SpinnerView: NSView {
 
     required init?(coder: NSCoder) { nil }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 16, height: 16) }
+    override var intrinsicContentSize: NSSize { NSSize(width: size, height: size) }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }   // clicks go to the row
 
@@ -1675,7 +2970,10 @@ final class SpinnerView: NSView {
 
 struct RunningSpinner: NSViewRepresentable {
     let color: Color
-    func makeNSView(context: Context) -> SpinnerView { SpinnerView(frame: .zero) }
+    var size: CGFloat = 16
+    var ring: CGFloat = 11
+    var lineWidth: CGFloat = 2
+    func makeNSView(context: Context) -> SpinnerView { SpinnerView(size: size, ring: ring, lineWidth: lineWidth) }
     func updateNSView(_ view: SpinnerView, context: Context) {
         view.color = NSColor(color)
         view.updateAnimation()
@@ -1880,13 +3178,15 @@ func compactAge(since d: Date, now: Date) -> String {
     return "\(s / 86400)d"
 }
 
-/// A row's right-click menu: your tags, New Tag… and Remove Tags.
+/// A row's right-click menu: Snooze, your tags, New Tag… and Remove Tags.
 struct TagActions {
     var enabled = false
     var known: [String] = []
     var toggle: (Row, String) -> Void = { _, _ in }
     var newTag: (Row) -> Void = { _ in }
     var clear: (Row) -> Void = { _ in }
+    var snooze: (Row, Date) -> Void = { _, _ in }
+    var wake: (Row) -> Void = { _ in }
 }
 
 private struct TagActionsKey: EnvironmentKey { static let defaultValue = TagActions() }
@@ -1909,6 +3209,20 @@ struct TagMenu: ViewModifier {
     func body(content: Content) -> some View {
         if actions.enabled && SessionTags.taggable(row) {
             content.contextMenu {
+                if let until = row.snoozedUntil, row.snoozed {
+                    Section("Snoozed " + snoozeWhen(until, now: Date())) {
+                        Button("Wake Now") { actions.wake(row) }
+                    }
+                } else if SessionSnoozes.snoozable(row) {
+                    Menu {
+                        ForEach(SnoozeChoice.allCases) { choice in
+                            Button(choice.title) { actions.snooze(row, choice.until(from: Date())) }
+                        }
+                    } label: {
+                        Label("Snooze", systemImage: "moon.zzz")
+                    }
+                    Divider()
+                }
                 Section("Tags") {
                     ForEach(actions.known, id: \.self) { tag in
                         Toggle(tag, isOn: Binding(get: { row.tags.contains(tag) },
@@ -1984,22 +3298,84 @@ struct TagPill: View {
     }
 }
 
-/// Up to two tags, then "+1" for the rest.
+/// When a snooze ends, then up to two tags, then "+1" for the rest.
 struct TagPills: View {
     let tags: [String]
+    var snoozedUntil: Date? = nil
     @AppStorage(TagStyle.key) private var style = TagStyle.outline.rawValue
 
     var body: some View {
-        if !tags.isEmpty {
+        if !tags.isEmpty || snoozedUntil != nil {
             HStack(spacing: style == TagStyle.dot.rawValue ? 9 : 4) {
+                if let snoozedUntil { SnoozePill(until: snoozedUntil) }
                 ForEach(tags.prefix(2), id: \.self) { TagPill(tag: $0) }
                 if tags.count > 2 {
                     Text("+\(tags.count - 2)").font(.system(size: 9.5, weight: .semibold)).foregroundStyle(.secondary)
                 }
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Tags: " + tags.joined(separator: ", "))
+            .accessibilityLabel(([snoozedUntil.map { "Snoozed " + snoozeWhen($0, now: Date()) }].compactMap { $0 }
+                                 + (tags.isEmpty ? [] : ["Tags: " + tags.joined(separator: ", ")])).joined(separator: ", "))
         }
+    }
+}
+
+/// "Snoozed until 3:40 PM", grey, in the style you chose for tags.
+struct SnoozePill: View {
+    let until: Date
+    @Environment(\.highContrast) private var contrast
+    @AppStorage(TagStyle.key) private var style = TagStyle.outline.rawValue
+
+    var body: some View {
+        let label = HStack(spacing: 3) {
+            Image(systemName: "moon.zzz.fill").font(.system(size: 8, weight: .semibold))
+            Text(snoozeWhen(until, now: Date()).capitalizedFirst).font(.system(size: 9.5, weight: .semibold))
+        }
+        .lineLimit(1)
+        .foregroundStyle(.secondary)
+        switch TagStyle(rawValue: style) ?? .outline {
+        case .outline:
+            label.padding(.horizontal, 6).padding(.vertical, 0.5)
+                .overlay(Capsule().strokeBorder(Color.secondary.opacity(contrast ? 0.95 : 0.6), lineWidth: 1))
+                .fixedSize()
+        case .filled:
+            label.padding(.horizontal, 6).padding(.vertical, 1)
+                .background(Capsule().fill(Color.secondary.opacity(contrast ? 0.26 : 0.16)))
+                .fixedSize()
+        case .dot, .text:
+            label.fixedSize()
+        }
+    }
+}
+
+extension String {
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
+}
+
+/// Limbo's mark, the Orbit logo without its square: sessions in the three
+/// state colours (running, needs you, finished) around a centre dot, on a
+/// faint orbit. The keep-on-top window's header and pill show it.
+struct LimboMark: View {
+    var size: CGFloat = 16
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.highContrast) private var contrast
+
+    var body: some View {
+        let p = Palette(scheme, contrast: contrast)
+        let r = size * 0.37                 // the orbit's radius
+        let d = size * 0.27                 // a session dot
+        let corner = r * 0.7071             // 135° and 225°: bottom left, top left
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(contrast ? 0.5 : 0.25), lineWidth: max(1, size * 0.085))
+                .frame(width: r * 2, height: r * 2)
+            Circle().fill(p.running).frame(width: d, height: d).offset(x: r)
+            Circle().fill(p.needsYou).frame(width: d, height: d).offset(x: -corner, y: corner)
+            Circle().fill(p.done).frame(width: d, height: d).offset(x: -corner, y: -corner)
+            Circle().fill(Color.primary).frame(width: size * 0.2, height: size * 0.2)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
     }
 }
 
@@ -2010,14 +3386,37 @@ struct Indicator: View {
     let group: Group
     var quiet = false
     var held = false
+    var snoozed = false
+    /// Whose icon leads, with the state on its bottom-right corner: the
+    /// agent's for a thread Orca runs, else the app's it's in. Not installed:
+    /// `fallback`'s (the app it's in), else the state mark alone.
+    var source: RowSource? = nil
+    var fallback: RowSource? = nil
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.highContrast) private var forcedContrast
 
+    private var palette: Palette { Palette(scheme, contrast: forcedContrast || systemContrast == .increased) }
+
     var body: some View {
-        let p = Palette(scheme, contrast: forcedContrast || systemContrast == .increased)
+        SwiftUI.Group {
+            if let icon = source.flatMap(appIcon) ?? fallback.flatMap(appIcon) {
+                badged(icon)
+            } else {
+                mark
+            }
+        }
+        .frame(width: 16, height: 16)
+        .accessibilityHidden(true)
+    }
+
+    /// The state mark alone, 16 points.
+    @ViewBuilder private var mark: some View {
+        let p = palette
         ZStack {
             switch group {
+            case _ where snoozed:
+                Image(systemName: "moon.zzz").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
             case _ where held:
                 Image(systemName: "pause.circle").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             case .yourTurn:
@@ -2046,8 +3445,90 @@ struct Indicator: View {
                 Circle().strokeBorder(Color.secondary.opacity(0.7), lineWidth: 1.5).frame(width: 8, height: 8)
             }
         }
-        .frame(width: 16, height: 16)
-        .accessibilityHidden(true)
+    }
+
+    /// Where the state sits on the icon: a 12-point circle centred 13.5
+    /// points in, cut out of the icon so it reads on any background, and
+    /// reaching 3.5 points past the icon's corner.
+    private static let badgeCut: CGFloat = 12
+    private static let badgeCentre: CGFloat = 13.5
+
+    /// The app's icon, faded when on hold or snoozed, with the state on its corner.
+    private func badged(_ icon: NSImage) -> some View {
+        Image(nsImage: icon)
+            .resizable()
+            .interpolation(.high)
+            .frame(width: 16, height: 16)
+            .opacity(held || snoozed ? 0.45 : 1)
+            .mask {
+                ZStack {
+                    Rectangle()
+                    Circle()
+                        .frame(width: Self.badgeCut, height: Self.badgeCut)
+                        .position(x: Self.badgeCentre, y: Self.badgeCentre)
+                        .blendMode(.destinationOut)
+                }
+                .compositingGroup()
+            }
+            .overlay(alignment: .topLeading) {
+                badge
+                    .frame(width: Self.badgeCut, height: Self.badgeCut)
+                    .offset(x: Self.badgeCentre - Self.badgeCut / 2, y: Self.badgeCentre - Self.badgeCut / 2)
+            }
+    }
+
+    /// The state, small enough for the icon's corner: the turning blue ring
+    /// while running, a filled circle with its sign once it needs you or ends.
+    @ViewBuilder private var badge: some View {
+        let p = palette
+        let grey = Color(white: scheme == .dark ? 0.52 : 0.56)
+        switch group {
+        case _ where snoozed:
+            ZStack {
+                Circle().fill(grey)
+                Image(systemName: "moon.fill").font(.system(size: 5, weight: .bold)).foregroundStyle(.white)
+            }
+            .frame(width: 9, height: 9)
+        case _ where held:
+            Image(systemName: "pause.circle.fill")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, grey)
+                .font(.system(size: 9.5, weight: .bold))
+        case .yourTurn:
+            Image(systemName: "exclamationmark.circle.fill")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(p.needsYouMark, p.needsYou)
+                .font(.system(size: 9.5, weight: .bold))
+        case .running where quiet:
+            // Still running, but nothing written for 10 minutes: a still amber ring.
+            Circle().strokeBorder(p.quiet, lineWidth: 1.6).frame(width: 9, height: 9)
+        case .running:
+            if staticIndicators {
+                ZStack {
+                    Circle().stroke(p.running.opacity(0.24), lineWidth: 1.6)
+                    Circle().trim(from: 0, to: 0.3)
+                        .stroke(p.running, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+                .frame(width: 7.6, height: 7.6)
+            } else {
+                RunningSpinner(color: p.running, size: Self.badgeCut, ring: 7.6, lineWidth: 1.6)
+                    .frame(width: Self.badgeCut, height: Self.badgeCut)
+            }
+        case .justFinished, .done:
+            Image(systemName: "checkmark.circle.fill")
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, p.done)
+                .font(.system(size: 9.5, weight: .bold))
+        case .review:
+            ZStack {
+                Circle().fill(p.review)
+                Circle().fill(.white).frame(width: 3, height: 3)
+            }
+            .frame(width: 9, height: 9)
+        case .terminal:
+            Circle().strokeBorder(grey, lineWidth: 1.3).frame(width: 8, height: 8)
+        }
     }
 }
 
@@ -2103,14 +3584,16 @@ struct SessionRow: View {
     private var tooltip: String {
         var parts = [row.title]
         if let line = secondLine { parts.append(line) }
-        parts.append(canOpen ? "Click to open in Claude" : "Started in a terminal, so it can't be opened from here")
+        parts.append(canOpen ? "Click to " + row.openLabel.prefix(1).lowercased() + row.openLabel.dropFirst() : "Started in a terminal, so it can't be opened from here")
         return parts.joined(separator: "\n\n")
     }
 
     var body: some View {
         Button { if canOpen { open(row) } } label: {
             HStack(alignment: .top, spacing: 10) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held).padding(.top, 1)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed,
+                          source: row.iconSource, fallback: row.source)
+                    .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(row.title)
@@ -2120,7 +3603,7 @@ struct SessionRow: View {
                         Spacer(minLength: 4)
                         trailing
                     }
-                    TagPills(tags: row.tags)
+                    TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil)
                     if let line = secondLine {
                         Text(line)
                             .font(.system(size: 12))
@@ -2153,11 +3636,11 @@ struct SessionRow: View {
         .opacity(dimmed || row.held ? 0.72 : 1)
         .help(tooltip)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(row.title), \(row.held ? "on hold" : stateWord)"
+        .accessibilityLabel("\(row.title)\(row.spokenApp), \(row.snoozed ? "snoozed" : row.held ? "on hold" : stateWord)"
                             + (row.tags.isEmpty ? "" : ", tagged " + row.tags.joined(separator: ", ")))
         .tagMenu(row)
         .accessibilityValue(secondLine ?? meta)
-        .accessibilityHint(canOpen ? "Opens the session in Claude" : "")
+        .accessibilityHint(canOpen ? row.openLabel : "")
     }
 
     @ViewBuilder private var trailing: some View {
@@ -2294,6 +3777,7 @@ struct PanelView: View {
     @AppStorage("showTerminal") private var showTerminal = false
     @AppStorage("showOlder") private var showOlder = false
     @AppStorage("showHeld") private var showHeld = false
+    @AppStorage("showSnoozed") private var showSnoozed = false
     @State private var loginOn = LoginItem.isEnabled
 
     var body: some View {
@@ -2369,6 +3853,12 @@ struct PanelView: View {
                 if !b.review.isEmpty {
                     SectionTitle(title: "Ready for review", count: b.review.count)
                     ForEach(b.review) { SessionRow(row: $0, now: now, open: open) }
+                }
+                if !b.snoozed.isEmpty {
+                    DisclosureTitle(title: "Snoozed", count: b.snoozed.count, expanded: $showSnoozed)
+                    if showSnoozed || expandAll {
+                        ForEach(b.snoozed) { SessionRow(row: $0, now: now, open: open) }
+                    }
                 }
                 if !b.onHold.isEmpty {
                     DisclosureTitle(title: "On hold", count: b.onHold.count, expanded: $showHeld)
@@ -2489,8 +3979,7 @@ final class PanelController: NSObject, NSPopoverDelegate {
     }
 
     private func open(_ row: Row) {
-        guard let id = row.link, isSessionId(id),
-              let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
+        guard let url = row.openURL else { return }
         popover?.performClose(nil)
         model.markOpened(row)
         NSWorkspace.shared.open(url)
@@ -2547,23 +4036,25 @@ struct CompactRow: View {
         let active = !row.held && (row.group == .running || row.group == .yourTurn)
         return Button { if row.link != nil { open(row) } } label: {
             HStack(alignment: .top, spacing: 8) {
-                Indicator(group: row.group, quiet: quiet != nil, held: row.held)
+                Indicator(group: row.group, quiet: quiet != nil, held: row.held, snoozed: row.snoozed,
+                          source: row.iconSource, fallback: row.source)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         let title = Text(row.title)
                             .font(.system(size: active ? 13 : 12.5,
                                           weight: contrast ? .bold : (active ? .semibold : .medium)))
                             .lineLimit(1).truncationMode(.tail)
-                        if oneLine && !row.tags.isEmpty {
+                            .accessibilityLabel(row.title + row.spokenApp)
+                        if oneLine && (!row.tags.isEmpty || row.snoozed) {
                             // Tags beside the title when the whole title still fits, else under it.
                             ViewThatFits(in: .horizontal) {
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                                     title.fixedSize(horizontal: true, vertical: false)
-                                    TagPills(tags: row.tags)
+                                    TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil)
                                 }
                                 VStack(alignment: .leading, spacing: 3) {
                                     title
-                                    TagPills(tags: row.tags)
+                                    TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil)
                                 }
                             }
                         } else {
@@ -2586,7 +4077,7 @@ struct CompactRow: View {
                         if response != nil { Color.clear.frame(width: 18, height: 1) }   // room for the response button
                     }
                     // Rows with a second line: tags on their own line, so a long one never squeezes the title.
-                    if !oneLine { TagPills(tags: row.tags).padding(.vertical, 1) }
+                    if !oneLine { TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil).padding(.vertical, 1) }
                     if let quiet {
                         Text([quietPhrase(quiet, compact: true), row.activity].compactMap { $0 }.joined(separator: " · "))
                             .font(.system(size: 11)).foregroundStyle(p.quiet).lineLimit(1).truncationMode(.tail)
@@ -2748,7 +4239,7 @@ struct AnswerCard: View {
             HStack(spacing: 4) {
                 Button { open(row) } label: {
                     HStack(spacing: 6) {
-                        Indicator(group: row.group)
+                        Indicator(group: row.group, source: row.iconSource, fallback: row.source)
                         Text(row.title)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(p.text2)
@@ -2768,7 +4259,7 @@ struct AnswerCard: View {
                     ResponseToggle(shown: responseShown, action: toggleResponse).testFrame("response:\(row.id)")
                 }
             }
-            if !row.tags.isEmpty { TagPills(tags: row.tags).padding(.leading, 22) }
+            if !row.tags.isEmpty { TagPills(tags: row.tags, snoozedUntil: row.snoozedUntil).padding(.leading, 22) }
             if responseShown, let response = card.response {
                 ResponseDrawer(text: response, open: { open(row) })
             }
@@ -2929,6 +4420,8 @@ struct FloatingRows {
     let finished: [Row]
     /// Sessions you put on hold, within the header's time choice; listed last.
     let onHold: [Row]
+    /// Sessions you snoozed, until they wake; listed after the finished ones.
+    let snoozed: [Row]
     /// Waiting or review sessions older than the header's time choice.
     let hidden: Int
 
@@ -2939,10 +4432,11 @@ struct FloatingRows {
         review = board.review.filter { now.timeIntervalSince($0.since) <= limit }
         finished = board.justFinished + board.done.filter { now.timeIntervalSince($0.since) <= finishedWithin }
         onHold = board.onHold.filter { now.timeIntervalSince($0.since) <= limit }
+        snoozed = board.snoozed.sorted { ($0.snoozedUntil ?? .distantFuture) < ($1.snoozedUntil ?? .distantFuture) }
         hidden = (allWaiting + board.review).filter { now.timeIntervalSince($0.since) > limit }.count
     }
 
-    var all: [Row] { running + waiting + review + finished + onHold }
+    var all: [Row] { running + waiting + review + finished + snoozed + onHold }
 
     func rows(_ filter: RowFilter?) -> [Row] {
         switch filter {
@@ -2987,6 +4481,9 @@ struct FloatingView: View {
     var glowChanged: (GlowPreview) -> Void = { _ in }
     /// The Got it button: stops the green or amber without opening anything.
     var acknowledge: () -> Void = {}
+    /// A layout picked, or the full-screen switch flipped: the window checks
+    /// its display and fits the new shape.
+    var layoutChanged: () -> Void = {}
     /// Drawn between the window's material and the rows, so text stays crisp.
     var glow: RunningGlowView?
     @ObservedObject var layout = FloatingLayout()
@@ -2997,6 +4494,8 @@ struct FloatingView: View {
     var forceSolid: Bool? = nil
     var initialFilter: RowFilter? = nil
     var initialResponse: String? = nil
+    /// Snapshots: the session whose hover card shows in the strip, dots or bar.
+    var initialHover: String? = nil
     /// Answering from a card: presses its button in Claude (when the switch is on).
     var answer: ((Row, String) -> Void)? = nil
     var warm: (() -> Void)? = nil
@@ -3004,6 +4503,13 @@ struct FloatingView: View {
     @State private var filter: RowFilter?
     /// The row or card whose latest reply is showing; one at a time.
     @State private var openResponse: String?
+    /// The strip's, the dots' or the bar's session under the pointer: its card shows.
+    @State private var hovered: String?
+    /// Where each chip, mark or bar item sits in its row, and the row's width,
+    /// to hang the hover card under (or over) it.
+    @State private var spots: [String: CGRect] = [:]
+    @State private var rowWidth: CGFloat = 0
+    @AppStorage(KeepOnTopLayout.autoStripKey) private var autoStrip = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var systemContrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -3022,8 +4528,8 @@ struct FloatingView: View {
 
     private var window: WaitingWindow { WaitingWindow(rawValue: waitingHours) ?? .day }
     private var contrast: Bool { forceContrast ?? (systemContrast == .increased) }
-    /// A solid background with Reduce Transparency, or with the calm rim.
-    private var solid: Bool { forceSolid ?? (reduceTransparency || glowStyle == GlowStyle.calm.rawValue) }
+    /// A solid background only with Reduce Transparency on.
+    private var solid: Bool { forceSolid ?? reduceTransparency }
     private var palette: Palette { Palette(scheme, contrast: contrast) }
     private var showGotIt: Bool { !status.previewing && (status.mode == .done || status.mode == .needsYou) }
 
@@ -3031,7 +4537,14 @@ struct FloatingView: View {
         let list = FloatingRows(board: Board(rows: model.rows, now: model.now), now: model.now,
                                 within: window.hours * 3600, finishedWithin: Self.doneShownFor)
         SwiftUI.Group {
-            if layout.mini { pill(list) } else { full(list) }
+            switch layout.current {
+            case .list: full(list)
+            case .pill: pill(list)
+            case .strip: strip(list)
+            case .dots: dots(list)
+            case .bar: bar(list)
+            case .columns: columns(list)
+            }
         }
         .fontDesign(.rounded)
         .environment(\.highContrast, contrast)
@@ -3039,11 +4552,17 @@ struct FloatingView: View {
         .onAppear {
             if let initialFilter { filter = initialFilter }
             if let initialResponse { openResponse = initialResponse }
+            if let initialHover { hovered = initialHover }
         }
         .onChange(of: waitingHours) { refit() }
         .onChange(of: layout.width) { refit() }
         .onChange(of: layout.height) { refit() }
-        .onChange(of: layout.mini) { refit() }
+        .onChange(of: layout.current) { hovered = nil; refit() }
+        .onChange(of: layout.chosen) { layoutChanged() }
+        .onChange(of: autoStrip) { refit(); layoutChanged() }
+        .onChange(of: layout.barWidth) { refit() }
+        .onChange(of: layout.columnsWidth) { refit() }
+        .onChange(of: hovered) { refit() }
         .onChange(of: filter) { refit() }
         .onChange(of: showGotIt) { refit() }
         .onChange(of: openResponse) { refit() }
@@ -3116,14 +4635,15 @@ struct FloatingView: View {
     static let corner: CGFloat = 16
 
     /// The cards ("Waiting on you"), then the other sessions under small
-    /// headings: Running, Needs you, Ready for review, Finished, On hold.
+    /// headings: Running, Needs you, Ready for review, Finished, Snoozed, On hold.
     private func content(_ carded: [Row], _ rows: [Row]) -> some View {
         let sections: [(title: String, rows: [Row])] = [
             ("Running", rows.filter { $0.group == .running && !$0.held }),
             ("Needs you", rows.filter { $0.group == .yourTurn && !$0.held }),
             ("Ready for review", rows.filter { $0.group == .review && !$0.held }),
             ("Finished", rows.filter { ($0.group == .justFinished || $0.group == .done) && !$0.held }),
-            ("On hold", rows.filter(\.held)),
+            ("Snoozed", rows.filter(\.snoozed)),
+            ("On hold", rows.filter { $0.held && !$0.snoozed }),
         ].filter { !$0.rows.isEmpty }
         return VStack(alignment: .leading, spacing: 0) {
             if !carded.isEmpty {
@@ -3156,6 +4676,8 @@ struct FloatingView: View {
                 .font(.system(size: 10, weight: .semibold))
                 .tracking(0.7)
                 .foregroundStyle(palette.time)
+                .lineLimit(1)
+                .layoutPriority(1)   // the hairline gives way first
             Text("\(count)")
                 .font(.system(size: 10, weight: .medium).monospacedDigit())
                 .foregroundStyle(palette.time)
@@ -3198,31 +4720,43 @@ struct FloatingView: View {
         }
     }
 
-    /// The window's background: the blurred material, or a solid one with
-    /// Reduce Transparency on.
+    /// The window's background: the system's glass, like other macOS windows
+    /// and alerts (the blurred material before macOS 26), or a solid one with
+    /// Reduce Transparency on. In Dark Mode the glass is darkened, as Control
+    /// Center's panels are, so a bright page behind it never makes it pale.
     @ViewBuilder private func surface<S: Shape>(_ shape: S) -> some View {
         if solid {
             shape.fill(Color(nsColor: .windowBackgroundColor))
+        } else if #available(macOS 26.0, *) {
+            Color.clear.glassEffect(.regular, in: shape)
+                .overlay(shape.fill(Color.black.opacity(Self.glassShade(scheme))))
         } else {
             shape.fill(.regularMaterial)
         }
     }
 
-    private func header(_ list: FloatingRows, filter active: RowFilter?) -> some View {
+    /// How much black sits on the glass: most of it in Dark Mode, none in Light.
+    static func glassShade(_ scheme: ColorScheme) -> Double { scheme == .dark ? 0.8 : 0 }
+
+    /// The window's top line. The columns leave out the counts (each column
+    /// has its own), and a double-click there goes back to the list.
+    private func header(_ list: FloatingRows, filter active: RowFilter?, counts: Bool = true,
+                        doubleClick: KeepOnTopLayout = .pill) -> some View {
         HStack(spacing: 6) {
-            Image(nsImage: claudeMark)
-                .renderingMode(.template)
-                .resizable()
-                .frame(width: 15, height: 15)
-                .foregroundStyle(.secondary)
+            LimboMark(size: 16)
             // Full chips when they fit, then compact ones (mark and number),
             // then a check for Got it, then only the chosen filter's chip: the
             // header never grows past the window.
-            ViewThatFits(in: .horizontal) {
-                headerCounts(list, filter: active, fit: .full)
-                headerCounts(list, filter: active, fit: .compact)
-                headerCounts(list, filter: active, fit: .compactIcon)
-                headerCounts(list, filter: active, fit: .minimal)
+            // (In a stack of its own: a priority set inside an `if` is lost.)
+            HStack(spacing: 0) {
+                if counts {
+                    ViewThatFits(in: .horizontal) {
+                        headerCounts(list, filter: active, fit: .full)
+                        headerCounts(list, filter: active, fit: .compact)
+                        headerCounts(list, filter: active, fit: .compactIcon)
+                        headerCounts(list, filter: active, fit: .minimal)
+                    }
+                }
             }
             .layoutPriority(1)
             // The empty middle: double-click it for the pill, or drag the window.
@@ -3230,10 +4764,14 @@ struct FloatingView: View {
             Color.clear
                 .frame(minWidth: 4, maxWidth: .infinity, minHeight: 18, maxHeight: 18)   // never taller
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2) { setMini(true) }
+                .onTapGesture(count: 2) { layout.choose(doubleClick) }
                 .gesture(WindowDragGesture())
-                .help("Double-click to shrink to a pill")
-            glowMenu
+                .testFrame("header-middle")
+                .help(doubleClick == .pill ? "Double-click to shrink to a pill" : "Double-click for the list")
+            HStack(spacing: 2) {   // close together: the counts need the room more
+                layoutMenu
+                glowMenu
+            }
             Menu {
                 Picker("Show sessions waiting for you from", selection: $waitingHours) {
                     ForEach(WaitingWindow.allCases) { Text($0.menuTitle).tag($0.rawValue) }
@@ -3273,7 +4811,7 @@ struct FloatingView: View {
         .contentShape(Rectangle())
         .gesture(WindowDragGesture())   // drag the window by its header
         .contextMenu {
-            Button("Shrink to Pill") { setMini(true) }
+            Button("Shrink to Pill") { layout.choose(.pill) }
             Divider()
             Button("Fit to Content") { layout.height = nil; layout.save() }
                 .disabled(layout.height == nil)
@@ -3382,7 +4920,7 @@ struct FloatingView: View {
             }
             .font(.system(size: 11, weight: .semibold).monospacedDigit())
             .foregroundStyle(selected ? tint : Color.primary)
-            .padding(.horizontal, 8)
+            .padding(.horizontal, compact ? 6 : 8)
             .padding(.vertical, 2)
             .background(Capsule().fill(selected ? tint.opacity(0.2) : Color.primary.opacity(0.1)))
             .overlay(Capsule().strokeBorder(selected ? tint.opacity(0.7) : Color.primary.opacity(contrast ? 0.6 : 0)))
@@ -3406,11 +4944,7 @@ struct FloatingView: View {
                 Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(p.done)
                 Text("All finished")
             } else {
-                Image(nsImage: claudeMark)
-                    .renderingMode(.template)
-                    .resizable()
-                    .frame(width: 14, height: 14)
-                    .foregroundStyle(.secondary)
+                LimboMark(size: 15)
                 if running == 0 && waiting == 0 { Text("All caught up").foregroundStyle(p.time) }
                 if running > 0 { Text("\(running) running") }
                 if running > 0 && waiting > 0 { Text("·").foregroundStyle(p.time) }
@@ -3428,10 +4962,14 @@ struct FloatingView: View {
         .background { surface(Capsule()) }
         .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
         .contentShape(Capsule())
-        .onTapGesture(count: 2) { setMini(false) }
+        .onTapGesture(count: 2) { layout.choose(.list) }
         .gesture(WindowDragGesture())
         .help("Double-click to expand")
-        .contextMenu { Button("Expand") { setMini(false) } }
+        .contextMenu {
+            Button("Expand") { layout.choose(.list) }
+            Divider()
+            layoutMenuItems(inline: false)
+        }
         .accessibilityElement(children: .combine)
         .accessibilityHint("Double-click to expand")
     }
@@ -3451,9 +4989,561 @@ struct FloatingView: View {
         }
     }
 
-    private func setMini(_ on: Bool) {
-        layout.mini = on
-        layout.save()
+    // MARK: The layout menu
+
+    /// Picks the window's layout; also in the right-click menu of the ones without a header.
+    private var layoutMenu: some View {
+        Menu { layoutMenuItems(inline: true) } label: {
+            Image(systemName: "rectangle.3.group")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(contrast ? Color.primary : Color.secondary)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Layout: \(layout.chosen.title)")
+        .accessibilityLabel("Layout: \(layout.chosen.title)")
+    }
+
+    @ViewBuilder private func layoutMenuItems(inline: Bool) -> some View {
+        let picker = Picker("Layout", selection: Binding(get: { layout.chosen }, set: { layout.choose($0) })) {
+            ForEach(KeepOnTopLayout.allCases) { Label($0.title, systemImage: $0.symbol).tag($0) }
+        }
+        if inline { picker.pickerStyle(.inline) } else { picker }
+        Divider()
+        Toggle("Strip while an app is full screen", isOn: $autoStrip)
+    }
+
+    // MARK: The strip, the dots and the bar
+
+    /// The coordinate space chips, marks and bar items report their places in.
+    private static let chipSpace = "chips"
+    static let maxChips = 6
+    static let maxDots = 12
+    static let hoverCardWidth: CGFloat = 290
+
+    /// A session whose latest turn asked you something: a "Waiting on you"
+    /// card in the list, whether it needs you, is to review or has finished.
+    static func asks(_ row: Row) -> Bool { row.group != .running && !row.held && row.card?.ask != nil }
+
+    /// The strip's, the bar's, the dots' and the columns' groups. Sessions
+    /// that asked you something are waiting on you, newest first, as the
+    /// list's cards are, then the ones that need you.
+    struct Compact {
+        let running, waiting, review, finished: [Row]
+
+        init(_ list: FloatingRows) {
+            let asking = (list.waiting + list.review + list.finished).filter(FloatingView.asks)
+                .sorted { $0.since > $1.since }
+            let ids = Set(asking.map(\.id))
+            running = list.running
+            waiting = asking + list.waiting.filter { !ids.contains($0.id) }
+            review = list.review.filter { !ids.contains($0.id) }
+            finished = list.finished.filter { !ids.contains($0.id) }
+        }
+    }
+
+    /// The strip's sessions: running, waiting on you, then ready for review,
+    /// at most `maxChips`; the rest only counted.
+    static func stripRows(_ list: FloatingRows) -> (shown: [Row], more: Int) {
+        let g = Compact(list)
+        let rows = g.running + g.waiting + g.review
+        return (Array(rows.prefix(maxChips)), max(0, rows.count - maxChips))
+    }
+
+    /// The dots' sessions in groups (running, waiting on you, review,
+    /// finished), at most `maxDots` in all; the rest only counted.
+    static func dotGroups(_ list: FloatingRows) -> (groups: [[Row]], more: Int) {
+        let g = Compact(list)
+        var left = maxDots
+        let groups = [g.running, g.waiting, g.review, g.finished].map { rows -> [Row] in
+            let taken = Array(rows.prefix(left))
+            left -= taken.count
+            return taken
+        }
+        let total = g.running.count + g.waiting.count + g.review.count + g.finished.count
+        return (groups.filter { !$0.isEmpty }, max(0, total - maxDots))
+    }
+
+    /// The mark for a session in the strip, the bar or the dots: one that
+    /// asked you something shows the amber "!", whatever its state.
+    private func compactMark(_ row: Row) -> some View {
+        Indicator(group: Self.asks(row) ? .yourTurn : row.group, quiet: row.quiet(now: model.now) != nil,
+                  held: row.held, snoozed: row.snoozed, source: row.iconSource, fallback: row.source)
+            .frame(width: 16, height: 16)
+    }
+
+    /// Where a hover card's left edge goes, measured from the left of the row
+    /// it hangs from: centred on its chip when the row is wider than the card,
+    /// else lined up with the side the window keeps fixed.
+    static func hoverCardX(chipMidX: CGFloat, rowWidth: CGFloat, card: CGFloat, trailing: Bool) -> CGFloat {
+        guard rowWidth >= card else { return trailing ? rowWidth - card : 0 }
+        return min(max(chipMidX - card / 2, 0), rowWidth - card)
+    }
+
+    /// The hovered session's card: its question and buttons, or its row,
+    /// then the snooze choices.
+    @ViewBuilder private func hoverCard(_ row: Row) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if row.group != .running, !row.held, let card = row.card, card.ask != nil {
+                AnswerCard(row: row, card: card, now: model.now, open: open,
+                           responseShown: openResponse == row.id,
+                           toggleResponse: { toggleResponse(row.id) },
+                           answer: answerFromCards && answer != nil ? { label in answer?(row, label) } : nil,
+                           warm: answerFromCards ? warm : nil,
+                           answering: answers.answering?.row == row.id ? answers.answering?.label : nil,
+                           note: answers.notes[row.id])
+            } else {
+                CompactRow(row: row, now: model.now, open: open, responseShown: openResponse == row.id,
+                           toggleResponse: row.group == .running ? nil : { toggleResponse(row.id) })
+                    .padding(4)
+            }
+            if SessionSnoozes.snoozable(row) { snoozeButtons(row) }
+        }
+        .frame(width: Self.hoverCardWidth, alignment: .leading)
+        .background { surface(RoundedRectangle(cornerRadius: 12, style: .continuous)) }
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+        .testFrame("card:\(row.id)")
+    }
+
+    /// The hover card under (or over) its chip; `trailing` when the window
+    /// keeps its right edge fixed.
+    private func placedCard(_ row: Row, trailing: Bool) -> some View {
+        let x = Self.hoverCardX(chipMidX: spots[row.id]?.midX ?? 0, rowWidth: rowWidth,
+                                card: Self.hoverCardWidth, trailing: trailing)
+        return hoverCard(row)
+            .alignmentGuide(trailing ? HorizontalAlignment.trailing : HorizontalAlignment.leading) { _ in
+                trailing ? rowWidth - x : -x
+            }
+    }
+
+    /// "Snooze 1h 3h Tomorrow" under a hover card: out of the strip and the
+    /// counts until then, or until the session moves on.
+    private func snoozeButtons(_ row: Row) -> some View {
+        let p = palette
+        return HStack(spacing: 5) {
+            Image(systemName: "moon.zzz").font(.system(size: 10, weight: .semibold))
+            Text("Snooze")
+            ForEach(SnoozeChoice.allCases) { choice in
+                Button {
+                    hovered = nil
+                    model.snooze(row, until: choice.until(from: Date()))
+                } label: {
+                    Text(choice.short)
+                        .padding(.horizontal, 8)
+                        .frame(height: 20)
+                        .background(Capsule().fill(Color.primary.opacity(contrast ? 0.2 : 0.09)))
+                        .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.6 : 0)))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.primary)
+                .help("Snooze " + snoozeWhen(choice.until(from: model.now), now: model.now))
+                .testFrame("snooze:\(row.id):\(choice.rawValue)")
+            }
+        }
+        .font(.system(size: 10.5, weight: .semibold))
+        .foregroundStyle(p.time)
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+        .padding(.bottom, 9)
+    }
+
+    /// The snoozed sessions as a moon and a count; its menu wakes them.
+    @ViewBuilder private func snoozedChip(_ rows: [Row], height: CGFloat = 24) -> some View {
+        if !rows.isEmpty {
+            let p = palette
+            let label = rows.count == 1 ? "1 snoozed" : "\(rows.count) snoozed"
+            Menu {
+                ForEach(rows) { row in
+                    Menu(row.title) {
+                        if let until = row.snoozedUntil { Text("Snoozed " + snoozeWhen(until, now: model.now)) }
+                        Button("Wake Now") { model.wake(row) }
+                        if row.link != nil { Button(row.openLabel) { open(row) } }
+                    }
+                }
+                if rows.count > 1 {
+                    Divider()
+                    Button("Wake All") { model.wakeAll() }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "moon.zzz.fill").font(.system(size: 9, weight: .semibold)).foregroundStyle(p.time)
+                    Text("\(rows.count)")
+                }
+                .padding(.horizontal, 8)
+                .frame(height: height)
+                .background(Capsule().fill(Color.primary.opacity(0.07)))
+                .contentShape(Capsule())
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help(label + ": click to wake one")
+            .testFrame("snoozed-chip")
+            .accessibilityLabel(label)
+        }
+    }
+
+    /// Records where a chip sits, for its card, and makes the pointer on it show the card.
+    private func hoverSpot(_ row: Row) -> HoverSpot {
+        HoverSpot(id: row.id, space: Self.chipSpace,
+                  hover: { hovered = row.id }, place: { spots[row.id] = $0 })
+    }
+
+    /// Double-click to go back to the list (on the mark, so a chip's click stays a chip's).
+    private func backToList(_ view: some View) -> some View {
+        view
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { layout.choose(.list) }
+            .help("Double-click for the list")
+    }
+
+    private var listButton: some View {
+        Button { layout.choose(.list) } label: {
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(contrast ? Color.primary : Color.secondary)
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Back to the list")
+        .accessibilityLabel("Back to the list")
+    }
+
+    private func spotDivider(_ height: CGFloat) -> some View {
+        Rectangle().fill(Color.primary.opacity(contrast ? 0.4 : 0.14)).frame(width: 1, height: height)
+    }
+
+    /// Sessions as one line of chips, for the black bar above a movie: running,
+    /// then waiting, then ready for review; finished ones as a count. The
+    /// pointer on a chip shows its card underneath; a click opens it.
+    private func strip(_ list: FloatingRows) -> some View {
+        let p = palette
+        let (shown, more) = Self.stripRows(list)
+        let finished = Compact(list).finished.count
+        let trailing = layout.trailing
+        let card = hovered.flatMap { id in shown.first { $0.id == id } }
+        return VStack(alignment: trailing ? .trailing : .leading, spacing: 6) {
+            if let card, layout.upward { placedCard(card, trailing: trailing) }
+            HStack(spacing: 4) {
+                backToList(LimboMark(size: 15).padding(.leading, 5).padding(.trailing, 2).frame(height: 32))
+                spotDivider(14)
+                if shown.isEmpty && finished == 0 {
+                    Text("All caught up").foregroundStyle(p.time).padding(.horizontal, 4)
+                }
+                ForEach(shown) { chip($0) }
+                if more > 0 { Text("+\(more)").foregroundStyle(p.time).padding(.horizontal, 4) }
+                if finished > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark").font(.system(size: 9, weight: .heavy)).foregroundStyle(p.done)
+                        Text("\(finished)")
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
+                    .help(finished == 1 ? "1 finished" : "\(finished) finished")
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(finished == 1 ? "1 finished" : "\(finished) finished")
+                }
+                snoozedChip(list.snoozed)
+                listButton.padding(.trailing, 2)
+            }
+            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+            .padding(.horizontal, 4)
+            .frame(height: 32)
+            .fixedSize()
+            .coordinateSpace(name: Self.chipSpace)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { rowWidth = $0 }
+            .background { if let glow { GlowBackdrop(view: glow) } }
+            .background { surface(Capsule()) }
+            .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+            .contentShape(Capsule())
+            .gesture(WindowDragGesture())
+            .contextMenu { layoutMenuItems(inline: false) }
+            if let card, !layout.upward { placedCard(card, trailing: trailing) }
+        }
+        .fixedSize()
+        .onHover { if !$0 { hovered = nil } }
+    }
+
+    /// A strip chip: the session's mark, its title (clipped) and how long ago.
+    private func chip(_ row: Row) -> some View {
+        let p = palette
+        let waiting = row.group == .yourTurn || Self.asks(row)
+        let tint = row.group == .running ? p.running : waiting ? p.needsYou : p.review
+        return Button { if row.link != nil { open(row) } } label: {
+            HStack(spacing: 5) {
+                compactMark(row)
+                Text(row.title)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 120, alignment: .leading)
+                Text(compactAge(since: row.since, now: model.now))
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(p.time)
+            }
+            .padding(.leading, 5)
+            .padding(.trailing, 9)
+            .frame(height: 24)
+            .background(Capsule().fill(tint.opacity(contrast ? 0 : (waiting ? 0.16 : 0.12))))
+            .overlay(Capsule().strokeBorder(waiting ? tint.opacity(0.6)
+                                            : Color.primary.opacity(contrast ? 0.6 : 0)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(row.link != nil ? .link : nil)
+        .modifier(hoverSpot(row))
+        .tagMenu(row)
+        .testFrame("chip:\(row.id)")
+        .accessibilityLabel("\(row.title)\(row.spokenApp), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+    }
+
+    /// Running, needs you, ready for review, finished: for VoiceOver.
+    private func spokenState(_ row: Row) -> String {
+        if let until = row.snoozedUntil, row.snoozed { return "snoozed " + snoozeWhen(until, now: model.now) }
+        if row.held { return "on hold" }
+        if Self.asks(row) { return "waiting on you" }
+        switch row.group {
+        case .running: return "running"
+        case .yourTurn: return "needs you"
+        case .review: return "ready for review"
+        default: return "finished"
+        }
+    }
+
+    /// The smallest layout: one mark per session, in groups. The pointer on a
+    /// mark shows its card underneath; a click opens it.
+    private func dots(_ list: FloatingRows) -> some View {
+        let p = palette
+        let (groups, more) = Self.dotGroups(list)
+        let trailing = layout.trailing
+        let card = hovered.flatMap { id in groups.joined().first { $0.id == id } }
+        return VStack(alignment: trailing ? .trailing : .leading, spacing: 6) {
+            if let card, layout.upward { placedCard(card, trailing: trailing) }
+            HStack(spacing: 7) {
+                backToList(LimboMark(size: 14).padding(.leading, 1).frame(height: 26))
+                if groups.isEmpty {
+                    spotDivider(12)
+                    Image(systemName: "checkmark").font(.system(size: 9, weight: .heavy)).foregroundStyle(p.time)
+                        .help("All caught up")
+                }
+                ForEach(groups.indices, id: \.self) { index in
+                    spotDivider(12)
+                    ForEach(groups[index]) { row in
+                        Button { if row.link != nil { open(row) } } label: {
+                            compactMark(row).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .pointerStyle(row.link != nil ? .link : nil)
+                        .modifier(hoverSpot(row))
+                        .tagMenu(row)
+                        .testFrame("dot:\(row.id)")
+                        .accessibilityLabel("\(row.title)\(row.spokenApp), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+                    }
+                }
+                if more > 0 {
+                    Text("+\(more)").font(.system(size: 11, weight: .semibold).monospacedDigit()).foregroundStyle(p.time)
+                }
+                if !list.snoozed.isEmpty {
+                    spotDivider(12)
+                    snoozedChip(list.snoozed, height: 18)
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                        .padding(.horizontal, -4)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 26)
+            .fixedSize()
+            .coordinateSpace(name: Self.chipSpace)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { rowWidth = $0 }
+            .background { if let glow { GlowBackdrop(view: glow) } }
+            .background { surface(Capsule()) }
+            .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+            .contentShape(Capsule())
+            .gesture(WindowDragGesture())
+            .contextMenu { layoutMenuItems(inline: false) }
+            if let card, !layout.upward { placedCard(card, trailing: trailing) }
+        }
+        .fixedSize()
+        .onHover { if !$0 { hovered = nil } }
+    }
+
+    static let barRunning = 4, barWaiting = 3, barReview = 2
+
+    /// A thin bar along the bottom of the screen, its full width: running
+    /// sessions with what they're doing, then the ones waiting and to review,
+    /// then a count of finished ones. The pointer on one shows its card above.
+    private func bar(_ list: FloatingRows) -> some View {
+        let p = palette
+        let g = Compact(list)
+        let running = Array(g.running.prefix(Self.barRunning))
+        let waiting = Array(g.waiting.prefix(Self.barWaiting))
+        let review = Array(g.review.prefix(Self.barReview))
+        let shown = running + waiting + review
+        let more = g.running.count + g.waiting.count + g.review.count - shown.count
+        let card = hovered.flatMap { id in shown.first { $0.id == id } }
+        let shape = UnevenRoundedRectangle(cornerRadii: .init(topLeading: 12, topTrailing: 12), style: .continuous)
+        return VStack(alignment: .leading, spacing: 6) {
+            if let card { placedCard(card, trailing: false) }
+            HStack(spacing: 12) {
+                backToList(LimboMark(size: 16).frame(height: 30))
+                if shown.isEmpty && g.finished.isEmpty {
+                    Text("All caught up").foregroundStyle(p.time)
+                }
+                if !running.isEmpty {
+                    barLabel("Running", g.running.count)
+                    ForEach(running) { barItem($0) }
+                }
+                if !waiting.isEmpty {
+                    if !running.isEmpty { spotDivider(14) }
+                    barLabel("Waiting on you", g.waiting.count)
+                    ForEach(waiting) { barItem($0) }
+                }
+                if !review.isEmpty {
+                    if !running.isEmpty || !waiting.isEmpty { spotDivider(14) }
+                    barLabel("To review", g.review.count)
+                    ForEach(review) { barItem($0) }
+                }
+                if more > 0 { Text("+\(more)").foregroundStyle(p.time).fixedSize() }
+                if !g.finished.isEmpty {
+                    if !shown.isEmpty { spotDivider(14) }
+                    barLabel("Finished", nil)
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark").font(.system(size: 9, weight: .heavy)).foregroundStyle(p.done)
+                        Text("\(g.finished.count)")
+                    }
+                    .fixedSize()
+                }
+                if !list.snoozed.isEmpty {
+                    if !shown.isEmpty || !g.finished.isEmpty { spotDivider(14) }
+                    snoozedChip(list.snoozed, height: 22)
+                }
+                // The empty part: double-click for the list.
+                backToList(Color.clear.frame(minWidth: 8, maxWidth: .infinity, minHeight: 22, maxHeight: 22))
+                    .layoutPriority(-1)   // the sessions take the room first
+                listButton
+            }
+            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+            .padding(.leading, 14)
+            .padding(.trailing, 8)
+            .frame(width: layout.barWidth, height: 30)
+            .coordinateSpace(name: Self.chipSpace)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { rowWidth = $0 }
+            .background { if let glow { GlowBackdrop(view: glow) } }
+            .background { surface(shape) }
+            .overlay(shape.strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+            .contextMenu { layoutMenuItems(inline: false) }
+        }
+        .frame(width: layout.barWidth, alignment: .leading)
+        .onHover { if !$0 { hovered = nil } }
+    }
+
+    /// A small capitals label in the bar, and its count.
+    private func barLabel(_ text: String, _ count: Int?) -> some View {
+        Text(count.map { "\(text.uppercased()) \($0)" } ?? text.uppercased())
+            .font(.system(size: 10, weight: .semibold).monospacedDigit())
+            .tracking(0.7)
+            .foregroundStyle(palette.time)
+            .fixedSize()
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    /// One session in the bar: mark, title, what it's doing (running) or its
+    /// first tag, and how long ago. Titles give way first to the rest.
+    private func barItem(_ row: Row) -> some View {
+        let p = palette
+        let waiting = row.group == .yourTurn || Self.asks(row)
+        return Button { if row.link != nil { open(row) } } label: {
+            HStack(spacing: 6) {
+                compactMark(row)
+                Text(row.title).lineLimit(1).truncationMode(.tail).layoutPriority(1)
+                // What it's doing, or its first tag: whole, or left out when there's no room.
+                ViewThatFits(in: .horizontal) {
+                    if row.group == .running, let activity = row.activity {
+                        Text(activity).font(.system(size: 11)).foregroundStyle(p.text2).fixedSize()
+                    } else if let tag = row.tags.first {
+                        TagPill(tag: tag).fixedSize()
+                    }
+                    Color.clear.frame(width: 0, height: 0)
+                }
+                Text(compactAge(since: row.since, now: model.now))
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(p.time)
+                    .fixedSize()
+            }
+            .padding(.horizontal, waiting ? 8 : 2)
+            .frame(height: 22)
+            .background(Capsule().fill(waiting && !contrast ? p.needsYou.opacity(0.14) : .clear))
+            .overlay(Capsule().strokeBorder(waiting ? p.needsYou.opacity(0.55) : .clear))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(row.link != nil ? .link : nil)
+        .modifier(hoverSpot(row))
+        .tagMenu(row)
+        .testFrame("bar:\(row.id)")
+        .accessibilityLabel("\(row.title)\(row.spokenApp), \(spokenState(row)), \(compactAge(since: row.since, now: model.now))")
+    }
+
+    // MARK: The columns
+
+    static let columnRows = 4
+
+    /// Wide and short: running, needs you (and to review), and finished side by side.
+    private func columns(_ list: FloatingRows) -> some View {
+        let g = Compact(list)
+        return VStack(alignment: .leading, spacing: 0) {
+            header(list, filter: nil, counts: false, doubleClick: .list)
+            HStack(alignment: .top, spacing: 0) {
+                column("Running", g.running)
+                columnDivider
+                column("Waiting on you", g.waiting + g.review)
+                columnDivider
+                column("Finished", g.finished + list.snoozed + list.onHold)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.bottom, 6)
+        }
+        .frame(width: layout.columnsWidth, alignment: .top)
+        .background { if let glow { GlowBackdrop(view: glow) } }
+        .background { surface(RoundedRectangle(cornerRadius: Self.corner, style: .continuous)) }
+        .overlay(RoundedRectangle(cornerRadius: Self.corner, style: .continuous)
+            .strokeBorder(Color.primary.opacity(contrast ? 0.7 : 0.1)))
+    }
+
+    private var columnDivider: some View {
+        Rectangle().fill(Color.primary.opacity(contrast ? 0.35 : 0.08)).frame(width: 1)
+            .frame(maxHeight: .infinity).padding(.vertical, 8)
+    }
+
+    private func column(_ title: String, _ rows: [Row]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            sectionHeader(title, count: rows.count)
+            if rows.isEmpty {
+                Text("None")
+                    .font(.system(size: 11))
+                    .foregroundStyle(palette.time)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+            } else {
+                rowStack(Array(rows.prefix(Self.columnRows)))
+                if rows.count > Self.columnRows {
+                    Text("\(rows.count - Self.columnRows) more")
+                        .font(.system(size: 10))
+                        .foregroundStyle(palette.time)
+                        .padding(.leading, 36)
+                        .padding(.bottom, 4)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     /// Picks how the window glows while a session runs, and in what colour.
@@ -3485,6 +5575,20 @@ struct FloatingView: View {
         .fixedSize()
         .help("Glow while a session runs: \(style.title)")
         .accessibilityLabel("Glow while a session runs: \(style.title)")
+    }
+}
+
+/// A chip's place in its row, and the pointer reaching it.
+struct HoverSpot: ViewModifier {
+    let id: String
+    let space: String
+    let hover: () -> Void
+    let place: (CGRect) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { if $0 { hover() } }
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(space)) } action: { place($0) }
     }
 }
 
@@ -4188,35 +6292,178 @@ final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-/// The keep-on-top window's size as you left it: any width, and a height
-/// only after you drag its top or bottom edge (until then it fits the rows).
+/// The keep-on-top window's shapes, picked from the layout menu in its header
+/// (or its right-click menu). Only the list and columns can be resized.
+enum KeepOnTopLayout: String, CaseIterable, Identifiable {
+    case list, strip, bar, dots, columns, pill
+    static let autoStripKey = "keepOnTopStripWhenFullScreen"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .list: return "List"
+        case .strip: return "Strip"
+        case .bar: return "Bar"
+        case .dots: return "Dots"
+        case .columns: return "Columns"
+        case .pill: return "Pill"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .list: return "list.bullet"
+        case .strip: return "rectangle.split.3x1"
+        case .bar: return "rectangle.bottomthird.inset.filled"
+        case .dots: return "ellipsis"
+        case .columns: return "rectangle.grid.3x2"
+        case .pill: return "capsule"
+        }
+    }
+    /// The edges a drag resizes: all of the list's, the sides of the columns.
+    var resizable: ResizeEdges {
+        switch self {
+        case .list: return [.left, .right, .top, .bottom]
+        case .columns: return [.left, .right]
+        default: return []
+        }
+    }
+    /// How round the glow's corners are: the window's, or half a capsule's height.
+    var glowCorner: CGFloat {
+        switch self {
+        case .dots: return 13
+        case .bar: return 12
+        default: return 16
+        }
+    }
+
+    /// What shows: the layout you chose, or the strip in place of the list or
+    /// the columns while an app is full screen on the window's display (with
+    /// that switch on), unless you picked a layout since it went full screen.
+    static func effective(chosen: KeepOnTopLayout, fullScreen: Bool, autoStrip: Bool,
+                          kept: Bool) -> KeepOnTopLayout {
+        guard autoStrip, fullScreen, !kept, chosen == .list || chosen == .columns else { return chosen }
+        return .strip
+    }
+
+    /// The saved choice; before layouts there was only the pill switch.
+    static func saved(raw: String?, legacyMini: Bool) -> KeepOnTopLayout {
+        raw.flatMap(KeepOnTopLayout.init(rawValue:)) ?? (legacyMini ? .pill : .list)
+    }
+}
+
+/// The keep-on-top window's layout and size as you left them: any width, and
+/// a height only after you drag its top or bottom edge (until then it fits the rows).
 final class FloatingLayout: ObservableObject {
     static let defaultWidth: CGFloat = 300
     static let minSize = NSSize(width: 220, height: 64)
+    static let defaultColumnsWidth: CGFloat = 660
+    static let minColumnsWidth: CGFloat = 480
     private static let widthKey = "keepOnTopWidth", heightKey = "keepOnTopHeight", miniKey = "keepOnTopMini"
+    private static let layoutKey = "keepOnTopLayout", columnsKey = "keepOnTopColumnsWidth"
     @Published var width: CGFloat
     @Published var height: CGFloat?
-    /// Shrunk to a pill with just the counts.
-    @Published var mini: Bool
+    @Published var columnsWidth: CGFloat
+    /// The layout you picked.
+    @Published var chosen: KeepOnTopLayout
+    /// Set by the window: another app is full screen on its display.
+    @Published var fullScreen = false
+    /// You picked a layout while that was so: it stays until full screen ends.
+    @Published var keptInFullScreen = false
+    /// Set by the window: it sits in the right half of its screen, so a hover
+    /// card lines up with its right edge and it grows to the left.
+    @Published var trailing = false
+    /// Set by the window: the strip or the dots sit in the lower half of their
+    /// screen, so the hover card opens above and the bottom edge stays put.
+    @Published var upward = false
+    /// Set by the window: the bar spans its screen.
+    @Published var barWidth: CGFloat = 1200
 
-    init(width: CGFloat = FloatingLayout.defaultWidth, height: CGFloat? = nil, mini: Bool = false) {
+    init(width: CGFloat = FloatingLayout.defaultWidth, height: CGFloat? = nil, mini: Bool = false,
+         chosen: KeepOnTopLayout? = nil, columnsWidth: CGFloat = FloatingLayout.defaultColumnsWidth) {
         self.width = width
         self.height = height
-        self.mini = mini
+        self.chosen = chosen ?? (mini ? .pill : .list)
+        self.columnsWidth = columnsWidth
+    }
+
+    /// Shrunk to a pill with just the counts.
+    var mini: Bool {
+        get { chosen == .pill }
+        set { chosen = newValue ? .pill : .list }
+    }
+
+    /// The layout showing now.
+    var current: KeepOnTopLayout {
+        KeepOnTopLayout.effective(chosen: chosen, fullScreen: fullScreen,
+                                  autoStrip: UserDefaults.standard.bool(forKey: KeepOnTopLayout.autoStripKey),
+                                  kept: keptInFullScreen)
+    }
+
+    /// Picks a layout from a menu or a double-click, and remembers it.
+    func choose(_ layout: KeepOnTopLayout) {
+        chosen = layout
+        if fullScreen { keptInFullScreen = true }
+        save()
     }
 
     static func saved() -> FloatingLayout {
         let d = UserDefaults.standard
-        let w = d.double(forKey: widthKey), h = d.double(forKey: heightKey)
+        let w = d.double(forKey: widthKey), h = d.double(forKey: heightKey), c = d.double(forKey: columnsKey)
         return FloatingLayout(width: w >= minSize.width ? w : defaultWidth, height: h >= minSize.height ? h : nil,
-                              mini: d.bool(forKey: miniKey))
+                              chosen: KeepOnTopLayout.saved(raw: d.string(forKey: layoutKey),
+                                                            legacyMini: d.bool(forKey: miniKey)),
+                              columnsWidth: c >= minColumnsWidth ? c : defaultColumnsWidth)
     }
 
     func save() {
-        UserDefaults.standard.set(Double(width), forKey: Self.widthKey)
-        UserDefaults.standard.set(Double(height ?? 0), forKey: Self.heightKey)
-        UserDefaults.standard.set(mini, forKey: Self.miniKey)
+        let d = UserDefaults.standard
+        d.set(Double(width), forKey: Self.widthKey)
+        d.set(Double(height ?? 0), forKey: Self.heightKey)
+        d.set(Double(columnsWidth), forKey: Self.columnsKey)
+        d.set(chosen.rawValue, forKey: Self.layoutKey)
+        d.set(chosen == .pill, forKey: Self.miniKey)
     }
+}
+
+/// Whether another app is full screen on a display: its Space is a full-screen
+/// app's, or a normal window covers the whole display (a game, say).
+func fullScreenShown(on screen: NSScreen) -> Bool {
+    if DisplaySpaces.isFullScreen(screen) == true { return true }
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    let primary = NSScreen.screens.first?.frame.height ?? screen.frame.height
+    return windowCovers(screen.frame, primaryHeight: primary, windows: windows, me: getpid())
+}
+
+/// A normal window (layer 0, not ours, not see-through) exactly the size of a
+/// display. Window bounds run from the primary display's top-left; reading
+/// them needs no Screen Recording permission (only titles do).
+func windowCovers(_ screen: NSRect, primaryHeight: CGFloat, windows: [[String: Any]], me: pid_t) -> Bool {
+    let target = CGRect(x: screen.minX, y: primaryHeight - screen.maxY, width: screen.width, height: screen.height)
+    return windows.contains { w in
+        guard (w[kCGWindowLayer as String] as? Int) == 0,
+              (w[kCGWindowOwnerPID as String] as? Int).map({ pid_t($0) }) != me,
+              (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+              let bounds = (w[kCGWindowBounds as String] as? NSDictionary)
+                  .flatMap({ CGRect(dictionaryRepresentation: $0 as CFDictionary) }) else { return false }
+        return abs(bounds.minX - target.minX) < 1 && abs(bounds.minY - target.minY) < 1
+            && abs(bounds.width - target.width) < 1 && abs(bounds.height - target.height) < 1
+    }
+}
+
+/// The bar's frame: along the bottom of `area`, its full width.
+func barFrame(area: NSRect, height: CGFloat) -> NSRect {
+    NSRect(x: area.minX, y: area.minY, width: area.width, height: height)
+}
+
+/// A frame moved just enough to sit inside `area`; the top edge wins when
+/// it is taller than the area.
+func keptOnScreen(_ frame: NSRect, area: NSRect) -> NSRect {
+    var r = frame
+    if r.maxX > area.maxX { r.origin.x = area.maxX - r.width }
+    if r.minX < area.minX { r.origin.x = area.minX }
+    if r.minY < area.minY { r.origin.y = area.minY }
+    if r.maxY > area.maxY { r.origin.y = area.maxY - r.height }
+    return r
 }
 
 /// Which edges of the keep-on-top window a drag resizes.
@@ -4319,6 +6566,8 @@ enum BackgroundCursor {
 /// front (see BackgroundCursor), without making Limbo Tasks frontmost.
 final class ResizeEdgesView: NSView {
     var minSize = FloatingLayout.minSize
+    /// The edges that resize: the columns' sides only, say.
+    var allowed: ResizeEdges = [.left, .right, .top, .bottom]
     var onResize: (NSRect, ResizeEdges) -> Void = { _, _ in }
     var onResizeEnd: () -> Void = {}
     /// The pointer in screen points; a check can stand in for the real mouse.
@@ -4327,7 +6576,7 @@ final class ResizeEdgesView: NSView {
     private var showingResizeCursor = false
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        ResizeEdges(at: convert(point, from: superview), in: bounds.size).isEmpty ? nil : self
+        ResizeEdges(at: convert(point, from: superview), in: bounds.size).intersection(allowed).isEmpty ? nil : self
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -4340,7 +6589,7 @@ final class ResizeEdgesView: NSView {
     }
 
     private func edges(_ event: NSEvent) -> ResizeEdges {
-        ResizeEdges(at: convert(event.locationInWindow, from: nil), in: bounds.size)
+        ResizeEdges(at: convert(event.locationInWindow, from: nil), in: bounds.size).intersection(allowed)
     }
 
     override func mouseEntered(with event: NSEvent) { hover(at: convert(event.locationInWindow, from: nil)) }
@@ -4351,7 +6600,7 @@ final class ResizeEdgesView: NSView {
     /// the resize cursor on an edge, the arrow again off it.
     func hover(at point: NSPoint?) {
         guard drag == nil else { return }
-        let edges = point.map { ResizeEdges(at: $0, in: bounds.size) } ?? []
+        let edges = point.map { ResizeEdges(at: $0, in: bounds.size).intersection(allowed) } ?? []
         if edges.isEmpty { endResizeCursor() } else { showResizeCursor(edges) }
     }
 
@@ -4535,6 +6784,11 @@ final class FloatingController {
     private var edges: ResizeEdgesView?
     /// While an edge is being dragged, the window follows the mouse, not the rows.
     private var resizing = false
+    /// The layout last fitted, and where the window's top-left was before the
+    /// bar took it to the bottom of the screen.
+    private var lastShape: KeepOnTopLayout?
+    private var beforeBar: NSPoint?
+    private var observers: [NSObjectProtocol] = []
     private static let shownKey = "keepOnTop"
     private static let frameName = "LimboTasksKeepOnTop"
 
@@ -4553,11 +6807,13 @@ final class FloatingController {
         clock?.invalidate()
         let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.now = Date()
+            self?.checkFullScreen()
             self?.fitToContent()
         }
         timer.tolerance = 5
         RunLoop.main.add(timer, forMode: .common)
         clock = timer
+        checkFullScreen()
         fitToContent()
         panel.orderFrontRegardless()
         updateGlow()
@@ -4638,29 +6894,119 @@ final class FloatingController {
         clock = nil
     }
 
-    /// Resizes to the content, keeping the top edge where it is.
+    /// Resizes to the content, keeping the top edge where it is and the window
+    /// on its screen; the bar instead spans the bottom of the screen.
     func fitToContent() {
         guard model.pinned else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, let panel = self.panel, let host = self.host else { return }
             self.updateGlow()
             guard !self.resizing else { return }
-            // The pill: rounder glow, and no resizing.
-            self.glow.cornerRadius = FloatingView.corner
-            self.edges?.isHidden = self.layout.mini
-            let size = host.fittingSize
-            guard panel.frame.size != size else { return }
-            let screen = panel.screen?.frame ?? NSScreen.main?.frame ?? panel.frame
-            panel.setFrame(anchoredFrame(panel.frame, size: size, screen: screen), display: true)
+            let shape = self.layout.current
+            self.glow.cornerRadius = shape.glowCorner
+            self.edges?.isHidden = shape.resizable.isEmpty
+            self.edges?.allowed = shape.resizable
+            self.edges?.minSize = shape == .columns
+                ? NSSize(width: FloatingLayout.minColumnsWidth, height: FloatingLayout.minSize.height)
+                : FloatingLayout.minSize
+            let screen = panel.screen ?? NSScreen.main
+            let full = screen?.frame ?? panel.frame
+            // In full screen the whole display is free; otherwise not the menu bar or the Dock.
+            let area = self.layout.fullScreen ? full : (screen?.visibleFrame ?? full)
+            let shapeChanged = self.lastShape != shape
+            if shape == .bar && self.lastShape != .bar {
+                self.beforeBar = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
+            } else if shape != .bar && self.lastShape == .bar, let corner = self.beforeBar {
+                panel.setFrameTopLeftPoint(corner)   // back where it was before the bar
+            }
+            self.lastShape = shape
+            if shape == .bar {
+                guard self.layout.barWidth == area.width else {
+                    self.layout.barWidth = area.width   // the bar refits at its new width
+                    return
+                }
+                let frame = barFrame(area: area, height: host.fittingSize.height)
+                if panel.frame != frame { panel.setFrame(frame, display: true) }
+                return
+            }
+            self.updateAnchors(shapeChanged: shapeChanged)
+            var frame = anchoredFrame(panel.frame, size: host.fittingSize, screen: full)
+            // A card opening above: the bottom stays put (not after a change of layout, which keeps the top).
+            if self.layout.upward && !shapeChanged { frame.origin.y = panel.frame.minY }
+            frame = keptOnScreen(frame, area: area)
+            if panel.frame != frame { panel.setFrame(frame, display: true) }
         }
+    }
+
+    /// Which way the window grows: away from the side nearer its screen's
+    /// edge, and for the strip and the dots in the lower half, upward. Taken
+    /// from the edge the line of chips sits on, so an open card never flips it.
+    private func updateAnchors(shapeChanged: Bool = false) {
+        guard let panel else { return }
+        let full = (panel.screen ?? NSScreen.main)?.frame ?? panel.frame
+        let shape = layout.current
+        let line = layout.upward && !shapeChanged ? panel.frame.minY + 16 : panel.frame.maxY - 16
+        let upward = (shape == .strip || shape == .dots) && line < full.midY
+        let trailing = panel.frame.midX > full.midX
+        if layout.trailing != trailing { layout.trailing = trailing }
+        if layout.upward != upward { layout.upward = upward }
+    }
+
+    /// A layout picked, or the full-screen switch flipped.
+    private func layoutChanged() {
+        checkFullScreen()
+        fitToContent()
+    }
+
+    /// Whether another app is full screen on the window's display, when that
+    /// matters: for "Strip while an app is full screen", and for where the bar sits.
+    func checkFullScreen() {
+        guard model.pinned, let panel else { return }
+        let wanted = UserDefaults.standard.bool(forKey: KeepOnTopLayout.autoStripKey) || layout.chosen == .bar
+        let on = wanted && (panel.screen ?? NSScreen.main).map { fullScreenShown(on: $0) } == true
+        guard layout.fullScreen != on else { return }
+        layout.fullScreen = on
+        if !on { layout.keptInFullScreen = false }
+        fitToContent()
+    }
+
+    /// Checks again when the Space or the app in front changes (going full
+    /// screen is a new Space), and once the slide into it has finished.
+    private func watchFullScreen(_ panel: NSPanel) {
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification] {
+            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.checkFullScreen()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self?.checkFullScreen() }
+            })
+        }
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.checkFullScreen()
+                self?.fitToContent()
+            })
+        // Dragged: which way it grows from here; onto another display: check that one.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak self] _ in
+                self?.updateAnchors()
+            })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeScreenNotification, object: panel, queue: .main) { [weak self] _ in
+                self?.checkFullScreen()
+                self?.fitToContent()
+            })
     }
 
     /// Side edges change only the width, so the height keeps fitting the rows;
     /// the top or bottom edge sets the height too, and the list scrolls in it.
     private func userResized(to frame: NSRect, edges: ResizeEdges) {
         resizing = true
-        if !edges.isDisjoint(with: [.top, .bottom]) { layout.height = frame.height }
-        layout.width = frame.width
+        if layout.current == .columns {
+            layout.columnsWidth = frame.width
+        } else {
+            if !edges.isDisjoint(with: [.top, .bottom]) { layout.height = frame.height }
+            layout.width = frame.width
+        }
         panel?.setFrame(frame, display: true)
     }
 
@@ -4689,8 +7035,7 @@ final class FloatingController {
     private func makePanel() -> KeepOnTopPanel {
         let view = FloatingView(model: model,
                                 open: { [weak self] row in
-                                    guard let id = row.link, isSessionId(id),
-                                          let url = URL(string: "claude://claude.ai/epitaxy/\(id)") else { return }
+                                    guard let url = row.openURL else { return }
                                     self?.model.markOpened(row)
                                     NSWorkspace.shared.open(url)
                                 },
@@ -4698,6 +7043,7 @@ final class FloatingController {
                                 refit: { [weak self] in self?.fitToContent() },
                                 glowChanged: { [weak self] in self?.glowChanged($0) },
                                 acknowledge: { [weak self] in self?.acknowledgeGlow() },
+                                layoutChanged: { [weak self] in self?.layoutChanged() },
                                 glow: glow,
                                 layout: layout,
                                 status: status,
@@ -4716,7 +7062,8 @@ final class FloatingController {
         edges.autoresizingMask = [.width, .height]
         edges.onResize = { [weak self] frame, moved in self?.userResized(to: frame, edges: moved) }
         edges.onResizeEnd = { [weak self] in self?.resizeEnded() }
-        edges.isHidden = layout.mini
+        edges.isHidden = layout.current.resizable.isEmpty
+        edges.allowed = layout.current.resizable
         content.addSubview(host)
         content.addSubview(edges)
         self.edges = edges
@@ -4734,6 +7081,7 @@ final class FloatingController {
         }
         panel.setFrameAutosaveName(Self.frameName)
         self.host = host
+        watchFullScreen(panel)
         return panel
     }
 }
@@ -4779,6 +7127,20 @@ enum DisplaySpaces {
         .map { unsafeBitCast($0, to: CurrentSpace.self) }
     private static let windowNumber: WindowNumber? = dlsym(handle, "_AXUIElementGetWindow")
         .map { unsafeBitCast($0, to: WindowNumber.self) }
+    private typealias SpaceType = @convention(c) (Int32, UInt64) -> Int32
+    private static let spaceType: SpaceType? = (dlsym(handle, "CGSSpaceGetType") ?? dlsym(handle, "SLSSpaceGetType"))
+        .map { unsafeBitCast($0, to: SpaceType.self) }
+
+    /// Whether a display shows a full-screen app's own Space (type 4), or nil
+    /// when the window server won't say.
+    static func isFullScreen(_ screen: NSScreen) -> Bool? {
+        guard let connection, let spaceType,
+              let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+              let cfUUID = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue(),
+              let uuid = CFUUIDCreateString(nil, cfUUID) as String?,
+              let space = space(of: uuid) else { return nil }
+        return spaceType(connection, space) == 4
+    }
 
     /// One display when you clicked: its Space, and the app and window in front there.
     struct Shown {
@@ -5522,13 +7884,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func didWake() {
+        model.wakeDue()
         engine.refresh()
         updateStatusItem()
     }
 
     private func updateStatusItem() {
         let now = Date()
-        let board = Board(rows: model.rows, now: now)
+        // Claude's sessions only: ChatGPT's and Cursor's threads are read only while a panel shows.
+        let board = Board(rows: model.rows.filter { !$0.fromOtherApp }, now: now)
         let counts = (board.yourTurn.count, board.running.count)
         if shownCounts.map({ $0 != counts }) ?? true {
             shownCounts = counts
@@ -5598,9 +7962,15 @@ func sampleRows(now: Date) -> [Row] {
         Row(id: "local_s3b", group: .yourTurn, title: "Rename the billing exports",
             ask: "Which naming scheme should the new export files use?",
             context: "billing-service", since: minutesAgo(50), link: "local_s3b", tags: [SessionTags.onHold]),
+        Row(id: "local_s3c", group: .yourTurn, title: "Rotate the staging API keys",
+            ask: "OK to revoke the old keys now?", context: "web-platform", since: minutesAgo(70),
+            link: "local_s3c", snoozedUntil: now.addingTimeInterval(45 * 60)),
         Row(id: "local_s4", group: .running, title: "Audit traffic before the old site is shut down",
             context: "Documents", since: minutesAgo(12), link: "local_s4",
             activity: "Scanning the app logs for scope errors"),
+        Row(id: "codex:sample1", group: .running, title: "Refactor the payments client", context: "payments",
+            since: minutesAgo(3), link: "codex://threads/sample1", activity: "Running a command",
+            lastOutput: minutesAgo(0)),
         Row(id: "pid:5", group: .running, title: "data-pipeline", context: "data-pipeline",
             since: minutesAgo(31), terminal: true, activity: "Running the nightly export",
             lastOutput: minutesAgo(14)),
@@ -5627,12 +7997,47 @@ func sampleRows(now: Date) -> [Row] {
     ])
 }
 
+/// --sample-apps: made-up sessions from every app Limbo reads (Claude,
+/// ChatGPT, Cursor, Antigravity, Orca), for pictures of it.
+func sampleAppRows(now: Date) -> [Row] {
+    func minutesAgo(_ m: Double) -> Date { now.addingTimeInterval(-m * 60) }
+    return rowsInOrder([
+        Row(id: "local_a1", group: .yourTurn, title: "Fix the flaky checkout test", ask: "Commit and push this change?",
+            context: "web-app",
+            since: minutesAgo(0.3), link: "local_a1",
+            card: TurnCard(ask: "Commit and push this change?", actions: ["Commit and push", "Not yet"],
+                           recap: "The checkout test now waits for the cart total before paying; 20 runs in a row passed.",
+                           reply: "The test clicked Pay before the cart total had loaded. It now waits for the total, and 20 runs in a row passed locally.")),
+        Row(id: "cursor:a2", group: .yourTurn, title: "Rename the config keys", detail: "Waiting for your approval",
+            context: "settings", since: minutesAgo(2), link: cursorLinkPrefix + "a2"),
+        Row(id: "local_a3", group: .running, title: "Audit traffic before the old site goes", context: "web-platform",
+            since: minutesAgo(12), link: "local_a3", activity: "Scanning the app logs for scope errors",
+            lastOutput: minutesAgo(0)),
+        Row(id: "codex:a4", group: .running, title: "Refactor the payments client", context: "payments",
+            since: minutesAgo(3), link: "codex://threads/a4", activity: "Running a command", lastOutput: minutesAgo(0)),
+        Row(id: "cursor:a5", group: .running, title: "Tidy the build scripts", context: "build-tools",
+            since: minutesAgo(5), link: cursorLinkPrefix + "a5", activity: "Read Makefile, build.sh",
+            lastOutput: minutesAgo(0)),
+        Row(id: "agy:a6", group: .running, title: "Profile the image pipeline", context: "media",
+            since: minutesAgo(1.5), link: antigravityLinkPrefix + "a6", lastOutput: minutesAgo(0)),
+        Row(id: "orca:a7", group: .running, title: "Home · Ada", context: "Orca", since: minutesAgo(0.5),
+            link: orcaLinkPrefix + "a7", lastOutput: minutesAgo(0), agent: .claude),
+        Row(id: "codex:a8", group: .done, title: "Summarize this week's PRs", context: "web-app",
+            since: minutesAgo(35), link: "codex://threads/a8"),
+        Row(id: "agy:a9", group: .done, title: "Free up disk space", context: "Antigravity",
+            since: minutesAgo(70), link: antigravityLinkPrefix + "a9"),
+    ])
+}
+
 /// --size 380x260, or 380xauto: the keep-on-top window's size in a snapshot.
 func snapshotLayout() -> FloatingLayout {
     let parts = (argument(after: "--size") ?? "").split(separator: "x").map(String.init)
     let width = parts.first.flatMap(Double.init).map { CGFloat($0) } ?? FloatingLayout.defaultWidth
     let height = parts.count > 1 ? Double(parts[1]).map { CGFloat($0) } : nil
-    return FloatingLayout(width: width, height: height, mini: arguments.contains("--mini"))
+    let layout = FloatingLayout(width: width, height: height, mini: arguments.contains("--mini"),
+                                chosen: argument(after: "--layout").flatMap(KeepOnTopLayout.init(rawValue:)))
+    if layout.chosen == .bar { layout.barWidth = width > 600 ? width : 1200 }
+    return layout
 }
 
 /// Renders the panel and the menu bar item to PNG files.
@@ -5641,7 +8046,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     // --live: the real turning rings and shimmering status lines, frozen mid-animation.
     staticIndicators = !arguments.contains("--live")
     let model = SessionModel()
-    let rows = sample ? sampleRows(now: Date()) : SessionEngine.scanOnce()
+    let rows = sample ? (arguments.contains("--sample-apps") ? sampleAppRows(now: Date()) : sampleRows(now: Date()))
+                      : SessionEngine.scanOnce()
     model.setRows(limit.map { Array(rows.prefix($0)) } ?? rows)
     let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     // The running glow, frozen at --phase seconds (default 1) into its loop.
@@ -5663,7 +8069,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
                                                layout: snapshotLayout(), status: status,
                                                forceContrast: contrast, forceSolid: arguments.contains("--solid"),
                                                initialFilter: argument(after: "--filter").flatMap(RowFilter.init(rawValue:)),
-                                               initialResponse: argument(after: "--response"))
+                                               initialResponse: argument(after: "--response"),
+                                               initialHover: argument(after: "--hover"))
             .padding(16).background(Color(white: dark ? 0.1 : 0.85)))
         : NSHostingView(rootView: PanelView(model: model, open: { _ in }, expandAll: expand, pin: {})
             .background(Color(nsColor: .windowBackgroundColor)))
@@ -5748,18 +8155,74 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
 }
 
 /// Group and title per row, plus counts. No asks or summaries.
+/// --codex-bench: what reading ChatGPT's threads costs, on this Mac's real
+/// threads: the first read, then a tick with nothing new.
+func runCodexBench() {
+    let watcher = CodexWatcher()
+    let clock = ContinuousClock()
+    let first = clock.measure { watcher.refresh() }
+    let ticks = 200
+    let rest = clock.measure { for _ in 0..<ticks { watcher.refresh() } }
+    func ms(_ d: Duration) -> Double { Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15 }
+    let look = clock.measure { _ = CodexWatcher.findServers() }
+    print(String(format: "threads open in ChatGPT: %d", watcher.rows.count))
+    print(String(format: "looking for ChatGPT's server (every 30 s): %.1f ms", ms(look)))
+    print(String(format: "first read (finds the server, reads each thread's file): %.1f ms", ms(first)))
+    print(String(format: "a tick with nothing new: %.3f ms (%.4f%% of one core at one tick every 2 s)",
+                 ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
+}
+
+/// --cursor-bench and --antigravity-bench: what reading an app's threads
+/// costs, on this Mac's real app: the first read, a tick when nothing
+/// changed, and one read of its list.
+func runAppBench(_ watcher: AppThreadsWatcher, name: String) {
+    let clock = ContinuousClock()
+    func ms(_ d: Duration) -> Double { Double(d.components.seconds) * 1000 + Double(d.components.attoseconds) / 1e15 }
+    var found: (pid: pid_t, started: Date)?
+    let look = clock.measure { found = AppThreadsWatcher.findApp(suffix: watcher.executableSuffix) }
+    let first = clock.measure { watcher.refresh() }
+    let ticks = 200
+    let rest = clock.measure { for _ in 0..<ticks { watcher.refresh() } }
+    var reading: [Row]?
+    let reads = 20
+    let started = found?.started ?? Date()
+    let read = clock.measure {
+        for _ in 0..<reads {
+            switch name {
+            case "Cursor":
+                reading = readCursorThreads(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
+                    .compactMap { cursorRow($0, cursorStarted: started) }
+            case "Orca":
+                reading = readOrcaThreads(database: watcher.database)?.compactMap(orcaRow)
+            default:
+                reading = readAntigravityConversations(database: watcher.database, since: Date().addingTimeInterval(-Board.window))?
+                    .compactMap { antigravityRow($0, appStarted: started) }
+            }
+        }
+    }
+    print(found == nil ? "\(name) isn't running: no rows" : "\(name) threads shown: \(watcher.rows.count)"
+          + " (\(watcher.rows.filter { $0.group == .running }.count) running)")
+    print(reading == nil ? "reading the list failed" : "rows read from the list: \(reading?.count ?? 0)")
+    print(String(format: "looking for \(name) (every 30 s): %.1f ms", ms(look)))
+    print(String(format: "first read (finds \(name), reads its list): %.1f ms", ms(first)))
+    print(String(format: "reading the list (open, query, close; only when \(name) wrote): %.2f ms", ms(read) / Double(reads)))
+    print(String(format: "a tick when \(name) wrote nothing: %.3f ms (%.4f%% of one core at one tick every 2 s)",
+                 ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
+    print("reads during \(ticks) ticks: \(max(0, watcher.reads - 1))")
+}
+
 func runDump() {
     let now = Date()
     let board = Board(rows: SessionEngine.scanOnce(), now: now)
     let groups: [(String, [Row])] = [
         ("your-turn", board.yourTurn), ("your-turn-older", board.older), ("running", board.running),
         ("just-finished", board.justFinished), ("review", board.review), ("done", board.done),
-        ("terminal", board.terminal), ("on-hold", board.onHold),
+        ("terminal", board.terminal), ("on-hold", board.onHold), ("snoozed", board.snoozed),
     ]
     for (name, rows) in groups {
         for r in rows {
             print("\(name)\t\(String(format: "%.1f", now.timeIntervalSince(r.since) / 3600))h\t\(r.title)"
-                  + (r.activity.map { "\t[\($0)]" } ?? ""))
+                  + (r.activity.map { "\t[\($0)]" } ?? "") + (r.fromOtherApp ? "\t(\(r.appName))" : ""))
         }
     }
     print("counts: " + groups.map { "\($0.0)=\($0.1.count)" }.joined(separator: " "))
@@ -5988,7 +8451,8 @@ func runSelfTest() {
     check("a turn without a wrap-up keeps its reply",
           turnCard(transcript: transcriptFile([saidLine("hi"), replyLine("Hello")])) == TurnCard(reply: "Hello"))
     check("a question with no buttons gets one", TurnCard(ask: "Go?").buttons == ["Answer in Claude"])
-    // Background work: a child shell holding …/<session>/tasks/<id>.output counts.
+    // Background work: a child shell holding …/<session>/tasks/<id>.output
+    // counts, and so does a monitor: a shell Claude started, holding no file.
     let taskDir = NSTemporaryDirectory() + "limbo-bg-\(getpid())/s-123/tasks"
     try? FileManager.default.createDirectory(atPath: taskDir, withIntermediateDirectories: true)
     let shell = Process()
@@ -6001,6 +8465,20 @@ func runSelfTest() {
     shell.terminate()
     shell.waitUntilExit()
     check("a finished task doesn't", runningBackgroundTasks(parent: getpid(), session: "s-123") == 0)
+    let monitor = Process()
+    monitor.executableURL = URL(fileURLWithPath: "/bin/zsh")   // sh in POSIX mode quits when source finds no file
+    monitor.arguments = ["-c", "source /nowhere/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && sleep 5; :"]
+    let plainShell = Process()
+    plainShell.executableURL = URL(fileURLWithPath: "/bin/sh")
+    plainShell.arguments = ["-c", "sleep 5"]
+    try? plainShell.run()
+    Thread.sleep(forTimeInterval: 0.3)
+    check("a shell Claude didn't start doesn't count", runningBackgroundTasks(parent: getpid(), session: "s-123") == 0)
+    try? monitor.run()
+    Thread.sleep(forTimeInterval: 0.3)
+    check("a monitor (a shell Claude started, streaming, no output file) counts",
+          runningBackgroundTasks(parent: getpid(), session: "s-123") == 1)
+    for process in [monitor, plainShell] { process.terminate(); process.waitUntilExit() }
     try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "limbo-bg-\(getpid())")
     let reviewDesk = DeskRecord(sessionId: "local_bg1", title: "Watch the deploys", cwd: "/tmp", lastActivity: now,
                                 lastTurnEdge: now.addingTimeInterval(-30), fileTime: now, isArchived: false,
@@ -6032,6 +8510,83 @@ func runSelfTest() {
     check("so is a link whose text has brackets", links("[safe [nested]](file:///tmp/evil.command)").isEmpty)
     check("a web link stays a link", links("[docs](https://example.com) and <https://example.org>")
             == ["https://example.com", "https://example.org"])
+
+    // The window's glass: dark in Dark Mode, plain in Light Mode.
+    check("Dark Mode darkens the glass", FloatingView.glassShade(.dark) >= 0.5)
+    check("Light Mode leaves the glass plain", FloatingView.glassShade(.light) == 0)
+
+    // Layouts: the saved choice, and what shows while an app is full screen.
+    check("an old pill setting comes back as the pill", KeepOnTopLayout.saved(raw: nil, legacyMini: true) == .pill)
+    check("no setting is the list", KeepOnTopLayout.saved(raw: nil, legacyMini: false) == .list)
+    check("a saved layout wins over the old pill setting", KeepOnTopLayout.saved(raw: "bar", legacyMini: true) == .bar)
+    check("an unknown saved layout is the list", KeepOnTopLayout.saved(raw: "grid", legacyMini: false) == .list)
+    check("the pill switch still works", FloatingLayout(mini: true).chosen == .pill
+              && { let l = FloatingLayout(mini: true); l.mini = false; return l.chosen == .list }())
+    check("full screen turns the list into the strip",
+          KeepOnTopLayout.effective(chosen: .list, fullScreen: true, autoStrip: true, kept: false) == .strip)
+    check("and the columns", KeepOnTopLayout.effective(chosen: .columns, fullScreen: true, autoStrip: true, kept: false) == .strip)
+    check("the dots stay the dots", KeepOnTopLayout.effective(chosen: .dots, fullScreen: true, autoStrip: true, kept: false) == .dots)
+    check("with the switch off, full screen changes nothing",
+          KeepOnTopLayout.effective(chosen: .list, fullScreen: true, autoStrip: false, kept: false) == .list)
+    check("a layout picked in full screen stays",
+          KeepOnTopLayout.effective(chosen: .list, fullScreen: true, autoStrip: true, kept: true) == .list)
+    check("out of full screen, the layout you chose",
+          KeepOnTopLayout.effective(chosen: .columns, fullScreen: false, autoStrip: true, kept: false) == .columns)
+    check("only the list and the columns resize", KeepOnTopLayout.allCases.filter { !$0.resizable.isEmpty } == [.list, .columns]
+              && KeepOnTopLayout.columns.resizable == [.left, .right])
+    let screenArea = NSRect(x: 0, y: 70, width: 1512, height: 875)
+    check("the bar spans the bottom of the screen",
+          barFrame(area: screenArea, height: 30) == NSRect(x: 0, y: 70, width: 1512, height: 30))
+    check("a window past the bottom moves up onto the screen",
+          keptOnScreen(NSRect(x: 1200, y: 20, width: 300, height: 200), area: screenArea) == NSRect(x: 1200, y: 70, width: 300, height: 200))
+    check("past the right edge, it moves left",
+          keptOnScreen(NSRect(x: 1400, y: 400, width: 300, height: 200), area: screenArea).maxX == 1512)
+    check("taller than the screen, its top stays on it",
+          keptOnScreen(NSRect(x: 10, y: 0, width: 300, height: 1200), area: screenArea).maxY == screenArea.maxY)
+    check("a window on the screen stays put",
+          keptOnScreen(NSRect(x: 10, y: 300, width: 300, height: 200), area: screenArea) == NSRect(x: 10, y: 300, width: 300, height: 200))
+    // The strip and the dots never outgrow the screen.
+    let many = (0..<9).map { Row(id: "r\($0)", group: .running, title: "Session \($0)", context: "", since: Date()) }
+    let crowd = FloatingRows(board: Board(rows: many + many.map { Row(id: $0.id + "d", group: .done, title: $0.title,
+                                                                     context: "", since: Date()) }, now: Date()),
+                             now: Date(), within: 86400, finishedWithin: 7200)
+    let stripped = FloatingView.stripRows(crowd)
+    check("the strip shows six chips and counts the rest", stripped.shown.count == 6 && stripped.more == 3)
+    let dotted = FloatingView.dotGroups(crowd)
+    check("the dots show twelve marks and count the rest",
+          dotted.groups.joined().count == FloatingView.maxDots && dotted.more == 18 - FloatingView.maxDots)
+    // A finished session that asked something is waiting on you, as its card is in the list.
+    let asked = Row(id: "asked", group: .justFinished, title: "Fix the test", context: "", since: Date(),
+                    card: TurnCard(ask: "Commit and push this change?", actions: ["Commit and push"]))
+    let quietDone = Row(id: "quiet", group: .done, title: "Tidy up", context: "", since: Date())
+    let asking = FloatingView.Compact(FloatingRows(board: Board(rows: [asked, quietDone], now: Date()), now: Date(),
+                                                   within: 86400, finishedWithin: 7200))
+    check("a finished session's question puts it with the ones waiting on you",
+          asking.waiting.map(\.id) == ["asked"] && asking.finished.map(\.id) == ["quiet"])
+    // A hover card hangs under its chip, inside the row.
+    check("a card centres under its chip", FloatingView.hoverCardX(chipMidX: 400, rowWidth: 800, card: 290, trailing: false) == 255)
+    check("near the left end it lines up with the row", FloatingView.hoverCardX(chipMidX: 50, rowWidth: 800, card: 290, trailing: false) == 0)
+    check("near the right end too", FloatingView.hoverCardX(chipMidX: 790, rowWidth: 800, card: 290, trailing: true) == 510)
+    check("under a short row it keeps to the fixed side",
+          FloatingView.hoverCardX(chipMidX: 60, rowWidth: 200, card: 290, trailing: true) == -90
+              && FloatingView.hoverCardX(chipMidX: 60, rowWidth: 200, card: 290, trailing: false) == 0)
+    // Full screen: a normal window from another app exactly covering the display.
+    func window(_ x: Int, _ y: Int, _ w: Int, _ h: Int, layer: Int = 0, pid: Int = 42) -> [String: Any] {
+        [kCGWindowLayer as String: layer, kCGWindowOwnerPID as String: pid,
+         kCGWindowBounds as String: ["X": x, "Y": y, "Width": w, "Height": h] as NSDictionary]
+    }
+    let display = NSRect(x: 0, y: 0, width: 1512, height: 982)
+    check("a window covering the display is full screen",
+          windowCovers(display, primaryHeight: 982, windows: [window(0, 0, 1512, 982)], me: 7))
+    check("a zoomed window is not", !windowCovers(display, primaryHeight: 982, windows: [window(0, 37, 1512, 880)], me: 7))
+    check("nor one of ours", !windowCovers(display, primaryHeight: 982, windows: [window(0, 0, 1512, 982, pid: 7)], me: 7))
+    check("nor a shield above the windows", !windowCovers(display, primaryHeight: 982, windows: [window(0, 0, 1512, 982, layer: 25)], me: 7))
+    check("on a display above the main one, bounds count from the main one's top",
+          windowCovers(NSRect(x: 0, y: 982, width: 1920, height: 1080), primaryHeight: 982,
+                       windows: [window(0, -1080, 1920, 1080)], me: 7))
+    check("every layout symbol exists",
+          (KeepOnTopLayout.allCases.map(\.symbol) + ["rectangle.3.group", "arrow.up.left.and.arrow.down.right"])
+              .allSatisfy { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil })
 
     // Answering from a card presses only an exact match.
     check("the same question, ignoring case and spacing",
@@ -6072,6 +8627,355 @@ func runSelfTest() {
     check("shrinking on the left keeps the left edge",
           anchoredFrame(NSRect(x: 40, y: 600, width: 320, height: 200), size: NSSize(width: 150, height: 32),
                         screen: screenFrame) == NSRect(x: 40, y: 768, width: 150, height: 32))
+
+    // ChatGPT (Codex) threads: a turn's start and end lines in its rollout file.
+    let codexDir = NSTemporaryDirectory() + "limbo-codex-\(getpid())/.codex/sessions/2026/11/19"
+    try? FileManager.default.createDirectory(atPath: codexDir, withIntermediateDirectories: true)
+    let threadId = "01a1f000-0000-7000-8000-000000000001"
+    let rollout = codexDir + "/rollout-2026-11-19T08-00-00-\(threadId).jsonl"
+    func codexLine(_ time: String, _ type: String, _ payload: String) -> String {
+        #"{"timestamp":"2026-11-19T\#(time)Z","ordinal":7,"type":"\#(type)","payload":{"type":\#(payload)}}"# + "\n"
+    }
+    let header = #"{"timestamp":"2026-11-19T02:30:00.000Z","type":"session_meta","payload":{"id":"\#(threadId)","cwd":"\/tmp\/web-app","originator":"Codex Desktop","thread_source":"user","base_instructions":{"text":"long"}}}"# + "\n"
+    let started = codexLine("02:30:01.000", "event_msg", #""task_started","turn_id":"t1""#)
+    let thinking = codexLine("02:30:02.000", "response_item", #""reasoning","summary":[]"#)
+    let command = codexLine("02:30:03.000", "response_item", #""custom_tool_call","status":"completed","call_id":"c1","name":"exec","input":"ls""#)
+    // A reply that quotes a turn's end line: words inside a message never count.
+    let quoting = codexLine("02:31:00.000", "response_item",
+                            #""message","role":"assistant","content":[{"type":"output_text","text":"see {\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}"}]"#)
+    try? (header + started + thinking + command).write(toFile: rollout, atomically: true, encoding: .utf8)
+    var scan = scanRollout(path: rollout, from: RolloutScan())
+    check("a turn started and not ended is running, doing what its last step did",
+          scan.marker == .started && scan.activity == "Running a command"
+              && scan.markerTime == codexTime.date(from: "2026-11-19T02:30:01.000Z"))
+    func append(_ text: String) {
+        if let handle = FileHandle(forWritingAtPath: rollout) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        }
+    }
+    append(quoting)
+    scan = scanRollout(path: rollout, from: scan)
+    check("a reply quoting an end line doesn't end the turn", scan.marker == .started && scan.activity == "Writing")
+    let turnEnd = codexLine("02:32:00.000", "event_msg", #""task_complete","turn_id":"t1","last_agent_message":"done""#)
+    append(String(turnEnd.dropLast(10)))
+    let partly = scanRollout(path: rollout, from: scan)
+    check("a half-written last line waits", partly.marker == .started && partly.offset == scan.offset)
+    append(String(turnEnd.suffix(10)))
+    scan = scanRollout(path: rollout, from: partly)
+    check("the turn's end line ends it", scan.marker == .complete
+              && scan.markerTime == codexTime.date(from: "2026-11-19T02:32:00.000Z"))
+    check("read from where it stopped: a fresh read agrees", scanRollout(path: rollout, from: RolloutScan()) == scan)
+    let head = rolloutHeader(path: rollout)
+    check("the first line gives the thread, its folder and who started it",
+          head.id == threadId && head.cwd == "/tmp/web-app" && head.source == "user")
+    check("Codex's own agents and reviewers are left out",
+          codexThreadShown(source: "user") && codexThreadShown(source: nil) && !codexThreadShown(source: "subagent")
+              && !codexThreadShown(source: "guardian_review"))
+    check("the thread id comes from the file name", codexThreadId(path: rollout) == threadId)
+    check("ChatGPT's own process is what starts its Codex servers, not one of its helpers",
+          CodexWatcher.isChatGPTApp("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+              && !CodexWatcher.isChatGPTApp("/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)"))
+    check("a long thread's file with a second id still gives the first",
+          codexThreadId(path: codexDir + "/rollout-2026-10-14T10-02-20-\(threadId)_01a1f000-0000-7000-8000-000000000002.jsonl")
+              == threadId)
+    check("a thread's name is the last one it got",
+          codexNames(index: #"{"id":"a","thread_name":"First","updated_at":"x"}"# + "\n"
+                     + #"{"id":"a","thread_name":"Renamed","updated_at":"y"}"#) == ["a": "Renamed"])
+    let finishedRow = codexRow(id: threadId, name: "Fix the export", cwd: head.cwd, scan: scan)
+    check("a finished thread is a finished row that opens in ChatGPT",
+          finishedRow?.group == .done && finishedRow?.source == .chatGPT && finishedRow?.tags == []
+              && finishedRow?.openURL?.absoluteString == "codex://threads/\(threadId)" && finishedRow?.context == "web-app")
+    check("it can't be tagged or snoozed", finishedRow.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    append(codexLine("02:33:00.000", "event_msg", #""task_started","turn_id":"t2""#)
+           + codexLine("02:33:40.000", "event_msg", #""turn_aborted","turn_id":"t2""#))
+    scan = scanRollout(path: rollout, from: scan)
+    check("a stopped turn is finished, marked Stopped",
+          codexRow(id: threadId, name: nil, cwd: nil, scan: scan).map { $0.group == .done && $0.detail == "Stopped"
+              && $0.title == "Codex thread" } == true)
+    var runningScan = scan
+    runningScan.marker = .started
+    runningScan.lastWrite = codexTime.date(from: "2026-11-19T02:33:41.500Z")
+    check("a running thread's last write is kept to the minute",
+          codexRow(id: threadId, name: "x", cwd: nil, scan: runningScan)?.lastOutput == codexTime.date(from: "2026-11-19T02:33:00.000Z"))
+    check("a Claude session still opens in Claude",
+          Row(id: "local_a1", group: .done, title: "t", context: "", since: now, link: "local_a1").openURL?.absoluteString
+              == "claude://claude.ai/epitaxy/local_a1")
+    try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "limbo-codex-\(getpid())")
+
+    // Cursor threads: its list of threads, in a database shaped like Cursor's.
+    let cursorDatabase = NSTemporaryDirectory() + "limbo-cursor-\(getpid()).vscdb"
+    try? FileManager.default.removeItem(atPath: cursorDatabase)
+    var setup: OpaquePointer?
+    _ = sqlite3_open(cursorDatabase, &setup)
+    func ms(_ secondsAgo: TimeInterval) -> Int64 { Int64(now.addingTimeInterval(-secondsAgo).timeIntervalSince1970 * 1000) }
+    func cursorHeader(_ id: String, updated: TimeInterval, checkpoint: TimeInterval? = nil, archived: Int = 0,
+                      subagent: Int = 0, _ fields: String) -> String {
+        let value = #"{"type":"head","composerId":"\#(id)",\#(fields)"workspaceIdentifier":{"uri":{"fsPath":"/tmp/build-tools"}}}"#
+        return "INSERT INTO composerHeaders VALUES ('\(id)', 'w1', \(ms(updated)), \(ms(updated)), \(archived), \(subagent), "
+            + "\(ms(updated)), \(checkpoint.map { String(ms($0)) } ?? "NULL"), '\(value)', NULL);"
+    }
+    let cursorSQL = [
+        "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT, subagentTypeName TEXT);",
+        cursorHeader("c-run", updated: 120, checkpoint: 90,
+                     #""name":"Tidy the build scripts","subtitle":"Read Makefile, build.sh","unfinishedRunAt":\#(ms(120)),"hasBlockingPendingActions":false,"#),
+        cursorHeader("c-wait", updated: 300, checkpoint: 200,
+                     #""name":"Rename the config keys","unfinishedRunAt":\#(ms(300)),"hasBlockingPendingActions":true,"#),
+        cursorHeader("c-done", updated: 3600, checkpoint: 3000, #""name":"Explain the cache","hasBlockingPendingActions":false,"#),
+        cursorHeader("c-plan", updated: 4000, checkpoint: 3900, #""name":"Plan the migration","hasPendingPlan":true,"#),
+        cursorHeader("c-cut", updated: 5000, checkpoint: 4900, #""name":"Cut short","unfinishedRunAt":\#(ms(5000)),"#),
+        cursorHeader("c-noname", updated: 6000, #""name":"","#),
+        cursorHeader("c-draft", updated: 60, #""name":"","subtitle":"half a question","isDraft":true,"#),
+        cursorHeader("c-archived", updated: 60, archived: 1, #""name":"Archived","#),
+        cursorHeader("c-subagent", updated: 60, subagent: 1, #""name":"A subagent","#),
+        cursorHeader("c-old", updated: 30 * 86400, #""name":"Last month","#),
+    ]
+    for sql in cursorSQL { _ = sqlite3_exec(setup, sql, nil, nil, nil) }
+    sqlite3_close(setup)
+    let cursorThreads = readCursorThreads(database: cursorDatabase, since: now.addingTimeInterval(-Board.window)) ?? []
+    check("Cursor's list: recent threads, newest first; no drafts, archived, subagents or old ones",
+          cursorThreads.map(\.id) == ["c-run", "c-wait", "c-done", "c-plan", "c-cut", "c-noname"])
+    check("no database, no list", readCursorThreads(database: cursorDatabase + "-missing", since: now) == nil)
+    let cursorStarted = now.addingTimeInterval(-1800)
+    let cursorRows = Dictionary(uniqueKeysWithValues: cursorThreads.compactMap { thread in
+        cursorRow(thread, cursorStarted: cursorStarted).map { (thread.id, $0) }
+    })
+    let cursorRunning = cursorRows["c-run"]
+    check("a run going is a running row, doing what Cursor says under it",
+          cursorRunning?.group == .running && cursorRunning?.since == Date(timeIntervalSince1970: Double(ms(120)) / 1000)
+              && cursorRunning?.activity == "Read Makefile, build.sh" && cursorRunning?.context == "build-tools"
+              && cursorRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    check("it's Cursor's, says so, and can't be tagged or snoozed",
+          cursorRunning?.source == .cursor && cursorRunning?.fromOtherApp == true && cursorRunning?.tags == []
+              && cursorRunning?.appName == "Cursor" && cursorRunning?.openLabel == "Switch to Cursor"
+              && cursorRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    check("a run waiting for approval waits on you", cursorRows["c-wait"]?.group == .yourTurn
+              && cursorRows["c-wait"]?.detail == "Waiting for your approval")
+    check("a plan ready waits on you", cursorRows["c-plan"]?.group == .yourTurn && cursorRows["c-plan"]?.detail == "Plan ready to review")
+    check("a finished thread is finished when its run ended", cursorRows["c-done"]?.group == .done
+              && cursorRows["c-done"]?.since == Date(timeIntervalSince1970: Double(ms(3000)) / 1000))
+    check("a run from before Cursor started was cut short: finished", cursorRows["c-cut"]?.group == .done)
+    check("a thread with no name and no run isn't listed", cursorRows["c-noname"] == nil)
+    check("ChatGPT's and Claude's rows say where they open",
+          Row(id: "codex:x", group: .done, title: "t", context: "", since: now).openLabel == "Open in ChatGPT"
+              && Row(id: "local_a1", group: .done, title: "t", context: "", since: now).source == .claude)
+    try? FileManager.default.removeItem(atPath: cursorDatabase)
+
+    // Antigravity conversations: its list, in a database shaped like Antigravity's.
+    let agyDatabase = NSTemporaryDirectory() + "limbo-agy-\(getpid()).db"
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: agyDatabase + suffix) }
+    let agyStamp = DateFormatter()
+    agyStamp.locale = Locale(identifier: "en_US_POSIX")
+    agyStamp.timeZone = .gmt
+    agyStamp.dateFormat = "yyyy-MM-dd HH:mm:ss.SSSSSS"
+    func agyTimeText(_ secondsAgo: TimeInterval) -> String { agyStamp.string(from: now.addingTimeInterval(-secondsAgo)) + "+00:00" }
+    func agyRow(_ id: String, title: String, preview: String = "", workspaces: String = "", modified: TimeInterval,
+                input: TimeInterval, status: String, killed: Int = 0, depth: Int = 0, parent: String = "",
+                source: String = "") -> String {
+        "INSERT INTO conversation_summaries VALUES ('\(id)', '\(title)', '\(preview)', '\(workspaces)', "
+            + "'\(agyTimeText(modified))', '\(agyTimeText(input))', '\(status)', \(killed), \(depth), '\(parent)', '\(source)');"
+    }
+    var agySetup: OpaquePointer?
+    _ = sqlite3_open(agyDatabase, &agySetup)
+    let agySQL = [
+        "PRAGMA journal_mode = WAL;",
+        "CREATE TABLE conversation_summaries (conversation_id text, title text NOT NULL DEFAULT '', preview text NOT NULL DEFAULT '', workspace_uris text NOT NULL, last_modified_time datetime NOT NULL, last_user_input_time datetime NOT NULL, status text NOT NULL DEFAULT '', killed numeric NOT NULL DEFAULT false, nesting_depth integer NOT NULL DEFAULT 0, parent_conversation_id text NOT NULL DEFAULT '', source text NOT NULL DEFAULT '', PRIMARY KEY (conversation_id));",
+        agyRow("a-run", title: "Sort out the release notes", workspaces: "file:///tmp/web-app", modified: 30, input: 200,
+               status: "CASCADE_RUN_STATUS_RUNNING"),
+        agyRow("a-idle", title: "", preview: "Why is the cache cold?", modified: 3600, input: 3700, status: "CASCADE_RUN_STATUS_IDLE"),
+        agyRow("a-killed", title: "Bump the SDK", modified: 4000, input: 4100, status: "CASCADE_RUN_STATUS_IDLE", killed: 1),
+        agyRow("a-stale", title: "Cut short", modified: 5000, input: 5100, status: "CASCADE_RUN_STATUS_RUNNING"),
+        agyRow("a-sub", title: "A subagent", modified: 20, input: 20, status: "CASCADE_RUN_STATUS_RUNNING", depth: 1, parent: "a-run"),
+        agyRow("a-old", title: "Last month", modified: 30 * 86400, input: 30 * 86400, status: "CASCADE_RUN_STATUS_IDLE"),
+        agyRow("a-cli", title: "", preview: "Run by the command-line agent", modified: 10, input: 10,
+               status: "CASCADE_RUN_STATUS_IDLE", source: "CORTEX_TRAJECTORY_SOURCE_CLI"),
+    ]
+    for sql in agySQL { _ = sqlite3_exec(agySetup, sql, nil, nil, nil) }
+    sqlite3_close(agySetup)
+    // Closing the last connection takes the log away, as when Antigravity has
+    // the database closed: a read-only reader then can't open it normally.
+    let agyConversations = readAntigravityConversations(database: agyDatabase, since: now.addingTimeInterval(-Board.window)) ?? []
+    check("Antigravity's list: recent conversations, newest first; no subagents, old or command-line ones, even with its log gone",
+          agyConversations.map(\.id) == ["a-run", "a-idle", "a-killed", "a-stale"])
+    check("Antigravity's times read to the microsecond, in their own zone",
+          antigravityTime("2026-11-21 07:18:46.384063+00:00").map { abs($0.timeIntervalSince1970 - 1795245526.384063) < 0.001 } == true
+              && antigravityTime("2026-11-21 12:48:46+05:30").map { abs($0.timeIntervalSince1970 - 1795245526) < 0.001 } == true)
+    let agyStarted = now.addingTimeInterval(-1800)
+    let agyRows = Dictionary(uniqueKeysWithValues: agyConversations.compactMap { c in
+        antigravityRow(c, appStarted: agyStarted).map { (c.id, $0) }
+    })
+    let agyRunning = agyRows["a-run"]
+    check("a running conversation is a running row, from your last message, in its folder",
+          agyRunning?.group == .running && agyRunning?.context == "web-app"
+              && agyRunning.map { abs($0.since.timeIntervalSince(now.addingTimeInterval(-200))) < 0.01 } == true
+              && agyRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    check("it's Antigravity's, switches to it, and can't be tagged or snoozed",
+          agyRunning?.source == .antigravity && agyRunning?.openLabel == "Switch to Antigravity"
+              && agyRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    check("an idle one is finished, named from its first ask when it has no title",
+          agyRows["a-idle"]?.group == .done && agyRows["a-idle"]?.title == "Why is the cache cold?"
+              && agyRows["a-idle"]?.context == "Antigravity")
+    check("a stopped one says so", agyRows["a-killed"]?.group == .done && agyRows["a-killed"]?.detail == "Stopped")
+    check("a run last changed before Antigravity started was cut short: finished", agyRows["a-stale"]?.group == .done)
+    check("an archived conversation's note says so; an unarchived or missing one doesn't",
+          antigravityArchived(note: Data(#"title:"Bump the SDK" archived:true archival_status_timestamp:{seconds:1}"#.utf8))
+              && antigravityArchived(note: Data("title:\"x\"\narchived: true\n".utf8))
+              && !antigravityArchived(note: Data(#"title:"x" archived:false archival_status_timestamp:{seconds:1}"#.utf8))
+              && !antigravityArchived(note: Data(#"title:"x" plan_execute:true"#.utf8)) && !antigravityArchived(note: nil))
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: agyDatabase + suffix) }
+
+    // Orca threads: the ones open in its tabs, in a database shaped like Orca's.
+    let orcaDb = NSTemporaryDirectory() + "limbo-orca-\(getpid()).db"
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: orcaDb + suffix) }
+    func orcaMs(_ secondsAgo: TimeInterval) -> Int64 { Int64(now.addingTimeInterval(-secondsAgo).timeIntervalSince1970 * 1000) }
+    func orcaRecord(_ id: String, _ json: String) -> String {
+        "INSERT INTO agent_session_records(session_id, record_json) VALUES ('\(id)', '\(json)');"
+    }
+    var orcaSetup: OpaquePointer?
+    _ = sqlite3_open(orcaDb, &orcaSetup)
+    let orcaSQL = [
+        """
+        CREATE TABLE agent_session_records (session_id TEXT PRIMARY KEY, record_json TEXT NOT NULL,
+          adopted_native_id TEXT GENERATED ALWAYS AS (CASE WHEN json_valid(record_json) THEN COALESCE(
+            json_extract(record_json,'$.providerHandleChain[#-1].handle.nativeId'),
+            json_extract(record_json,'$.providerHandleChain[#-1].handle.sessionId')) END) VIRTUAL);
+        """,
+        "CREATE TABLE agent_session_tabs (tab_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, position INTEGER NOT NULL);",
+        "CREATE TABLE journal_chat_state (session_id TEXT PRIMARY KEY, last_activity_at INTEGER NOT NULL DEFAULT 0);",
+        orcaRecord("o-run", #"{"provider":"antigravity","conversationName":"Tidy the README","location":{"workspaceId":"w1::/tmp/web-app"},"providerHandleChain":[{"handle":{"nativeId":"n-agy"}}],"lastTurn":{"state":"open","at":\#(orcaMs(300)),"prompt":"tidy it"}}"#),
+        orcaRecord("o-done", #"{"provider":"claude","conversationName":"","location":{"workspaceId":"folder:abc"},"providerHandleChain":[{"handle":{"sessionId":"n-claude"}}],"lastTurn":{"state":"settled","at":\#(orcaMs(600)),"outcome":"success","prompt":"Explain the build\nin detail"}}"#),
+        orcaRecord("o-fail", #"{"provider":"codex","conversationName":"Bump the SDK","location":{"workspaceId":"w2::/tmp/sdk"},"providerHandleChain":[],"lastTurn":{"state":"settled","at":\#(orcaMs(900)),"outcome":"failure","prompt":"bump"}}"#),
+        orcaRecord("o-new", #"{"provider":"claude","conversationName":"","location":{"workspaceId":"w1::/tmp/web-app"},"providerHandleChain":[]}"#),
+        orcaRecord("o-closed", #"{"provider":"claude","conversationName":"Closed tab","location":{"workspaceId":"w1::/tmp/web-app"},"providerHandleChain":[],"lastTurn":{"state":"open","at":\#(orcaMs(60))}}"#),
+        "INSERT INTO agent_session_tabs VALUES ('t1', 'o-run', 0), ('t2', 'o-done', 1), ('t3', 'o-fail', 2), ('t4', 'o-new', 3);",
+        "INSERT INTO journal_chat_state VALUES ('o-run', \(orcaMs(45)));",
+    ]
+    for sql in orcaSQL { _ = sqlite3_exec(orcaSetup, sql, nil, nil, nil) }
+    sqlite3_close(orcaSetup)
+    let orcaThreads = readOrcaThreads(database: orcaDb) ?? []
+    check("Orca's list: only the threads open in its tabs", Set(orcaThreads.map(\.id)) == ["o-run", "o-done", "o-fail", "o-new"])
+    check("each with the agent's own id for it, when it has one",
+          Set(orcaThreads.compactMap(\.nativeId)) == ["n-agy", "n-claude"])
+    let orcaRows = Dictionary(uniqueKeysWithValues: orcaThreads.compactMap { t in orcaRow(t).map { (t.id, $0) } })
+    let orcaRunning = orcaRows["o-run"]
+    check("an open turn is a running row, in its folder and with its agent",
+          orcaRunning?.group == .running && orcaRunning?.title == "Tidy the README" && orcaRunning?.context == "web-app · Orca"
+              && orcaRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    check("it shows its agent's icon, and VoiceOver says both",
+          orcaRunning?.iconSource == .antigravity && orcaRunning?.spokenApp == ", Antigravity in Orca")
+    check("it's Orca's, switches to it, and can't be tagged or snoozed",
+          orcaRunning?.source == .orca && orcaRunning?.openLabel == "Switch to Orca"
+              && orcaRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    check("a settled one is finished, named from its ask's first line when it has no name",
+          orcaRows["o-done"]?.group == .done && orcaRows["o-done"]?.title == "Explain the build"
+              && orcaRows["o-done"]?.context == "Orca" && orcaRows["o-done"]?.iconSource == .claude)
+    check("Codex shows ChatGPT's icon; an agent with no app of its own shows Orca's, and is named",
+          orcaRows["o-fail"]?.iconSource == .chatGPT
+              && orcaRow(OrcaThread(id: "o-x", agent: "grok", name: "x", prompt: "", workspace: "w::/tmp/a", turnAt: now))
+                  .map { $0.iconSource == .orca && $0.context == "a · Grok in Orca" } == true)
+    check("a failed one says so", orcaRows["o-fail"]?.group == .done && orcaRows["o-fail"]?.detail == "Failed")
+    check("a thread never used isn't listed", orcaRows["o-new"] == nil)
+    check("Orca's worktree names, by workspace",
+          orcaWorktreeNames(Data(#"{"schemaVersion":1,"worktrees":[["w1::/tmp/web-app","Tidy-up session"],["w2::/tmp/sdk",""]]}"#.utf8))
+              == ["w1::/tmp/web-app": "Tidy-up session"])
+    var named = orcaThreads.first { $0.id == "o-run" }
+    named?.worktree = "Tidy-up session"
+    check("a thread sits under its worktree's name when Orca has one",
+          named.flatMap(orcaRow)?.context == "Tidy-up session · Orca")
+    let folderNames = orcaFolderWorkspaces(Data(#"[{"id":"b1","name":"Ada","folderPath":"/Users/x/.orca/bots/ada-1"},{"id":"f1","name":"Notes","folderPath":"/Users/x/notes"},{"id":"f2","name":""}]"#.utf8))
+    check("Orca's folder workspaces: bots by their folder, others by name",
+          folderNames["b1"]?.name == "Ada" && folderNames["b1"]?.bot == true && folderNames["f1"]?.bot == false
+              && folderNames["f2"] == nil)
+    var botChat = orcaThreads.first { $0.id == "o-done" }
+    botChat?.name = "Home"
+    botChat?.bot = "Ada"
+    check("a bot's chat carries the bot's name", botChat.flatMap(orcaRow)?.title == "Home · Ada")
+    let waitingClaude = Row(id: "pid:42", group: .yourTurn, title: "Fix the flaky test", ask: "Allow the edit?",
+                            context: "web-app", since: now, terminal: true)
+    let orcaClaude = Row(id: "orca:o-done", group: .running, title: "Home · Ada", context: "Orca",
+                         since: now, link: orcaLinkPrefix + "o-done")
+    let merged = mergeOrca(claude: [waitingClaude], orca: [orcaClaude, orcaRunning!],
+                           sessions: [42: "n-claude"], orcaThreads: ["n-claude": "o-done", "n-agy": "o-run"])
+    check("a Claude session Orca runs is listed once, as Claude's own row, still waiting on you, by Orca's name",
+          merged.map(\.id) == ["pid:42", "orca:o-run"] && merged.first?.group == .yourTurn
+              && merged.first?.ask == "Allow the edit?" && merged.first?.title == "Home · Ada" && merged.first?.context == "Orca")
+    check("and a click on it switches to Orca",
+          merged.first?.linkApp == .orca && merged.first?.openLabel == "Switch to Orca" && merged.first?.source == .claude
+              && !SessionTags.taggable(merged.first!))
+    check("a terminal session Orca doesn't run keeps no link",
+          mergeOrca(claude: [waitingClaude], orca: [orcaClaude], sessions: [42: "other"], orcaThreads: ["n-claude": "o-done"])
+              .first?.link == nil)
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: orcaDb + suffix) }
+
+    // Snooze: held until a time you pick, or until the session moves on.
+    let snoozeSuite = "limbo-tasks-selftest-snooze"
+    let snoozeDefaults = UserDefaults(suiteName: snoozeSuite)!
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    let today = Date(timeIntervalSince1970: 1_800_000_000)   // 2027-01-15 08:00 UTC
+    let morning = SnoozeChoice.tomorrow.until(from: today, calendar: calendar)
+    check("tomorrow morning is 9:00 the next day",
+          calendar.dateComponents([.day, .hour, .minute], from: morning) == DateComponents(day: 16, hour: 9, minute: 0))
+    check("an hour is an hour", SnoozeChoice.hour.until(from: today) == today.addingTimeInterval(3600))
+    check("a snooze ending today says only the time",
+          snoozeWhen(today.addingTimeInterval(3600), now: today, calendar: calendar).hasPrefix("until ")
+              && !snoozeWhen(today.addingTimeInterval(3600), now: today, calendar: calendar).contains("tomorrow"))
+    check("one ending tomorrow says tomorrow",
+          snoozeWhen(morning, now: today, calendar: calendar).hasPrefix("until tomorrow "))
+    let asker = Row(id: "local_z1", group: .yourTurn, title: "Rotate the keys", ask: "OK to revoke?", context: "",
+                    since: Date().addingTimeInterval(-600), link: "local_z1")
+    let reviewAsk = Row(id: "local_z2", group: .review, title: "Ship the fix", context: "",
+                        since: Date().addingTimeInterval(-900), link: "local_z2",
+                        card: TurnCard(ask: "Merge it?", actions: ["Merge"]))
+    let busy = Row(id: "local_z3", group: .running, title: "Busy", context: "", since: Date().addingTimeInterval(-60),
+                   link: "local_z3")
+    check("needs you, to review and asking rows can be snoozed",
+          SessionSnoozes.snoozable(asker) && SessionSnoozes.snoozable(reviewAsk))
+    check("running, quiet finished and terminal rows can't",
+          !SessionSnoozes.snoozable(busy) && !SessionSnoozes.snoozable(quietDone)
+              && !SessionSnoozes.snoozable(Row(id: "pid:9", group: .yourTurn, title: "t", context: "", since: Date(),
+                                               terminal: true)))
+    let snoozer = SessionModel(defaults: snoozeDefaults)
+    snoozer.setRows([asker, reviewAsk, busy])
+    snoozer.now = Date()
+    snoozer.snooze(asker, until: Date().addingTimeInterval(3600))
+    snoozer.snooze(reviewAsk, until: Date().addingTimeInterval(7200))
+    let snoozedBoard = Board(rows: snoozer.rows, now: snoozer.now)
+    check("a snoozed session leaves Your turn for Snoozed",
+          snoozedBoard.yourTurn.isEmpty && Set(snoozedBoard.snoozed.map(\.id)) == ["local_z1", "local_z2"])
+    check("snoozed: no amber glow", snoozer.freshNeedsYou(snoozedBoard).isEmpty)
+    let snoozedList = FloatingRows(board: snoozedBoard, now: snoozer.now, within: 86400, finishedWithin: 7200)
+    check("snoozed asking rows leave the strip",
+          FloatingView.Compact(snoozedList).waiting.isEmpty && FloatingView.stripRows(snoozedList).shown.map(\.id) == ["local_z3"])
+    check("Snoozed lists the soonest to wake first", snoozedList.snoozed.map(\.id) == ["local_z1", "local_z2"])
+    check("a snooze is kept in the settings", Set(SessionSnoozes.load(snoozeDefaults).byId.keys) == ["local_z1", "local_z2"])
+    check("a snooze leaves running rows alone",
+          SessionSnoozes(byId: ["local_z3": .init(until: .distantFuture, at: Date())]).apply(to: [busy], now: Date())[0].snoozedUntil == nil)
+    // You answer it (or it ends another turn): the snooze is over.
+    let movedOn = Row(id: "local_z2", group: .running, title: "Ship the fix", context: "", since: Date().addingTimeInterval(5),
+                      link: "local_z2")
+    snoozer.setRows([asker, movedOn, busy])
+    check("a session that moves on wakes", snoozer.snoozes.byId["local_z2"] == nil
+              && Board(rows: snoozer.rows, now: snoozer.now).snoozed.map(\.id) == ["local_z1"])
+    snoozer.wake(asker)
+    check("Wake Now brings it back", Board(rows: snoozer.rows, now: snoozer.now).yourTurn.map(\.id) == ["local_z1"])
+    // A snooze that runs out: back in Your turn, glowing amber as if it had just asked.
+    let oldAsk = Row(id: "local_z4", group: .yourTurn, title: "Old question", context: "",
+                     since: Date().addingTimeInterval(-5 * 3600), link: "local_z4")
+    snoozer.setRows([oldAsk])
+    snoozer.snooze(oldAsk, until: Date().addingTimeInterval(-1))
+    snoozer.wakeDue()
+    let wokenBoard = Board(rows: snoozer.rows, now: snoozer.now)
+    check("a snooze that ran out wakes and glows amber again",
+          wokenBoard.yourTurn.map(\.id) == ["local_z4"] && snoozer.freshNeedsYou(wokenBoard).map(\.id) == ["local_z4"])
+    snoozer.snooze(oldAsk, until: Date().addingTimeInterval(3600))
+    snoozer.forgetArchived(["local_z4"])
+    check("archiving drops its snooze", snoozer.snoozes.byId.isEmpty && Board(rows: snoozer.rows, now: snoozer.now).snoozed.isEmpty)
+    check("the snooze symbols exist", ["moon.zzz", "moon.zzz.fill"].allSatisfy {
+        NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil })
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
 
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
@@ -6268,7 +9172,8 @@ func runGestureCheck() {
     check("a double-click on a chip doesn't shrink to the pill", !layout.mini)
     if host.frame.height != fullHeight { click(at: NSPoint(x: 45, y: host.frame.height - 18)); refit() }
     // Double-click the header's empty middle: the pill, with the glow.
-    click(at: NSPoint(x: 175, y: host.frame.height - 18), times: 2)   // between the chips and the menus
+    let middle = testFrames["header-middle"].map { NSPoint(x: $0.midX, y: host.frame.height - $0.midY) }
+    click(at: middle ?? NSPoint(x: 175, y: host.frame.height - 18), times: 2)   // between the chips and the menus
     refit()
     check("double-clicking the header shrinks to the pill", layout.mini, "(\(NSStringFromSize(host.frame.size)))")
     check("the glow comes along to the pill", glow.window != nil && Int(glow.bounds.height) == 32, glowState())
@@ -6277,6 +9182,43 @@ func runGestureCheck() {
     check("double-clicking the pill expands it", !layout.mini)
     check("the glow comes back to the window", glow.window != nil && glow.bounds.height == host.frame.height
               && glow.bounds.height > 100, glowState())
+    // The other layouts: one line for the strip, smaller still for the dots,
+    // full width for the bar, wide and short for the columns. A click on a
+    // session opens it; a double-click on the mark goes back to the list.
+    func point(_ name: String) -> NSPoint? {
+        testFrames[name].map { NSPoint(x: $0.midX, y: host.frame.height - $0.midY) }
+    }
+    let listHeight = host.frame.height
+    layout.choose(.strip)
+    refit()
+    check("the strip is one line", host.frame.height == 32 && host.frame.width > 300, "(\(NSStringFromSize(host.frame.size)))")
+    check("the glow comes along to the strip", glow.window != nil && Int(glow.bounds.height) == 32, glowState())
+    opened.removeAll()
+    if let chip = point("chip:local_s4") { click(at: chip) }
+    check("a click on a chip opens its session", opened == ["local_s4"], "(opened \(opened))")
+    click(at: NSPoint(x: 14, y: host.frame.height / 2), times: 2)
+    refit()
+    check("double-clicking the strip's mark goes back to the list", layout.chosen == .list && host.frame.height == listHeight)
+    layout.choose(.dots)
+    refit()
+    check("the dots are smaller still", host.frame.height == 26 && host.frame.width < 300, "(\(NSStringFromSize(host.frame.size)))")
+    opened.removeAll()
+    if let dot = point("dot:local_s1") { click(at: dot) }
+    check("a click on a mark opens its session", opened == ["local_s1"], "(opened \(opened))")
+    layout.choose(.bar)
+    refit()
+    check("the bar is as wide as it's told and one line", host.frame.width == layout.barWidth && host.frame.height == 30,
+          "(\(NSStringFromSize(host.frame.size)))")
+    opened.removeAll()
+    if let item = point("bar:local_s1") { click(at: item) }
+    check("a click in the bar opens its session", opened == ["local_s1"], "(opened \(opened))")
+    layout.choose(.columns)
+    refit()
+    check("the columns are wide and shorter than the list",
+          host.frame.width == layout.columnsWidth && host.frame.height < listHeight, "(\(NSStringFromSize(host.frame.size)))")
+    layout.choose(.list)
+    refit()
+    check("and back to the list", host.frame.height == listHeight)
     // A card's button opens its session; the response button shows the reply
     // without opening anything. Their places are recorded as they are laid out.
     func place(of name: String) -> NSPoint? {
@@ -6314,6 +9256,53 @@ func runGestureCheck() {
     } else {
         check("the response button shows the reply without opening the session", false, "(button not found)")
     }
+    // Snooze from a hover card: the session leaves the strip for the moon's
+    // count, and the moon's menu can wake it. Own settings, cleared after.
+    let snoozeSuite = "limbo-tasks-gesture-snooze"
+    let snoozeDefaults = UserDefaults(suiteName: snoozeSuite)!
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
+    let snoozeModel = SessionModel(defaults: snoozeDefaults)
+    snoozeModel.setRows(sampleRows(now: Date()).filter { $0.snoozedUntil == nil })
+    let stripLayout = FloatingLayout(chosen: .strip)
+    let stripHost = FirstClickHostingView(rootView: FloatingView(model: snoozeModel, open: { _ in }, unpin: {},
+                                                                 glow: nil, layout: stripLayout,
+                                                                 initialHover: "local_s1"))
+    stripHost.frame = NSRect(origin: .zero, size: stripHost.fittingSize)
+    let stripPanel = KeepOnTopPanel(contentRect: stripHost.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                    backing: .buffered, defer: false)
+    stripPanel.contentView = stripHost
+    stripPanel.setFrameOrigin(NSPoint(x: -6000, y: -5000))
+    stripPanel.orderFrontRegardless()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    stripHost.frame = NSRect(origin: .zero, size: stripHost.fittingSize)
+    stripPanel.setContentSize(stripHost.frame.size)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    if let button = testFrames["snooze:local_s1:hour"] {
+        let at = NSPoint(x: button.midX, y: stripHost.frame.height - button.midY)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            let event = NSEvent.mouseEvent(with: type, location: at, modifierFlags: [],
+                                           timestamp: ProcessInfo.processInfo.systemUptime,
+                                           windowNumber: stripPanel.windowNumber, context: nil, eventNumber: 0,
+                                           clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!
+            stripPanel.sendEvent(event)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        let until = snoozeModel.snoozes.byId["local_s1"]?.until.timeIntervalSinceNow ?? 0
+        check("a hover card's 1h button snoozes the session for an hour", (3590...3600).contains(until),
+              "(\(Int(until)) s)")
+        stripHost.frame = NSRect(origin: .zero, size: stripHost.fittingSize)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let stillThere = FloatingView.stripRows(FloatingRows(board: Board(rows: snoozeModel.rows, now: Date()), now: Date(),
+                                                             within: 86400, finishedWithin: 7200)).shown.map(\.id)
+        check("it leaves the strip, and the moon counts it",
+              !stillThere.contains("local_s1") && testFrames["snoozed-chip"] != nil && stripHost.frame.height == 32,
+              "(strip \(stillThere), height \(Int(stripHost.frame.height)))")
+    } else {
+        check("a hover card's 1h button snoozes the session for an hour", false, "(button not found)")
+    }
+    stripPanel.orderOut(nil)
+    snoozeDefaults.removePersistentDomain(forName: snoozeSuite)
     // New Tag…: the box takes the keyboard without making Limbo the active app,
     // and Return adds what was typed; Esc adds nothing.
     let prompt = TagPrompt()
@@ -6372,6 +9361,22 @@ if let seconds = argument(after: "--glow-cycle").flatMap(Int.init) {
 if let path = argument(after: "--snapshot") {
     writeSnapshot(to: path, dark: arguments.contains("--dark"), sample: arguments.contains("--sample"),
                   expand: arguments.contains("--expand"), limit: argument(after: "--rows").flatMap(Int.init))
+    exit(0)
+}
+if arguments.contains("--codex-bench") {
+    runCodexBench()
+    exit(0)
+}
+if arguments.contains("--cursor-bench") {
+    runAppBench(AppThreadsWatcher.cursor(), name: "Cursor")
+    exit(0)
+}
+if arguments.contains("--orca-bench") {
+    runAppBench(AppThreadsWatcher.orca(adopted: AdoptedIds()), name: "Orca")
+    exit(0)
+}
+if arguments.contains("--antigravity-bench") {
+    runAppBench(AppThreadsWatcher.antigravity(), name: "Antigravity")
     exit(0)
 }
 if arguments.contains("--dump") {
