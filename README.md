@@ -23,7 +23,7 @@ A small Mac app, in [tasks/main.swift](tasks/main.swift), that shows your agent 
 - **Glows** on the window's edge: amber when a session needs you, green when everything has finished, so you can stay in one task and still notice the others.
 - **The menu bar** shows the counts, with a panel listing every session from the last week.
 
-<p align="center"><img src="docs/images/limbo-tasks/strip.png" width="820" alt="The strip: one chip per session, led by its app's icon, with the card of the chip the pointer is on underneath"></p>
+<p align="center"><img src="docs/images/limbo-tasks/strip.png" width="820" alt="The strip: chips for running sessions and the ones waiting on you, then finished ones after a thin line, each led by its app's icon, with the card of the chip the pointer is on underneath"></p>
 
 It does not need the Go watcher below. The screenshots use the app's built-in made-up sessions (`--sample`; the first, the strip, Aurora and light mode add the other apps' with `--sample-apps`).
 
@@ -50,6 +50,7 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 | **Orca threads** | The agent threads open in Orca (Claude, Codex, Antigravity…), running or finished, beside Claude's sessions. |
 | **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
 | **Snooze** | Put a session away for an hour, three hours or until tomorrow morning; it comes back by itself. |
+| **Hide** | Put any app's session or thread away until it next updates: it runs again or ends a new turn. |
 | **Menu bar** | The Claude mark with the number of sessions running and a speech bubble with the number waiting for you. |
 | **Menu bar panel** | Every session from the last 7 days in groups: Running, Your turn, Just finished, Ready for review, Snoozed, On hold, Done, In a terminal. |
 
@@ -74,7 +75,7 @@ A small window with the running sessions, the ones waiting for you or ready for 
 The layout button in the window's header (and the right-click menu of the layouts without a header) picks the window's shape. The horizontal ones fit in the black bar above or below a widescreen movie, so they never cover what you're watching:
 
 - **List** (default): the window at the top of this page.
-- **Strip** (shown above): one line of chips, one per session (running, waiting, then ready for review, at most six), with how long ago, and finished ones as a count. Point at a chip for its card (its question and buttons, or its row) underneath, or above it in the lower half of the screen; click to open it.
+- **Strip** (shown above): one line of chips, one per session, with how long ago: running, waiting, ready for review, then, after a thin line, the ones finished in the last 2 hours, newest first, so a session that just finished is one click away. At most six show, with two places kept for finished ones; when they don't all fit, the ones waiting on you win over the others, and the rest are counted ("+3"). Point at a chip for its card (its question and buttons, or its row) underneath, or above it in the lower half of the screen; click to open it.
 - **Bar:** a thin bar across the whole bottom of the screen, with what running sessions are doing and the first tag of the others. Cards open above it.
 - **Dots:** the smallest: one mark per session, in groups. Point at one for its card.
 - **Columns:** wide and short, with Running, Needs you and Finished side by side; drag its sides to resize it.
@@ -125,7 +126,7 @@ Codex threads open in the ChatGPT app show beside Claude's sessions, led by Chat
 - They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
 - Only threads you started: Codex's own agents, reviewers and voice sessions are left out. Ordinary ChatGPT chats aren't on disk in a readable form, so they can't show.
 - A thread waiting for your approval shows as running: Codex doesn't write that down, the same as Claude's mid-turn permission prompts.
-- They can't be tagged or snoozed.
+- They can't be tagged or snoozed, but they can be [hidden](#hide).
 
 #### Cursor threads
 
@@ -134,7 +135,7 @@ Cursor's agent threads from the last week show, led by Cursor's icon, while Curs
 - They are read only while the keep-on-top window or the menu bar panel shows, and the menu bar's counts stay Claude's.
 - Archived threads, subagents' threads and unsent drafts are left out.
 - A run that began before Cursor last started was cut short, so it shows as finished.
-- They can't be tagged or snoozed.
+- They can't be tagged or snoozed, but they can be [hidden](#hide).
 
 #### Antigravity conversations
 
@@ -145,7 +146,7 @@ Antigravity's agent conversations from the last week show, led by Antigravity's 
 - A run whose last change came before Antigravity last started was cut short, so it shows as finished.
 - A conversation waiting for your approval shows as running: Antigravity's list doesn't say so.
 - Conversations run by Antigravity's command-line agent (`agy`, which Orca also runs) are left out: Antigravity never marks those running. Orca's own list shows the ones Orca runs.
-- They can't be tagged or snoozed.
+- They can't be tagged or snoozed, but they can be [hidden](#hide).
 
 #### Orca threads
 
@@ -155,16 +156,25 @@ The agent threads open in Orca's tabs show, led by their agent's icon (Claude's,
 - A Claude session Orca runs is listed once, as Claude's own terminal session (which knows when it waits on you and what it's doing), and a click on it switches to Orca.
 - Threads you've closed in Orca, and ones never used, are left out.
 - A thread waiting for your approval shows as running: Orca's record doesn't say so.
-- They can't be tagged or snoozed.
+- They can't be tagged or snoozed, but they can be [hidden](#hide).
 
 #### Snooze
 
-Snooze a session that needs you (or is ready for review, or asked you something) when you don't want to deal with it yet: **For 1 Hour**, **For 3 Hours** or **Until Tomorrow Morning** (9:00). Pick it from the session's right-click menu, anywhere it shows, or from the **Snooze 1h 3h Tomorrow** buttons under a card in the strip, the bar and the dots.
+Snooze a Claude session that isn't running (it needs you, is ready for review, or finished) when you don't want to deal with it yet: **For 1 Hour**, **For 3 Hours** or **Until Tomorrow Morning** (9:00). Pick it from the session's right-click menu, anywhere it shows, or from the **Snooze 1h 3h Tomorrow** buttons under a card in the strip, the bar and the dots.
 
 - A snoozed session leaves the window's list. It no longer counts as needing you, in the header or the menu bar, and never starts a glow. A moon in the window's header (and in the strip, the bar and the dots) shows how many are snoozed; its menu says when each wakes, and wakes one, or all, or opens one in Claude. In a narrow window the moon gives way to the counts.
 - The menu bar panel keeps them in a folded Snoozed section, dimmed, with when each wakes ("Until 8:02 PM").
-- It wakes on its own at that time, back where it was; one that needs you glows amber again, as if it had just asked. It wakes early if the session moves on: you answer it, or it ends another turn. **Wake Now** in its right-click menu brings it back at once.
+- It wakes on its own at that time, back where it was; one that needs you glows amber again, as if it had just asked, and a finished one is back among the window's finished sessions for 2 hours. It wakes early if the session moves on: you answer it, or it ends another turn. **Wake Now** in its right-click menu brings it back at once.
 - Snoozes live in Limbo's own settings, like tags; sessions started in a terminal can't be snoozed.
+
+#### Hide
+
+Hide a session or thread you're done with for now, from any app, until it next updates: **Hide Until Next Update** in its right-click menu, or **Hide** under its card in the strip, the bar and the dots (next to Snooze).
+
+- It leaves the keep-on-top window, every layout and the counts, and never starts a glow.
+- It comes back by itself when it changes: it runs again or ends a newer turn (for a Claude session, when you send it something from Claude).
+- The menu bar panel keeps hidden ones in a folded Hidden section; **Show Again** in a row's right-click menu brings one back at once.
+- Hides live in Limbo's own settings, by the session's or thread's id; running sessions and ones started in a terminal can't be hidden.
 
 #### Glows
 
@@ -211,6 +221,7 @@ Panel groups, first rule that matches wins:
 | Your turn | The Claude app's own end-of-turn summary (`postTurnSummary` in the session's `local_<id>.json`) is current and says `blocked`, `need_input` or `failed`, or the session stopped with an error in the last 7 days. The row shows what it needs from you. Questions older than 3 days fold under "older"; older than 7 days drop off. |
 | Just finished | The turn has ended but the app has not written its summary yet (usually seconds). |
 | Ready for review | The summary says `review_ready`, and you have not opened the session in Claude since its turn ended (the record's `lastFocusedAt`, which Claude sets each time the session comes into view). Once you have, it counts as done. A session that finishes while you are already looking at it stays here until it next comes into view. |
+| Hidden | You hid it, and it hasn't changed since (it is not running and has ended no newer turn). |
 | Snoozed | You snoozed it, and its time hasn't come and it hasn't moved on since (and it is not running). |
 | On hold | You tagged it On hold (and it is not running). |
 | Done | Anything else from the last 7 days, collapsed. |
@@ -231,7 +242,7 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 - Orca's threads, only while the panel or the window is showing and Orca is running: a stat every 2 s of Orca's session database (`~/Library/Application Support/orca/agent-session-domain.db`) and its write-ahead log, and, only when one of them changed, one query for the threads open in its tabs (agent, name, folder, the last turn's state and outcome, the last activity, the agent's own id for it), plus its worktree names. It's opened read-only and closed straight after. Conversations themselves are never read. On this Mac a tick with nothing new takes about 0.004 ms and a read about 0.7 ms (`--orca-bench`); while an Orca agent is busy its database changes about every tick, so that's a read every 2 s, under 0.04% of a core.
 - It never opens the `*.key` files, and never changes Claude's, ChatGPT's, Cursor's, Antigravity's or Orca's files.
 
-Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`, snoozes under `sessionSnoozes`.
+Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`, snoozes under `sessionSnoozes`, hides under `sessionHides`.
 
 #### Answer from Cards, step by step
 
