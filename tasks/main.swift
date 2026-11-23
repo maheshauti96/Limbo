@@ -3736,7 +3736,7 @@ struct SessionRow: View {
                     .fill(Color.primary.opacity(hovering && canOpen ? 0.07 : 0)))
         }
         .buttonStyle(.plain)
-        .pointerStyle(canOpen ? .link : nil)
+        .linkPointer(canOpen)
         .onHover { hovering = $0 }
         .opacity(dimmed || row.held ? 0.72 : 1)
         .help(tooltip)
@@ -3812,7 +3812,7 @@ struct DisclosureTitle: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .pointerStyle(.link)
+        .linkPointer()
         .accessibilityLabel("\(title), \(count)")
         .accessibilityValue(expanded ? "expanded" : "collapsed")
         .accessibilityAddTraits(.isHeader)
@@ -3840,7 +3840,7 @@ struct OlderToggle: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .pointerStyle(.link)
+        .linkPointer()
     }
 }
 
@@ -4107,23 +4107,38 @@ struct CompactRow: View {
     /// The response button, on rows that have a reply to show; the reply opens under the row.
     var responseShown = false
     var toggleResponse: (() -> Void)? = nil
+    /// The eye under the pointer; off where Hide is a button of its own (a chip's card).
+    var hideButton = true
     @State private var hovering = false
+    /// The pointer anywhere on the row, its buttons included.
+    @State private var rowHover = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.highContrast) private var contrast
+    @Environment(\.tagActions) private var actions
 
     private var response: String? { toggleResponse == nil ? nil : row.card?.response }
+
+    /// Hide, in the time's place, while the pointer is on a row that can be hidden.
+    private var showHide: Bool {
+        hideButton && (rowHover || forcedHover == row.id) && actions.enabled && SessionHides.hideable(row)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             line
                 // Beside the row's own button, not inside it, so a click here never opens the session.
                 .overlay(alignment: .topTrailing) {
-                    if let toggleResponse, response != nil {
-                        ResponseToggle(shown: responseShown, action: toggleResponse)
-                            .testFrame("response:\(row.id)")
-                            .padding(.top, 2)
-                            .padding(.trailing, 4)
+                    HStack(spacing: 0) {
+                        if showHide {
+                            HideToggle { actions.hide(row) }.testFrame("row-hide:\(row.id)")
+                        }
+                        if let toggleResponse, response != nil {
+                            ResponseToggle(shown: responseShown, action: toggleResponse)
+                                .testFrame("response:\(row.id)")
+                        }
                     }
+                    .padding(.top, 2)
+                    .padding(.trailing, 4)
                 }
             if responseShown, let response {
                 ResponseDrawer(text: response, open: { open(row) })
@@ -4132,7 +4147,11 @@ struct CompactRow: View {
                     .padding(.bottom, 6)
             }
         }
+        .onHover { rowHover = $0 }
         .tagMenu(row)
+        .accessibilityAction(named: "Hide Until Next Update") {
+            if actions.enabled && SessionHides.hideable(row) { actions.hide(row) }
+        }
     }
 
     private var line: some View {
@@ -4185,6 +4204,7 @@ struct CompactRow: View {
                             Text(compactAge(since: row.since, now: now))
                                 .font(.system(size: 10).monospacedDigit())
                                 .foregroundStyle(p.time)
+                                .opacity(showHide ? 0 : 1)   // Hide sits here under the pointer
                         }
                         if response != nil { Color.clear.frame(width: 18, height: 1) }   // room for the response button
                     }
@@ -4220,7 +4240,7 @@ struct CompactRow: View {
                           : Color.primary.opacity(hovering && row.link != nil ? 0.08 : 0)))
         }
         .buttonStyle(.plain)
-        .pointerStyle(row.link != nil ? .link : nil)
+        .linkPointer(row.link != nil)
         .onHover { hovering = $0 }
         .help([row.title, question ?? row.ask ?? row.detail,
                quiet.map { quietPhrase($0) + ": it may be stuck, or in one long command" }]
@@ -4247,6 +4267,159 @@ extension View {
 }
 
 /// The response button on a row or card: shows the session's latest reply in place.
+/// Hide Until Next Update in one click, on a row or card under the pointer.
+struct HideToggle: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "eye.slash")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color.secondary)
+                .frame(width: 20, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .linkPointer()
+        .help("Hide until it next updates")
+        .backgroundHint("Hide until it next updates")
+        .accessibilityLabel("Hide until it next updates")
+    }
+}
+
+/// --snapshot … --hover-row <id>: draws that row or card as if the pointer were on it.
+var forcedHover: String? = nil
+/// --snapshot … --hint: draws the tooltips of the controls under that pointer.
+var forcedHints = false
+
+extension View {
+    /// A tooltip for a control in the keep-on-top window, drawn here, to its
+    /// left: macOS shows no tooltips for an app that isn't in front, which
+    /// Limbo never is.
+    func backgroundHint(_ text: String) -> some View { modifier(BackgroundHint(text: text)) }
+
+    /// The pointing hand over a link or button, even while another app is
+    /// in front (see HandCursor). Off when `on` is false.
+    func linkPointer(_ on: Bool = true) -> some View { modifier(LinkPointer(on: on)) }
+}
+
+/// The pointing hand over the window's links and buttons. macOS changes the
+/// cursor only for the app in front, which Limbo never is, so while the
+/// pointer is on one of them the window server's background-cursor setting
+/// is on, as on the resize edges. Nested ones (Hide inside a row) are
+/// counted, so moving from one to the other never drops the hand.
+enum HandCursor {
+    private(set) static var regions = 0
+
+    static func enter() {
+        regions += 1
+        show()
+    }
+
+    /// The pointer moved inside: the hand again (a resize edge or SwiftUI may have set another).
+    static func moved() { if regions > 0 { show() } }
+
+    static func leave() {
+        regions = max(0, regions - 1)
+        if regions > 0 {
+            show()
+        } else {
+            NSCursor.arrow.set()
+            BackgroundCursor.allow(false)
+        }
+    }
+
+    private static func show() {
+        BackgroundCursor.allow(true)
+        NSCursor.pointingHand.set()
+    }
+}
+
+struct LinkPointer: ViewModifier {
+    let on: Bool
+    @State private var inside = false
+
+    func body(content: Content) -> some View {
+        content
+            .pointerStyle(on ? .link : nil)
+            .onContinuousHover { phase in
+                switch phase {
+                case .active:
+                    guard on else { leave(); return }
+                    if inside {
+                        HandCursor.moved()
+                    } else {
+                        inside = true
+                        HandCursor.enter()
+                    }
+                case .ended:
+                    leave()
+                }
+            }
+            .onChange(of: on) { _, now in if !now { leave() } }
+            .onDisappear { leave() }   // a click that hides or opens it can take it away under the pointer
+    }
+
+    private func leave() {
+        guard inside else { return }
+        inside = false
+        HandCursor.leave()
+    }
+}
+
+struct BackgroundHint: ViewModifier {
+    let text: String
+    @State private var inside = false
+    @State private var tipShown = false
+    @State private var tipDelay: Task<Void, Never>?
+    @Environment(\.colorScheme) private var scheme
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .leading) {
+                if tipShown || forcedHints {
+                    Text(text)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.primary)
+                        .fixedSize()
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(scheme == .dark ? Color(white: 0.2) : Color(white: 0.97)))
+                        .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.15)))
+                        .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
+                        .fixedSize()
+                        // Hung from a zero-width box at the control's left edge, so it reaches left, into the window.
+                        .frame(width: 0, alignment: .trailing)
+                        .offset(x: -4)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .onContinuousHover { phase in
+                switch phase {
+                case .active:
+                    guard !inside else { return }
+                    inside = true
+                    tipDelay = Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(600))
+                        if !Task.isCancelled && inside { tipShown = true }
+                    }
+                case .ended:
+                    leave()
+                }
+            }
+            .onDisappear { leave() }
+    }
+
+    private func leave() {
+        tipDelay?.cancel()
+        tipShown = false
+        inside = false
+    }
+}
+
 struct ResponseToggle: View {
     let shown: Bool
     let action: () -> Void
@@ -4262,7 +4435,7 @@ struct ResponseToggle: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .pointerStyle(.link)
+        .linkPointer()
         .help(shown ? "Hide the latest response" : "Show the latest response")
         .accessibilityLabel(shown ? "Hide the latest response" : "Show the latest response")
     }
@@ -4298,7 +4471,7 @@ struct ResponseDrawer: View {
                 .foregroundStyle(p.review)
             }
             .buttonStyle(.plain)
-            .pointerStyle(.link)
+            .linkPointer()
             .accessibilityLabel("Open the session in Claude")
         }
         .padding(.horizontal, 9)
@@ -4342,11 +4515,16 @@ struct AnswerCard: View {
     /// The button being pressed right now, and why the last click only opened the session.
     var answering: String? = nil
     var note: String? = nil
+    /// The eye under the pointer; off where Hide is a button of its own (a chip's card).
+    var hideButton = true
+    @State private var hovering = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.highContrast) private var contrast
+    @Environment(\.tagActions) private var actions
 
     var body: some View {
         let p = Palette(scheme, contrast: contrast)
+        let showHide = hovering || forcedHover == row.id
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 4) {
                 Button { open(row) } label: {
@@ -4365,8 +4543,16 @@ struct AnswerCard: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .pointerStyle(.link)
+                .linkPointer()
                 .help("Open in Claude")
+                if hideButton && actions.enabled && SessionHides.hideable(row) {
+                    // Its place is kept, so the time doesn't move as the pointer comes and goes.
+                    HideToggle { actions.hide(row) }
+                        .opacity(showHide ? 1 : 0)
+                        .allowsHitTesting(showHide)
+                        .accessibilityHidden(!showHide)
+                        .testFrame("card-hide:\(row.id)")
+                }
                 if card.response != nil {
                     ResponseToggle(shown: responseShown, action: toggleResponse).testFrame("response:\(row.id)")
                 }
@@ -4399,8 +4585,14 @@ struct AnswerCard: View {
                 RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.5))
             }
         }
-        .onHover { if $0 { warm?() } }
+        .onHover { inside in
+            hovering = inside
+            if inside { warm?() }
+        }
         .tagMenu(row)
+        .accessibilityAction(named: "Hide Until Next Update") {
+            if actions.enabled && SessionHides.hideable(row) { actions.hide(row) }
+        }
         .padding(.horizontal, 6)
         .padding(.bottom, 6)
     }
@@ -4487,7 +4679,7 @@ struct AnswerButton: View {
             .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
-        .pointerStyle(.link)
+        .linkPointer()
         .fixedSize()
         .help(answersHere ? "Answers “\(label)” in Claude" : "Opens the session in Claude, where you answer")
         .accessibilityLabel(answersHere ? "\(label). Answers in Claude" : "\(label). Opens the session in Claude")
@@ -4727,7 +4919,7 @@ struct FloatingView: View {
                         .buttonStyle(.plain)
                         .fontWeight(.semibold)
                         .foregroundStyle(palette.review)
-                        .pointerStyle(.link)
+                        .linkPointer()
                 }
                 .font(.system(size: 11))
                 .padding(.leading, 36)
@@ -4911,6 +5103,7 @@ struct FloatingView: View {
                 .overlay(Capsule().strokeBorder(Color.primary.opacity(contrast ? 0.6 : 0)))
             }
             .menuStyle(.button)
+            .linkPointer()
             .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
@@ -4925,6 +5118,7 @@ struct FloatingView: View {
             }
             .buttonStyle(.plain)
             .help("Stop keeping on top")
+            .linkPointer()
             .accessibilityLabel("Stop keeping on top")
         }
         .padding(.horizontal, 12)
@@ -4975,7 +5169,7 @@ struct FloatingView: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .pointerStyle(.link)
+                .linkPointer()
                 .help("Got it: stop the green, you've seen that everything finished")
                 .accessibilityLabel("All finished. Got it")
             } else if title {
@@ -5007,7 +5201,7 @@ struct FloatingView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .pointerStyle(.link)
+                .linkPointer()
                 .help(status.mode == .done ? "Got it: stop the green, you've seen that everything finished"
                                            : "Got it: stop the amber glow without opening the session")
                 .accessibilityLabel("Got it")
@@ -5056,7 +5250,7 @@ struct FloatingView: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .pointerStyle(.link)
+        .linkPointer()
         .help(selected ? "Show all sessions" : "Show only: \(chipTitle(kind, n))")
         .accessibilityLabel(selected ? "Showing only \(chipTitle(kind, n)); show all" : "Show only \(chipTitle(kind, n))")
         .accessibilityAddTraits(selected ? .isSelected : [])
@@ -5130,6 +5324,7 @@ struct FloatingView: View {
                 .contentShape(Rectangle())
         }
         .menuStyle(.button)
+        .linkPointer()
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .fixedSize()
@@ -5234,10 +5429,10 @@ struct FloatingView: View {
                            answer: answerFromCards && answer != nil ? { label in answer?(row, label) } : nil,
                            warm: answerFromCards ? warm : nil,
                            answering: answers.answering?.row == row.id ? answers.answering?.label : nil,
-                           note: answers.notes[row.id])
+                           note: answers.notes[row.id], hideButton: false)
             } else {
                 CompactRow(row: row, now: model.now, open: open, responseShown: openResponse == row.id,
-                           toggleResponse: row.group == .running ? nil : { toggleResponse(row.id) })
+                           toggleResponse: row.group == .running ? nil : { toggleResponse(row.id) }, hideButton: false)
                     .padding(4)
             }
             if SessionSnoozes.snoozable(row) || SessionHides.hideable(row) { cardActions(row) }
@@ -5300,6 +5495,8 @@ struct FloatingView: View {
                 .foregroundStyle(Color.primary)
                 .fixedSize()
                 .help("Hide until it next updates")
+                .backgroundHint("Hide until it next updates")
+                .linkPointer()
                 .testFrame("hide:\(row.id)")
             }
         }
@@ -5326,6 +5523,7 @@ struct FloatingView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.primary)
                 .help("Snooze " + snoozeWhen(choice.until(from: model.now), now: model.now))
+                .linkPointer()
                 .testFrame("snooze:\(row.id):\(choice.rawValue)")
         }
     }
@@ -5358,6 +5556,7 @@ struct FloatingView: View {
                 .contentShape(Capsule())
             }
             .menuStyle(.button)
+            .linkPointer()
             .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
@@ -5391,6 +5590,7 @@ struct FloatingView: View {
         }
         .buttonStyle(.plain)
         .help("Back to the list")
+        .linkPointer()
         .accessibilityLabel("Back to the list")
     }
 
@@ -5472,7 +5672,7 @@ struct FloatingView: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .pointerStyle(row.link != nil ? .link : nil)
+        .linkPointer(row.link != nil)
         .modifier(hoverSpot(row))
         .tagMenu(row)
         .testFrame("chip:\(row.id)")
@@ -5515,7 +5715,7 @@ struct FloatingView: View {
                             compactMark(row).contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .pointerStyle(row.link != nil ? .link : nil)
+                        .linkPointer(row.link != nil)
                         .modifier(hoverSpot(row))
                         .tagMenu(row)
                         .testFrame("dot:\(row.id)")
@@ -5659,7 +5859,7 @@ struct FloatingView: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .pointerStyle(row.link != nil ? .link : nil)
+        .linkPointer(row.link != nil)
         .modifier(hoverSpot(row))
         .tagMenu(row)
         .testFrame("bar:\(row.id)")
@@ -5744,6 +5944,7 @@ struct FloatingView: View {
                 .contentShape(Rectangle())
         }
         .menuStyle(.button)
+        .linkPointer()
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .fixedSize()
@@ -8219,6 +8420,8 @@ func writeSnapshot(to path: String, dark: Bool, sample: Bool, expand: Bool, limi
     _ = NSApplication.shared
     // --live: the real turning rings and shimmering status lines, frozen mid-animation.
     staticIndicators = !arguments.contains("--live")
+    forcedHover = argument(after: "--hover-row")
+    forcedHints = arguments.contains("--hint")
     let model = SessionModel()
     let rows = sample ? (arguments.contains("--sample-apps") ? sampleAppRows(now: Date()) : sampleRows(now: Date()))
                       : SessionEngine.scanOnce()
@@ -9595,6 +9798,48 @@ func runGestureCheck() {
     }
     hidePanel.orderOut(nil)
     hideDefaults.removePersistentDomain(forName: hideSuite)
+    // Hide on a row in the list, under the pointer (drawn as if hovered): one click.
+    let rowHideSuite = "limbo-tasks-gesture-row-hide"
+    let rowHideDefaults = UserDefaults(suiteName: rowHideSuite)!
+    rowHideDefaults.removePersistentDomain(forName: rowHideSuite)
+    let rowHideModel = SessionModel(defaults: rowHideDefaults)
+    rowHideModel.setRows(sampleRows(now: Date()).filter { $0.snoozedUntil == nil })
+    forcedHover = "local_s8"
+    let rowHost = FirstClickHostingView(rootView: FloatingView(model: rowHideModel, open: { opened.append($0.id) }, unpin: {},
+                                                              glow: nil, layout: FloatingLayout()))
+    rowHost.frame = NSRect(origin: .zero, size: rowHost.fittingSize)
+    let rowPanel = KeepOnTopPanel(contentRect: rowHost.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                  backing: .buffered, defer: false)
+    rowPanel.contentView = rowHost
+    rowPanel.setFrameOrigin(NSPoint(x: -6000, y: -3000))
+    rowPanel.orderFrontRegardless()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+    rowHost.frame = NSRect(origin: .zero, size: rowHost.fittingSize)
+    rowPanel.setContentSize(rowHost.frame.size)
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    let openedBefore = opened
+    if let button = testFrames["row-hide:local_s8"] {
+        let at = NSPoint(x: button.midX, y: rowHost.frame.height - button.midY)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            let event = NSEvent.mouseEvent(with: type, location: at, modifierFlags: [],
+                                           timestamp: ProcessInfo.processInfo.systemUptime,
+                                           windowNumber: rowPanel.windowNumber, context: nil, eventNumber: 0,
+                                           clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!
+            rowPanel.sendEvent(event)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        let listed = FloatingRows(board: Board(rows: rowHideModel.rows, now: Date()), now: Date(), within: 86400,
+                                  finishedWithin: 7200).all.map(\.id)
+        check("a row's Hide button hides it in one click, without opening it",
+              rowHideModel.hides.byId["local_s8"] != nil && !listed.contains("local_s8") && opened == openedBefore,
+              "(listed \(listed), opened \(opened))")
+    } else {
+        check("a row's Hide button hides it in one click, without opening it", false, "(button not found)")
+    }
+    forcedHover = nil
+    rowPanel.orderOut(nil)
+    rowHideDefaults.removePersistentDomain(forName: rowHideSuite)
     // New Tag…: the box takes the keyboard without making Limbo the active app,
     // and Return adds what was typed; Esc adds nothing.
     let prompt = TagPrompt()

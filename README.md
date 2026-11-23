@@ -169,7 +169,13 @@ Snooze a Claude session that isn't running (it needs you, is ready for review, o
 
 #### Hide
 
-Hide a session or thread you're done with for now, from any app, until it next updates: **Hide Until Next Update** in its right-click menu, or **Hide** under its card in the strip, the bar and the dots (next to Snooze).
+Hide a session or thread you're done with for now, from any app, until it next updates:
+
+- **In the list:** point at its row and click the eye that takes the place of its time (on a card, it's next to the reply button).
+- **In the strip, the bar and the dots:** click **Hide** under its card, next to Snooze.
+- **Anywhere:** **Hide Until Next Update** in its right-click menu.
+
+Then:
 
 - It leaves the keep-on-top window, every layout and the counts, and never starts a glow.
 - It comes back by itself when it changes: it runs again or ends a newer turn (for a Claude session, when you send it something from Claude).
@@ -257,7 +263,7 @@ The steps of the last answer, with the time of each since the click and no messa
 
 #### Keyboard focus and the cursor
 
-The window is a non-activating panel that can never become the key window, so it never takes the keyboard from a game or a video. macOS shows cursor changes only from the frontmost app, which this window never makes Limbo; the resize cursors still show because, while the pointer is on an edge, Limbo turns on the window server's private `SetsCursorInBackground` setting, and turns it off again (after putting the arrow back) when the pointer leaves. The New Tag box is a separate panel that can take the keyboard without making Limbo the app in front.
+The window is a non-activating panel that can never become the key window, so it never takes the keyboard from a game or a video. macOS shows cursor changes only from the frontmost app, which this window never makes Limbo; the resize cursors still show because, while the pointer is on an edge, Limbo turns on the window server's private `SetsCursorInBackground` setting, and turns it off again (after putting the arrow back) when the pointer leaves. Every link and button (rows, chips, a card's buttons, the header's chips and menus) shows the pointing hand the same way, with the setting on only while the pointer is on one. macOS shows no tooltips for an app that isn't in front either, so Limbo draws the Hide buttons' own, to the button's left, after a short pause. The New Tag box is a separate panel that can take the keyboard without making Limbo the app in front.
 
 #### Cost
 
@@ -277,6 +283,7 @@ limbo-tasks --snapshot out.png --floating --size 440x260 | 440xauto             
 limbo-tasks --snapshot out.png --floating [--mini] [--filter running|needsYou|review] [--contrast] [--solid]
 limbo-tasks --snapshot out.png --floating --layout strip|bar|dots|columns [--hover local_s1]   # --size 1400 for the bar's width
 limbo-tasks --snapshot out.png --floating --response local_s7 [--live] [-tagStyle outline|filled|dot|text]
+limbo-tasks --snapshot out.png --floating --hover-row local_s8 [--hint]   # a row or card as if the pointer were on it (--hint: with its tooltip)
 limbo-tasks --glow-cycle 16                         # Random in an offscreen window: effect each second, then CPU used
 limbo-tasks --gesture-check                         # chips, cards, replies, snooze, the New Tag box, close, pill, layouts (off screen)
 limbo-tasks --resize-check                          # dragging the edges, and never becoming the front app
