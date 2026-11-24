@@ -14,6 +14,11 @@
 //       keep-on-top window shows. What a running session is doing now, how a
 //       finished one's latest turn ended (its question, buttons and reply), and
 //       the title of one started in a terminal.
+//   ~/Library/Application Support/Claude/IndexedDB and Session Storage
+//       The Claude app's web cache, only while the panel or the keep-on-top
+//       window shows, and of it only what it keeps of your projects: their
+//       threads (titles, states, times), their names, and the titles of threads
+//       you've been to. The threads' messages are passed over.
 // Never opened: the *.key files beside the live records, and every other file
 // in those folders (waiting-input/, backlog/, deleted_*, ...).
 //
@@ -193,6 +198,8 @@ struct DeskRecord: Equatable {
     var transcriptId: String? = nil
     /// When the session last came into view in the Claude app.
     var lastFocused: Date? = nil
+    /// Its id on claude.ai, for a session that works for a project's thread.
+    var threadWorker: String? = nil
 }
 
 // Lenient decoding: a field with an unexpected type is dropped, not fatal.
@@ -229,6 +236,17 @@ private struct RawParent: Decodable {
     }
 }
 
+private struct RawSpawn: Decodable {
+    var session: String?
+    var threadChild: Bool?
+    enum CodingKeys: String, CodingKey { case session = "ccrSessionId", threadChild = "projectThreadChild" }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        session = try? c.decodeIfPresent(String.self, forKey: .session)
+        threadChild = try? c.decodeIfPresent(Bool.self, forKey: .threadChild)
+    }
+}
+
 /// Only the named fields are decoded; the rest of the file (mostly connector
 /// configuration) is never turned into values and never stored.
 private struct RawDesk: Decodable {
@@ -250,12 +268,13 @@ private struct RawDesk: Decodable {
     var cliSessionId: String?
     var lastAssistantCliSessionId: String?
     var lastFocusedAt: Double?
+    var spawn: RawSpawn?
 
     enum CodingKeys: String, CodingKey {
         case sessionId, title, cwd, lastActivityAt, lastTurnEdgeAt, isArchived, lastAssistantUuid
         case summary = "postTurnSummary", summaryFor = "postTurnSummaryFor", wrapUp = "turnWrapUp"
         case lastTurnReport, parent = "spawnedFrom", error, errorAt, errorCategory
-        case cliSessionId, lastAssistantCliSessionId, lastFocusedAt
+        case cliSessionId, lastAssistantCliSessionId, lastFocusedAt, spawn = "remoteControlSpawn"
     }
 
     init(from decoder: Decoder) throws {
@@ -278,6 +297,7 @@ private struct RawDesk: Decodable {
         cliSessionId = try? c.decodeIfPresent(String.self, forKey: .cliSessionId)
         lastAssistantCliSessionId = try? c.decodeIfPresent(String.self, forKey: .lastAssistantCliSessionId)
         lastFocusedAt = try? c.decodeIfPresent(Double.self, forKey: .lastFocusedAt)
+        spawn = try? c.decodeIfPresent(RawSpawn.self, forKey: .spawn)
     }
 }
 
@@ -311,7 +331,8 @@ func parseDeskRecord(path: String, stamp: FileStamp) -> DeskRecord? {
         errorText: raw.error == nil ? nil
             : plainLine(raw.errorCategory?.replacingOccurrences(of: "_", with: " ") ?? raw.error, max: 120),
         transcriptId: [raw.lastAssistantCliSessionId, raw.cliSessionId].compactMap { $0 }.first(where: isTranscriptId),
-        lastFocused: dateFromMillis(raw.lastFocusedAt))
+        lastFocused: dateFromMillis(raw.lastFocusedAt),
+        threadWorker: raw.spawn?.threadChild == true ? raw.spawn?.session.map(sessionSuffix) : nil)
 }
 
 /// Kernel start time of a running process, nil if there is none.
@@ -798,10 +819,10 @@ enum Group: Int, Comparable {
 struct Row: Identifiable, Equatable {
     let id: String
     let group: Group
-    let title: String
+    var title: String
     var ask: String? = nil
     var detail: String? = nil
-    let context: String         // parent session title, or the folder
+    var context: String         // parent session title, or the folder
     let since: Date             // turn end, or when it started running
     var link: String? = nil     // desktop session id, when it can be opened
     var terminal = false
@@ -1446,10 +1467,11 @@ func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row
 }
 
 /// The app a row's session or thread is in.
-enum RowSource { case claude, chatGPT, cursor, antigravity, orca, herdr }
+enum RowSource { case claude, project, chatGPT, cursor, antigravity, orca, herdr }
 
 extension Row {
     var source: RowSource {
+        if id.hasPrefix("project:") { return .project }
         if id.hasPrefix("codex:") { return .chatGPT }
         if id.hasPrefix("cursor:") { return .cursor }
         if id.hasPrefix("agy:") { return .antigravity }
@@ -1457,15 +1479,20 @@ extension Row {
         return .claude
     }
 
-    /// A thread in ChatGPT, Cursor, Antigravity or Orca: listed, never
+    /// A thread in ChatGPT, Cursor, Antigravity, Orca or a Claude project: listed, never
     /// counted in the menu bar, never tagged or snoozed.
     var fromOtherApp: Bool { source != .claude }
+
+    /// A project thread starts and ends no glow: its state is only as of the
+    /// last time the Claude app read it.
+    var startsGlow: Bool { source != .project }
 
     /// The app a click goes to, from the link. Usually the row's own app;
     /// a Claude session that Orca runs goes to Orca.
     var linkApp: RowSource? {
         guard let link else { return nil }
         if isSessionId(link) { return .claude }
+        if link.hasPrefix(projectLinkPrefix) { return .project }
         if link.hasPrefix("codex://threads/") { return .chatGPT }
         if link.hasPrefix(cursorLinkPrefix) { return .cursor }
         if link.hasPrefix(antigravityLinkPrefix) { return .antigravity }
@@ -1474,7 +1501,7 @@ extension Row {
         return nil
     }
 
-    /// Where a click goes: the session in Claude, the thread in ChatGPT, or
+    /// Where a click goes: the session in Claude, a thread's project in Claude, the thread in ChatGPT, or
     /// Cursor, Antigravity or Orca itself. Cursor has no link to one of its
     /// own threads (its /agent link finds only cloud agents, and shows an
     /// error otherwise); Antigravity's are its window's own, unpublished;
@@ -1483,6 +1510,9 @@ extension Row {
         guard let link, let app = linkApp else { return nil }
         switch app {
         case .claude: return URL(string: "claude://claude.ai/epitaxy/\(link)")
+        case .project:
+            let project = String(link.dropFirst(projectLinkPrefix.count))
+            return isProjectId(project, "chan_") ? URL(string: "claude://claude.ai/epitaxy/project/\(project)") : nil
         case .chatGPT: return URL(string: link)
         case .cursor, .antigravity, .orca, .herdr:
             return NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleId)
@@ -1502,6 +1532,7 @@ extension Row {
 
     /// What a click does, for menus: "Open in Claude", or "Switch to Orca".
     var openLabel: String {
+        if linkApp == .project { return "Open Project in Claude" }
         let app = (linkApp ?? source).name
         return opensAppOnly ? "Switch to \(app)" : "Open in \(app)"
     }
@@ -1510,6 +1541,7 @@ extension Row {
     /// nothing for Claude's own sessions.
     var spokenApp: String {
         guard fromOtherApp else { return "" }
+        if source == .project { return ", in a Claude project" }
         if let agent, agent != source { return ", \(agent.name) in \(appName)" }
         return ", in \(appName)"
     }
@@ -1518,7 +1550,7 @@ extension Row {
 extension RowSource {
     var name: String {
         switch self {
-        case .claude: return "Claude"
+        case .claude, .project: return "Claude"
         case .chatGPT: return "ChatGPT"
         case .cursor: return "Cursor"
         case .antigravity: return "Antigravity"
@@ -1530,7 +1562,7 @@ extension RowSource {
     /// The app's bundle id: where its icon comes from.
     var bundleId: String {
         switch self {
-        case .claude: return "com.anthropic.claudefordesktop"
+        case .claude, .project: return "com.anthropic.claudefordesktop"
         case .chatGPT: return "com.openai.codex"
         case .cursor: return cursorBundleId
         case .antigravity: return antigravityBundleId
@@ -2405,6 +2437,667 @@ private func queryAntigravity(_ uri: String, since: Date, limit: Int) -> [Antigr
     }
 }
 
+// MARK: - Reading Claude's web cache
+
+/// Bytes that end early, or aren't what they should be.
+struct BadBytes: Error {}
+
+/// Reads bytes in order; every read is checked against the end.
+struct ByteCursor {
+    let bytes: [UInt8]
+    var at: Int
+    let end: Int
+
+    init(_ bytes: [UInt8], from: Int = 0, to: Int? = nil) {
+        self.bytes = bytes
+        at = from
+        end = min(to ?? bytes.count, bytes.count)
+    }
+
+    var atEnd: Bool { at >= end }
+    var next: UInt8? { at < end ? bytes[at] : nil }
+
+    mutating func byte() throws -> UInt8 {
+        guard at < end else { throw BadBytes() }
+        defer { at += 1 }
+        return bytes[at]
+    }
+
+    mutating func take(_ count: Int) throws -> Range<Int> {
+        guard count >= 0, at <= end, count <= end - at else { throw BadBytes() }
+        defer { at += count }
+        return at..<(at + count)
+    }
+
+    mutating func varint() throws -> Int {
+        var result: UInt64 = 0
+        for shift in stride(from: UInt64(0), to: 63, by: 7) {
+            let b = try byte()
+            result |= UInt64(b & 0x7f) << shift
+            if b & 0x80 == 0 { return Int(result) }
+        }
+        throw BadBytes()
+    }
+
+    /// A little-endian number of up to eight bytes.
+    mutating func number(_ count: Int) throws -> UInt64 {
+        try take(count).reversed().reduce(0) { $0 << 8 | UInt64(bytes[$1]) }
+    }
+}
+
+let webCacheLimit = 32 << 20
+
+/// Snappy, the compression LevelDB and Chromium's web storage use.
+func snappyDecompress(_ bytes: [UInt8], from: Int = 0, to: Int? = nil) throws -> [UInt8] {
+    var c = ByteCursor(bytes, from: from, to: to)
+    let size = try c.varint()
+    guard size <= webCacheLimit else { throw BadBytes() }
+    var out: [UInt8] = []
+    out.reserveCapacity(size)
+    while !c.atEnd {
+        let tag = Int(try c.byte())
+        if tag & 3 == 0 {
+            var length = tag >> 2
+            if length >= 60 { length = Int(try c.number(length - 59)) }
+            out += bytes[try c.take(length + 1)]
+        } else {
+            let length: Int, offset: Int
+            switch tag & 3 {
+            case 1:
+                length = (tag >> 2 & 7) + 4
+                offset = (tag >> 5) << 8 | Int(try c.byte())
+            case 2:
+                length = (tag >> 2) + 1
+                offset = Int(try c.number(2))
+            default:
+                length = (tag >> 2) + 1
+                offset = Int(try c.number(4))
+            }
+            guard offset > 0, offset <= out.count else { throw BadBytes() }
+            for _ in 0..<length { out.append(out[out.count - offset]) }
+        }
+        guard out.count <= size else { throw BadBytes() }
+    }
+    guard out.count == size else { throw BadBytes() }
+    return out
+}
+
+/// LevelDB, the store under Chromium's web storage, read while its owner has
+/// it open: the files as they are, no lock taken. The owner can be writing
+/// or deleting one; what can't be read is left out.
+enum LevelDB {
+    struct Entry: Equatable {
+        let sequence: UInt64    // a new one each time the key is written
+        let value: [UInt8]
+    }
+
+    /// The keys `wanted` picks, each with its latest value.
+    static func entries(folder: String, wanted: (ArraySlice<UInt8>) -> Bool) -> [[UInt8]: Entry]? {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder) else { return nil }
+        var found: [[UInt8]: (sequence: UInt64, value: [UInt8]?)] = [:]
+        func add(_ key: ArraySlice<UInt8>, _ sequence: UInt64, _ value: ArraySlice<UInt8>?) {
+            guard wanted(key) else { return }
+            let key = Array(key)
+            if let old = found[key], old.sequence > sequence { return }
+            found[key] = (sequence, value.map(Array.init))
+        }
+        for name in names where name.hasSuffix(".log") || name.hasSuffix(".ldb") {
+            guard let data = readFile(folder + "/" + name, limit: webCacheLimit) else { continue }
+            let bytes = [UInt8](data)
+            if name.hasSuffix(".log") { try? readLog(bytes, add) } else { try? readTable(bytes, add) }
+        }
+        return found.compactMapValues { entry in entry.value.map { Entry(sequence: entry.sequence, value: $0) } }
+    }
+
+    /// A write-ahead log: 32 KB blocks of records, a write batch split over one or more.
+    static func readLog(_ bytes: [UInt8], _ add: (ArraySlice<UInt8>, UInt64, ArraySlice<UInt8>?) -> Void) throws {
+        var c = ByteCursor(bytes)
+        var partial: [UInt8] = []
+        while !c.atEnd {
+            let left = 32768 - c.at % 32768
+            if left < 7 { _ = try c.take(left); continue }
+            _ = try c.number(4)                               // checksum
+            let length = Int(try c.number(2)), type = try c.byte()
+            if length == 0 && type == 0 { _ = try c.take(left - 7); continue }
+            let data = try c.take(length)
+            switch type {
+            case 1: try? readBatch(Array(bytes[data]), add)
+            case 2: partial = Array(bytes[data])
+            case 3: partial += bytes[data]
+            case 4:
+                try? readBatch(partial + bytes[data], add)
+                partial = []
+            default: throw BadBytes()
+            }
+            guard partial.count <= webCacheLimit else { throw BadBytes() }
+        }
+    }
+
+    private static func readBatch(_ bytes: [UInt8], _ add: (ArraySlice<UInt8>, UInt64, ArraySlice<UInt8>?) -> Void) throws {
+        var c = ByteCursor(bytes)
+        let sequence = try c.number(8), count = try c.number(4)
+        for index in 0..<count {
+            let type = try c.byte()
+            let key = try c.take(try c.varint())
+            let value = type == 1 ? try c.take(try c.varint()) : nil
+            add(bytes[key], sequence + index, value.map { bytes[$0] })
+        }
+    }
+
+    /// A sorted table: data blocks, an index of them, and a footer.
+    static func readTable(_ bytes: [UInt8], _ add: (ArraySlice<UInt8>, UInt64, ArraySlice<UInt8>?) -> Void) throws {
+        guard bytes.count >= 48 else { throw BadBytes() }
+        var footer = ByteCursor(bytes, from: bytes.count - 48)
+        _ = try (footer.varint(), footer.varint())            // the metaindex block
+        func block(_ offset: Int, _ size: Int) throws -> [UInt8] {
+            var c = ByteCursor(bytes, from: min(offset, bytes.count))
+            let data = try c.take(size)
+            return try c.byte() == 1 ? snappyDecompress(bytes, from: data.lowerBound, to: data.upperBound) : Array(bytes[data])
+        }
+        func each(_ block: [UInt8], _ body: ([UInt8], Range<Int>) throws -> Void) throws {
+            guard block.count >= 4 else { throw BadBytes() }
+            var tail = ByteCursor(block, from: block.count - 4)
+            let restarts = Int(try tail.number(4))
+            var c = ByteCursor(block, to: block.count - 4 - 4 * restarts)
+            var key: [UInt8] = []
+            while !c.atEnd {
+                let shared = try c.varint(), rest = try c.varint(), size = try c.varint()
+                guard shared <= key.count else { throw BadBytes() }
+                key = Array(key[..<shared]) + block[try c.take(rest)]
+                try body(key, try c.take(size))
+            }
+        }
+        let index = try block(try footer.varint(), try footer.varint())
+        try each(index) { _, handle in
+            var c = ByteCursor(index, from: handle.lowerBound, to: handle.upperBound)
+            let data = try block(try c.varint(), try c.varint())
+            try each(data) { key, value in
+                guard key.count >= 8 else { throw BadBytes() }
+                var trailer = ByteCursor(key, from: key.count - 8)
+                let packed = try trailer.number(8)
+                add(key[..<(key.count - 8)], packed >> 8, packed & 0xff == 1 ? data[value] : nil)
+            }
+        }
+    }
+}
+
+/// A web page's stored value (V8's serialization), as dictionaries, arrays,
+/// strings, doubles and bools; anything else as NSNull. Values under `skip`
+/// keys are passed over.
+struct V8Reader {
+    private var c: ByteCursor
+    private let skip: Set<String>
+    private var objects: [Any] = []
+
+    /// A stored value, less the envelopes around it.
+    static func value(_ bytes: [UInt8], skip: Set<String> = []) throws -> Any {
+        var bytes = bytes
+        if bytes.starts(with: [0xff, 0x11, 0x02]) { bytes = try snappyDecompress(bytes, from: 3) }
+        var c = ByteCursor(bytes)
+        while c.next == 0xff {
+            _ = try c.byte()
+            _ = try c.varint()
+            if c.next == 0xfe { _ = try c.take(13) }
+        }
+        var reader = V8Reader(c: c, skip: skip)
+        return try reader.read(build: true, depth: 0)
+    }
+
+    private init(c: ByteCursor, skip: Set<String>) {
+        self.c = c
+        self.skip = skip
+    }
+
+    private mutating func tag() throws -> UInt8 {
+        while true {
+            let t = try c.byte()
+            if t == 0 { continue }                            // padding
+            if t == UInt8(ascii: "?") { _ = try c.varint(); continue }
+            return t
+        }
+    }
+
+    private mutating func peekTag() throws -> UInt8 {
+        while c.next == 0 { c.at += 1 }
+        guard let t = c.next else { throw BadBytes() }
+        return t
+    }
+
+    private mutating func text(_ count: Int, _ build: Bool, _ decode: (ArraySlice<UInt8>) -> String) throws -> Any {
+        let range = try c.take(count)
+        return build ? decode(c.bytes[range]) : NSNull()
+    }
+
+    private static func latin1(_ b: ArraySlice<UInt8>) -> String {
+        var s = String.UnicodeScalarView()
+        for byte in b { s.append(Unicode.Scalar(byte)) }
+        return String(s)
+    }
+
+    private static func utf16(_ b: ArraySlice<UInt8>) -> String {
+        let units = stride(from: b.startIndex, to: b.endIndex - 1, by: 2).map { UInt16(b[$0]) | UInt16(b[$0 + 1]) << 8 }
+        return String(decoding: units, as: UTF16.self)
+    }
+
+    private mutating func read(build: Bool, depth: Int) throws -> Any {
+        guard depth < 200 else { throw BadBytes() }
+        switch try tag() {
+        case UInt8(ascii: "\""): return try text(try c.varint(), build, Self.latin1)
+        case UInt8(ascii: "c"): return try text(try c.varint(), build, Self.utf16)
+        case UInt8(ascii: "S"): return try text(try c.varint(), build) { String(decoding: $0, as: UTF8.self) }
+        case UInt8(ascii: "N"): return Double(bitPattern: try c.number(8))
+        case UInt8(ascii: "I"):
+            let n = try c.varint()
+            return Double((n >> 1) ^ -(n & 1))
+        case UInt8(ascii: "U"): return Double(try c.varint())
+        case UInt8(ascii: "T"): return true
+        case UInt8(ascii: "F"): return false
+        case UInt8(ascii: "0"), UInt8(ascii: "_"), UInt8(ascii: "-"): return NSNull()
+        case UInt8(ascii: "Z"):
+            _ = try c.take(try c.varint() >> 1)
+            return NSNull()
+        case UInt8(ascii: "^"):
+            let id = try c.varint()
+            guard id < objects.count else { throw BadBytes() }
+            return objects[id]
+        case UInt8(ascii: "D"), UInt8(ascii: "n"):
+            objects.append(Double(bitPattern: try c.number(8)))
+            return objects[objects.count - 1]
+        case UInt8(ascii: "y"), UInt8(ascii: "x"):
+            objects.append(NSNull())
+            return NSNull()
+        case UInt8(ascii: "o"):
+            return try properties(until: UInt8(ascii: "{"), counts: 1, build: build, depth: depth)
+        case UInt8(ascii: "a"):
+            _ = try c.varint()
+            let items = try properties(until: UInt8(ascii: "@"), counts: 2, build: build, depth: depth) as? [String: Any] ?? [:]
+            return items.compactMap { key, value in Int(key).map { ($0, value) } }.sorted { $0.0 < $1.0 }.map(\.1)
+        case UInt8(ascii: "A"):
+            let count = try c.varint(), id = objects.count
+            guard count <= c.end else { throw BadBytes() }
+            objects.append(NSNull())
+            var items: [Any] = []
+            for _ in 0..<count {
+                let item = try read(build: build, depth: depth + 1)
+                if build { items.append(item) }
+            }
+            while try peekTag() != UInt8(ascii: "$") {
+                _ = try read(build: false, depth: depth + 1)
+                _ = try read(build: false, depth: depth + 1)
+            }
+            c.at += 1
+            _ = try (c.varint(), c.varint())
+            objects[id] = items
+            return items
+        case UInt8(ascii: ";"):                               // a Map, as a dictionary
+            return try properties(until: UInt8(ascii: ":"), counts: 1, build: build, depth: depth)
+        case UInt8(ascii: "'"):                               // a Set
+            let id = objects.count
+            objects.append(NSNull())
+            while try peekTag() != UInt8(ascii: ",") { _ = try read(build: false, depth: depth + 1) }
+            c.at += 1
+            _ = try c.varint()
+            return objects[id]
+        default: throw BadBytes()
+        }
+    }
+
+    private mutating func properties(until end: UInt8, counts: Int, build: Bool, depth: Int) throws -> Any {
+        let id = objects.count
+        objects.append(NSNull())
+        var result: [String: Any] = [:]
+        while try peekTag() != end {
+            let key = try read(build: true, depth: depth + 1)
+            let name = key as? String ?? (key as? Double).map { String(Int($0)) } ?? ""
+            let wanted = build && !skip.contains(name)
+            let value = try read(build: wanted, depth: depth + 1)
+            if wanted { result[name] = value }
+        }
+        c.at += 1
+        for _ in 0..<counts { _ = try c.varint() }
+        objects[id] = result
+        return result
+    }
+}
+
+/// An IndexedDB record's key, when it's a string: where the byte that says
+/// which part of the store it's in sits, and the string.
+func indexedDBKey(_ key: ArraySlice<UInt8>) -> (part: Int, name: String)? {
+    guard let first = key.first else { return nil }
+    let part = 1 + Int(first >> 5 & 7) + 1 + Int(first >> 2 & 7) + 1
+    guard first & 3 == 0, key.count > part + 2, key[key.startIndex + part + 1] == 1 else { return nil }
+    var c = ByteCursor(Array(key), from: part + 2)
+    guard let count = try? c.varint(), count <= 256, let text = try? c.take(count * 2), c.atEnd else { return nil }
+    let units = stride(from: text.lowerBound, to: text.upperBound, by: 2).map { UInt16(c.bytes[$0]) << 8 | UInt16(c.bytes[$0 + 1]) }
+    return (part, String(decoding: units, as: UTF16.self))
+}
+
+// MARK: - Claude project threads
+
+/// One thread of a Claude project. Threads run on claude.ai, not on this Mac:
+/// what's known here is what the Claude app last read, kept in its web cache.
+struct ProjectThread: Equatable {
+    let id: String             // cmsg_…: the message it started from
+    let project: String        // chan_…
+    var name: String?          // the name you or Claude gave it
+    var text: String           // the message it started from
+    var status: String         // working, needs_input, idle or resolved
+    var unread = false
+    var lastReply: Date
+    var readAt: Date           // when the Claude app fetched this
+    var sessions: [String] = [] // the sessions working on it, less their prefix
+}
+
+/// A project's threads, and its name as its coordinator has it.
+struct ProjectThreads: Equatable {
+    let id: String
+    var name: String?
+    var threads: [ProjectThread]
+}
+
+/// `chan_…`, `cmsg_…`: ASCII letters and digits after the prefix.
+func isProjectId(_ s: String, _ prefix: String) -> Bool {
+    s.hasPrefix(prefix) && s.count > prefix.count && s.count <= 96 && s.dropFirst(prefix.count).allSatisfy(isASCIIAlnum)
+}
+
+/// "cse_A1" and "session_A1" name the same session: "A1".
+func sessionSuffix(_ id: String) -> String { id.split(separator: "_").last.map(String.init) ?? id }
+
+private let isoTime: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+/// "2026-11-24T03:50:20.909575Z", to the second.
+func projectTime(_ text: String?) -> Date? {
+    guard let text, text.count >= 19 else { return nil }
+    return isoTime.date(from: text.prefix(19) + ".000Z")
+}
+
+/// A project as the Claude app's cache keeps it. Threads you resolved are left
+/// out, and so are the cards a project posts about a decision (no thread of theirs).
+func projectThreads(_ stored: Any) -> ProjectThreads? {
+    guard let stored = stored as? [String: Any], let tree = stored["tree"] as? [String: Any],
+          let key = stored["conversationUuid"] as? String, key.hasPrefix("project:"),
+          let threadList = tree["threadList"] as? [String: Any], let list = threadList["rows"] as? [[String: Any]] else { return nil }
+    let project = String(key.dropFirst("project:".count))
+    guard isProjectId(project, "chan_") else { return nil }
+    // When the app fetched the threads, not when it saved its copy of them.
+    let readAt = dateFromMillis(threadList["readAt"] as? Double ?? stored["fetchedAt"] as? Double
+                                    ?? stored["writtenAt"] as? Double) ?? .distantPast
+    let known = tree["sessions"] as? [String: Any] ?? [:]
+    var titles: [String: String] = [:], bound: [String: [String]] = [:]
+    for session in known["sessions"] as? [[String: Any]] ?? [] {
+        if let id = session["id"] as? String { titles[sessionSuffix(id)] = session["title"] as? String }
+    }
+    for pair in known["bindings"] as? [[Any]] ?? [] where pair.count == 2 {
+        if let thread = pair[0] as? String, let session = pair[1] as? String {
+            bound[thread, default: []].append(sessionSuffix(session))
+        }
+    }
+    let threads = list.compactMap { row -> ProjectThread? in
+        guard let id = row["id"] as? String, isProjectId(id, "cmsg_"),
+              let status = row["thread_status"] as? String, status != "resolved",
+              row["thread_holds_only_card_presses"] as? Bool != true,
+              let last = projectTime(row["last_reply_at"] as? String ?? row["created_at"] as? String) else { return nil }
+        var sessions = bound[id] ?? []
+        for session in row["bound_sessions"] as? [[String: Any]] ?? [] {
+            if let id = (session["id"] as? String).map(sessionSuffix), !sessions.contains(id) { sessions.append(id) }
+        }
+        let name = (row["display_name"] as? String) ?? sessions.lazy.compactMap { titles[$0] }.first
+        return ProjectThread(id: id, project: project, name: plainLine(name, max: 160), text: row["body"] as? String ?? "",
+                             status: row["thread_any_session_working"] as? Bool == true ? "working" : status,
+                             unread: row["has_unread"] as? Bool ?? false, lastReply: last, readAt: readAt, sessions: sessions)
+    }
+    // Its coordinator is titled: Project coordinator ("Website")
+    let name = (known["overviewSessionId"] as? String).flatMap { titles[sessionSuffix($0)] }
+        .flatMap { title -> String? in
+            guard let open = title.firstIndex(of: "\""), let close = title.lastIndex(of: "\""), open < close else { return nil }
+            return plainLine(String(title[title.index(after: open)..<close]), max: 80)
+        }
+    return ProjectThreads(id: project, name: name, threads: threads)
+}
+
+/// Your projects' names by id, less the ones archived, from the list the
+/// Claude app keeps of them. nil if the cache doesn't hold that list.
+func projectNames(_ stored: Any) -> [String: String]? {
+    guard let queries = ((stored as? [String: Any])?["clientState"] as? [String: Any])?["queries"] as? [[String: Any]]
+    else { return nil }
+    var names: [String: String]?
+    for query in queries where (query["queryKey"] as? [Any])?.first as? String == "cc-project-channels" {
+        for project in (query["state"] as? [String: Any])?["data"] as? [[String: Any]] ?? [] {
+            guard let id = project["id"] as? String, isProjectId(id, "chan_") else { continue }
+            names = names ?? [:]
+            if project["archived_at"] is String { continue }
+            names?[id] = plainLine(project["name"] as? String, max: 80)
+        }
+    }
+    return names
+}
+
+/// The titles of project threads you've been to, by thread, from the list
+/// behind the Claude app's search box.
+func visitedThreadTitles(_ json: Data) -> [String: String] {
+    var titles: [String: String] = [:]
+    for item in (try? JSONSerialization.jsonObject(with: json)) as? [[String: Any]] ?? []
+    where item["kind"] as? String == "epitaxy-thread" {
+        guard let key = item["key"] as? String, let thread = key.split(separator: "/").last.map(String.init),
+              isProjectId(thread, "cmsg_"), let title = plainLine(item["title"] as? String, max: 160) else { continue }
+        titles[thread] = titles[thread] ?? title
+    }
+    return titles
+}
+
+/// A title for a thread that has no name yet: what its first message says, less any links.
+func threadTitle(text: String) -> String? {
+    guard !text.hasPrefix("{") else { return nil }
+    let words = text.split(whereSeparator: \.isWhitespace).filter { !$0.contains("://") }
+    return plainLine(words.joined(separator: " "), max: 160)
+}
+
+/// How long a thread the Claude app saw working is taken to be still working.
+let projectFreshFor: TimeInterval = 10 * 60
+
+/// A project thread's link: "claude-project:chan_…". The Claude app has no
+/// link to one thread of a project (its claude:// links drop which thread),
+/// so a click opens the project.
+let projectLinkPrefix = "claude-project:"
+
+/// A project thread as a row. Its state is as of the last time the Claude app
+/// read the project, so one seen working longer ago than `projectFreshFor`
+/// isn't called running or done, but to check.
+func projectRow(_ thread: ProjectThread, project: String, title: String, now: Date) -> Row {
+    let id = "project:\(thread.id)", link = projectLinkPrefix + thread.project
+    func row(_ group: Group, ask: String? = nil, detail: String? = nil) -> Row {
+        Row(id: id, group: group, title: title, ask: ask, detail: detail, context: project, since: thread.lastReply, link: link)
+    }
+    let fresh = now.timeIntervalSince(thread.readAt) < projectFreshFor
+    switch thread.status {
+    case "working":
+        if fresh { return row(.running) }
+        return row(.review, detail: "Was working when Claude last read \(project)")
+    case "needs_input":
+        return row(.yourTurn, ask: fresh ? "Waiting for your answer" : "Was waiting for your answer when Claude last read \(project)")
+    default:
+        let recent = now.timeIntervalSince(thread.lastReply) <= Board.recentLimit
+        return thread.unread && recent ? row(.review, detail: "New reply in \(project)") : row(.done)
+    }
+}
+
+/// Claude's rows plus its projects' threads. A session on this Mac that works
+/// for a thread is listed as the thread, once: its own state is live, so it
+/// stays, under the project, with the thread's title when its own says nothing.
+/// `workers` are those sessions' ids on claude.ai, by session.
+func mergeProjects(claude: [Row], threads: [Row], sessions: [String: [String]], workers: [String: String]) -> [Row] {
+    guard !threads.isEmpty else { return claude }
+    var byWorker: [String: Row] = [:]
+    for row in threads {
+        for session in sessions[row.id] ?? [] { byWorker[session] = row }
+    }
+    var shown = Set<String>()
+    let rows = claude.map { row -> Row in
+        guard let worker = workers[row.id], let thread = byWorker[worker] else { return row }
+        shown.insert(thread.id)
+        var row = row
+        if row.title.hasSuffix("(from a project)") { row.title = thread.title }
+        row.context = thread.context
+        return row
+    }
+    return rowsInOrder(rows + threads.filter { !shown.contains($0.id) })
+}
+
+/// A LevelDB folder's files as stamps, to notice a change: a stat of each, the
+/// folder listed again only when a file came or went.
+struct LevelDBStamps {
+    let folder: String
+    private var listed: FileStamp?
+    private var paths: [String] = []
+
+    init(folder: String) { self.folder = folder }
+
+    mutating func current() -> [FileStamp?] {
+        let stamp = pathStamp(folder)
+        if stamp != listed || stamp == nil {
+            listed = stamp
+            paths = ((try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? [])
+                .filter { $0.hasSuffix(".log") || $0.hasSuffix(".ldb") }.sorted().map { folder + "/" + $0 }
+        }
+        return paths.map(pathStamp)
+    }
+}
+
+/// Reads the project threads the Claude app keeps in its web cache, on the
+/// engine's queue, while a panel shows. Each tick is a stat of the cache's few
+/// files; changed ones are read at most every 10 s, and a project is decoded
+/// only when the app wrote it again. Only the projects' records, the list of
+/// projects and the list of visited threads are decoded.
+final class ClaudeProjectsWatcher {
+    static let storage = Paths.home.appendingPathComponent("Library/Application Support/Claude").path
+    private let database: String
+    private var files: LevelDBStamps
+    private var visitedFiles: LevelDBStamps
+    private var stamps: [FileStamp?] = []
+    private var lastRead = Date.distantPast
+    /// By the record's whole key: the app keeps each project's dates in a record of
+    /// their own, which holds no threads (nil here, so it's not decoded again).
+    private var decoded: [[UInt8]: (sequence: UInt64, project: ProjectThreads?)] = [:]
+    private var namesSequence: UInt64 = 0
+    private var names: [String: String]?
+    private var visitedStamps: [FileStamp?] = []
+    private var visited: [String: String] = [:]
+    private(set) var projects: [ProjectThreads] = []
+    private(set) var reads = 0
+
+    init(storage: String = ClaudeProjectsWatcher.storage) {
+        database = storage + "/IndexedDB/https_claude.ai_0.indexeddb"
+        files = LevelDBStamps(folder: database + ".leveldb")
+        visitedFiles = LevelDBStamps(folder: storage + "/Session Storage")
+    }
+
+    /// One tick; true if a thread changed.
+    @discardableResult
+    func refresh(now: Date = Date()) -> Bool {
+        guard now.timeIntervalSince(lastRead) >= 10 else { return false }
+        let current = files.current()
+        guard !current.isEmpty, current != stamps else { return false }
+        lastRead = now
+        let before = projects
+        guard autoreleasepool(invoking: read) else { return false }
+        stamps = current
+        reads += 1
+        return projects != before
+    }
+
+    /// No panel shows: drop the threads.
+    func clear() {
+        stamps = []
+        lastRead = .distantPast
+        projects = []
+    }
+
+    private func read() -> Bool {
+        guard let entries = LevelDB.entries(folder: database + ".leveldb", wanted: { key in
+            guard let key = indexedDBKey(key) else { return false }
+            return key.name == "react-query-cache" || key.name.hasPrefix("project:chan_")
+        }) else { return false }
+        for (key, entry) in entries {
+            // Part 1 of a store holds its values.
+            guard let (part, name) = indexedDBKey(key[...]), key[part] == 1 else { continue }
+            func value(skip: Set<String>) -> Any? {
+                var c = ByteCursor(entry.value)
+                guard (try? c.varint()) != nil else { return nil }
+                var bytes = Array(entry.value[c.at...])
+                if bytes.starts(with: [0xff, 0x11, 0x01]) {
+                    // Kept in a file of its own, which part 3 names by number.
+                    var sibling = key
+                    sibling[part] = 3
+                    guard let file = entries[sibling].flatMap({ blobFile(database: key[1], $0.value) }),
+                          let data = readFile(file, limit: webCacheLimit) else { return nil }
+                    bytes = [UInt8](data)
+                }
+                return try? V8Reader.value(bytes, skip: skip)
+            }
+            if name == "react-query-cache" {
+                guard entry.sequence != namesSequence, let stored = value(skip: ["mutations"]) else { continue }
+                namesSequence = entry.sequence
+                names = projectNames(stored) ?? names
+            } else {
+                if decoded[key]?.sequence == entry.sequence { continue }
+                // Not the messages themselves, only the list of threads. One that
+                // can't be read now stays as it was, and is tried again.
+                guard let stored = value(skip: ["chat", "threads", "pullRequests"]) else { continue }
+                decoded[key] = (entry.sequence, projectThreads(stored))
+            }
+        }
+        for key in Array(decoded.keys) where entries[key] == nil { decoded[key] = nil }
+        projects = decoded.values.compactMap(\.project).sorted { $0.id < $1.id }
+        return true
+    }
+
+    private func blobFile(database id: UInt8, _ value: [UInt8]) -> String? {
+        var c = ByteCursor(value)
+        guard (try? c.byte()) == 0, let number = try? c.varint() else { return nil }
+        return database + ".blob/" + String(id, radix: 16) + "/" + String(format: "%02x", number >> 8 & 0xff) + "/"
+            + String(number, radix: 16)
+    }
+
+    /// The threads as rows, and each row's sessions on claude.ai.
+    func rows(now: Date) -> (rows: [Row], sessions: [String: [String]]) {
+        var rows: [Row] = [], sessions: [String: [String]] = [:]
+        for project in projects {
+            // Not on your list: archived, or another account's.
+            if let names, names[project.id] == nil { continue }
+            let name = names?[project.id] ?? project.name ?? "Claude project"
+            for thread in project.threads where now.timeIntervalSince(thread.lastReply) <= Board.window {
+                let title = thread.name ?? visitedTitle(thread.id) ?? threadTitle(text: thread.text) ?? "Thread in \(name)"
+                let row = projectRow(thread, project: name, title: title, now: now)
+                rows.append(row)
+                sessions[row.id] = thread.sessions
+            }
+        }
+        return (rows, sessions)
+    }
+
+    /// The title of a thread you've been to; the list is read again only when it changed.
+    private func visitedTitle(_ thread: String) -> String? {
+        if let title = visited[thread] { return title }
+        let current = visitedFiles.current()
+        guard current != visitedStamps else { return nil }
+        visitedStamps = current
+        let name = Array("-cmdk-navigation-history:".utf8)
+        let lists = LevelDB.entries(folder: visitedFiles.folder) { key in
+            key.starts(with: Array("map-".utf8)) && key.count < 200 && String(decoding: key, as: UTF8.self)
+                .contains(String(decoding: name, as: UTF8.self))
+        } ?? [:]
+        for list in lists.values.sorted(by: { $0.sequence < $1.sequence }) {
+            let units = stride(from: 0, to: list.value.count - 1, by: 2).map { UInt16(list.value[$0]) | UInt16(list.value[$0 + 1]) << 8 }
+            visited.merge(visitedThreadTitles(Data(String(decoding: units, as: UTF16.self).utf8))) { $1 }
+        }
+        return visited[thread]
+    }
+}
+
 // MARK: - Engine
 
 /// Owns all file access, on one low-priority serial queue.
@@ -2449,6 +3142,7 @@ final class SessionEngine {
     private let antigravity = AppThreadsWatcher.antigravity()
     private let orcaAdopted = AdoptedIds()
     private lazy var orca = AppThreadsWatcher.orca(adopted: orcaAdopted)
+    private let projects = ClaudeProjectsWatcher()
     private var otherApps: DispatchSourceTimer?
 
     func start() {
@@ -2485,6 +3179,7 @@ final class SessionEngine {
             engine.cursor.refresh()
             engine.antigravity.refresh()
             engine.orca.refresh()
+            engine.projects.refresh()
             let claude = classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
                                   activities: activities, cards: engine.currentCards(), background: engine.backgroundWork(),
                                   titles: engine.terminalTitles())
@@ -2540,7 +3235,8 @@ final class SessionEngine {
                 apps.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
                 apps.setEventHandler { [weak self] in
                     guard let self else { return }
-                    let changed = [self.codex.refresh(), self.cursor.refresh(), self.antigravity.refresh(), self.orca.refresh()]
+                    let changed = [self.codex.refresh(), self.cursor.refresh(), self.antigravity.refresh(), self.orca.refresh(),
+                                   self.projects.refresh()]
                     if changed.contains(true) { self.publishIfChanged() }
                 }
                 apps.resume()
@@ -2552,6 +3248,7 @@ final class SessionEngine {
                 self.cursor.clear()
                 self.antigravity.clear()
                 self.orca.clear()
+                self.projects.clear()
             }
             self.syncActivityWatchers()
             self.publishIfChanged()
@@ -2714,8 +3411,13 @@ final class SessionEngine {
         }
     }
 
-    /// Claude's rows plus the other apps', each Claude session Orca runs listed once.
-    private func withOtherApps(_ claude: [Row]) -> [Row] {
+    /// Claude's rows plus its projects' threads and the other apps', each Claude session
+    /// Orca runs, or a project's thread runs on this Mac, listed once.
+    private func withOtherApps(_ rows: [Row]) -> [Row] {
+        let threads = projects.rows(now: Date())
+        let workers = Dictionary(desk.values.compactMap { e in e.record.flatMap { r in r.threadWorker.map { (r.sessionId, $0) } } },
+                                 uniquingKeysWith: { a, _ in a })
+        let claude = mergeProjects(claude: rows, threads: threads.rows, sessions: threads.sessions, workers: workers)
         let others = codex.rows + cursor.rows + antigravity.rows
         guard !orca.rows.isEmpty else { return others.isEmpty ? claude : rowsInOrder(claude + others) }
         let sessions = Dictionary(live.values.compactMap { r in r.cliSessionId.map { (r.pid, $0) } },
@@ -7383,7 +8085,7 @@ final class FloatingController {
     /// just made in the sparkle menu shows for 4 seconds.
     func updateGlow() {
         glow.configure(style: .saved, color: .saved)
-        let board = Board(rows: model.rows, now: model.now)
+        let board = Board(rows: model.rows.filter(\.startsGlow), now: model.now)
         // A running session you put on hold starts no glow, and its end no green.
         let running = board.running.filter { !$0.tags.contains(SessionTags.onHold) }.count
         let decision = glowDecision(pinned: model.pinned, running: running, wasRunning: wasRunning,
@@ -8847,6 +9549,191 @@ for (flag, on) in [("--login-item-on", true), ("--login-item-off", false)] where
     }
 }
 
+/// Claude project threads, from a made-up web cache written the way Chromium writes one.
+private func runProjectChecks(_ check: (String, Bool) -> Void, now: Date) {
+    func varint(_ n: Int) -> [UInt8] {
+        var n = n, out: [UInt8] = []
+        while n >= 0x80 { out.append(UInt8(n & 0x7f) | 0x80); n >>= 7 }
+        return out + [UInt8(n)]
+    }
+    func little(_ n: UInt64, _ count: Int) -> [UInt8] { (0..<count).map { UInt8(n >> (8 * $0) & 0xff) } }
+    func v8(_ value: Any) -> [UInt8] {
+        switch value {
+        case let s as String: return Array("\"".utf8) + varint(s.utf8.count) + Array(s.utf8)
+        case let b as Bool: return Array((b ? "T" : "F").utf8)
+        case let n as Int: return Array("I".utf8) + varint(n << 1)
+        case let d as Double: return Array("N".utf8) + little(d.bitPattern, 8)
+        case let o as [(String, Any)]:
+            return Array("o".utf8) + o.flatMap { v8($0.0) + v8($0.1) } + Array("{".utf8) + varint(o.count)
+        case let a as [Any]: return Array("A".utf8) + varint(a.count) + a.flatMap(v8) + Array("$".utf8) + [0] + varint(a.count)
+        default: return Array("0".utf8)
+        }
+    }
+    // A record as IndexedDB keeps it: a version, the web page's envelope, the value.
+    func stored(_ value: Any) -> [UInt8] {
+        [7, 0xff, 0x15, 0xfe] + [UInt8](repeating: 0, count: 12) + [0xff, 0x0f] + v8(value)
+    }
+    func key(_ name: String, part: UInt8 = 1) -> [UInt8] {
+        [0, 1, 1, part, 1] + varint(name.utf16.count) + name.utf16.flatMap { [UInt8($0 >> 8), UInt8($0 & 0xff)] }
+    }
+    func log(_ sequence: UInt64, _ entries: [(key: [UInt8], value: [UInt8]?)]) -> [UInt8] {
+        var batch = little(sequence, 8) + little(UInt64(entries.count), 4)
+        for e in entries {
+            batch += [e.value == nil ? 0 : 1] + varint(e.key.count) + e.key
+            if let value = e.value { batch += varint(value.count) + value }
+        }
+        // Split over as many 32 KB blocks as it takes.
+        var out: [UInt8] = [], rest = batch[...], first = true
+        while !rest.isEmpty {
+            let room = 32768 - out.count % 32768 - 7
+            if room <= 0 { out += [UInt8](repeating: 0, count: room + 7); continue }
+            let part = rest.prefix(room)
+            rest = rest.dropFirst(part.count)
+            out += little(0, 4) + little(UInt64(part.count), 2) + [first ? (rest.isEmpty ? 1 : 2) : (rest.isEmpty ? 4 : 3)] + part
+            first = false
+        }
+        return out
+    }
+    func table(_ sequence: UInt64, _ key: [UInt8], _ value: [UInt8]) -> [UInt8] {
+        func block(_ k: [UInt8], _ v: [UInt8]) -> [UInt8] {
+            varint(0) + varint(k.count) + varint(v.count) + k + v + little(0, 4) + little(1, 4)
+        }
+        let data = block(key + little(sequence << 8 | 1, 8), value)
+        let index = block([0xff], varint(0) + varint(data.count))
+        let footer = varint(0) + varint(0) + varint(data.count + 5) + varint(index.count)
+        return data + [0] + little(0, 4) + index + [0] + little(0, 4)
+            + footer + [UInt8](repeating: 0, count: 48 - footer.count)
+    }
+
+    check("snappy: literals and copies", (try? snappyDecompress([11, 8, 97, 98, 99, 2 | 7 << 2, 3, 0])) == Array("abcabcabcab".utf8))
+    check("snappy: a copy from before the start is refused", (try? snappyDecompress([4, 2 | 3 << 2, 9, 0])) == nil)
+    let round = try? V8Reader.value(Array(stored([("a", ["x", 5, true] as [Any]), ("b", 2.5), ("gone", "y")] as [(String, Any)]).dropFirst()),
+                                    skip: ["gone"]) as? [String: Any]
+    check("a stored page value reads back", (round?["a"] as? [Any])?.first as? String == "x" && (round?["a"] as? [Any])?[1] as? Double == 5
+            && round?["b"] as? Double == 2.5 && round?["gone"] == nil)
+    check("one cut short is refused", (try? V8Reader.value(Array(stored("hello").dropFirst().dropLast(2)))) == nil)
+    check("a record's key names its part", indexedDBKey(key("project:chan_1A")[...]).map { $0.part == 3 && $0.name == "project:chan_1A" } == true)
+
+    let iso = ISO8601DateFormatter()
+    func time(_ ago: TimeInterval) -> String { iso.string(from: now.addingTimeInterval(-ago)).replacingOccurrences(of: "Z", with: ".123456Z") }
+    func thread(_ id: String, _ status: String, ago: TimeInterval, body: String = "Please look into it", _ more: [(String, Any)] = []) -> [(String, Any)] {
+        [("id", "cmsg_\(id)"), ("thread_status", status), ("last_reply_at", time(ago)), ("body", body)] + more
+    }
+    func project(read ago: TimeInterval, _ rows: [[(String, Any)]]) -> [(String, Any)] {
+        // Saved just now, whenever it was fetched.
+        [("conversationUuid", "project:chan_1A"), ("writtenAt", now.timeIntervalSince1970 * 1000),
+         ("tree", [("chat", [("rows", [String](repeating: String(repeating: "long ", count: 400), count: 40) as [Any])] as [(String, Any)]),
+                   ("threadList", [("rows", rows as [Any]), ("readAt", (now.timeIntervalSince1970 - ago) * 1000)] as [(String, Any)]),
+                   ("sessions", [("overviewSessionId", "session_C0"), ("sessions", [
+                       [("id", "session_C0"), ("title", "Project coordinator (\"Website\")")] as [(String, Any)],
+                       [("id", "session_S1"), ("title", "Fix the signup form")] as [(String, Any)]] as [Any]),
+                       ("bindings", [["cmsg_run", "session_S1"] as [Any]] as [Any])] as [(String, Any)])] as [(String, Any)])]
+    }
+    let rows = [
+        thread("run", "working", ago: 60),
+        thread("ask", "needs_input", ago: 3600, body: "https://example.com/a?b=c Which plan?", [("bound_sessions", [[("id", "cse_W9")] as [(String, Any)]] as [Any])]),
+        thread("new", "idle", ago: 7200, [("has_unread", true), ("display_name", "Pick a logo")]),
+        thread("old", "idle", ago: 6 * 86400, [("has_unread", true)]),
+        thread("been", "idle", ago: 7200),
+        thread("gone", "resolved", ago: 60),
+        thread("card", "idle", ago: 60, body: "{\"kind\":\"widget\"}", [("thread_holds_only_card_presses", true)]),
+        thread("long", "idle", ago: 30 * 86400),
+    ]
+    let folder = NSTemporaryDirectory() + "limbo-projects-\(getpid())"
+    let cache = folder + "/IndexedDB/https_claude.ai_0.indexeddb"
+    let fm = FileManager.default
+    for path in [cache + ".leveldb", cache + ".blob/1/02", folder + "/Session Storage"] {
+        try? fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+    }
+    defer { try? fm.removeItem(atPath: folder) }
+    func write(_ bytes: [UInt8], _ path: String) { try? Data(bytes).write(to: URL(fileURLWithPath: path)) }
+    let visited = "[{\"kind\":\"epitaxy-thread\",\"key\":\"epitaxy-thread:chan_1A/cmsg_been\",\"title\":\"Choose a font\"},"
+        + "{\"kind\":\"code\",\"key\":\"code:local_1\",\"title\":\"Other\"}]"
+    write(log(1, [(Array("map-1-cmdk-navigation-history:x".utf8), visited.utf16.flatMap { little(UInt64($0), 2) })]),
+          folder + "/Session Storage/000001.log")
+    // An older copy in a table, the latest in the log, over several blocks.
+    write(table(3, key("project:chan_1A"), stored(project(read: 900, [thread("stale", "idle", ago: 60)]))), cache + ".leveldb/000002.ldb")
+    // Beside it, the same name in another store: its dates, no threads.
+    let dates: [UInt8] = [0, 1, 2] + key("project:chan_1A").dropFirst(3)
+    write(log(10, [(key("project:chan_1A"), stored(project(read: 60, rows))),
+                   (dates, stored([("conversationUuid", "project:chan_1A"), ("writtenAt", 1.0)] as [(String, Any)])),
+                   (key("secret-thing"), stored("never decoded"))]),
+          cache + ".leveldb/000003.log")
+    let watcher = ClaudeProjectsWatcher(storage: folder)
+    check("a project's threads are read from Claude's cache", watcher.refresh(now: now) && watcher.projects.first?.threads.count == 6)
+    var byId = Dictionary(watcher.rows(now: now).rows.map { (String($0.id.dropFirst("project:cmsg_".count)), $0) }, uniquingKeysWith: { a, _ in a })
+    check("the latest copy counts; resolved threads, cards and ones past a week are left out",
+          Set(byId.keys) == ["run", "ask", "new", "old", "been"])
+    check("a thread Claude saw working just now is running, under its session's title and its project",
+          byId["run"]?.group == .running && byId["run"]?.title == "Fix the signup form" && byId["run"]?.context == "Website")
+    check("one waiting for you needs you; its title leaves out links",
+          byId["ask"]?.group == .yourTurn && byId["ask"]?.ask == "Waiting for your answer" && byId["ask"]?.title == "Which plan?")
+    check("an unread reply is to review, under the thread's own name; an old one is done",
+          byId["new"]?.group == .review && byId["new"]?.title == "Pick a logo"
+              && byId["new"]?.detail == "New reply in Website" && byId["old"]?.group == .done)
+    check("a thread you've been to has the title Claude showed", byId["been"]?.title == "Choose a font" && byId["been"]?.group == .done)
+    check("it opens its project in Claude, and can't be tagged or snoozed",
+          byId["run"]?.source == .project && byId["run"]?.fromOtherApp == true && byId["run"]?.openLabel == "Open Project in Claude"
+              && byId["run"]?.openURL?.absoluteString == "claude://claude.ai/epitaxy/project/chan_1A"
+              && byId["run"].map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
+    check("it starts no glow", byId["run"]?.startsGlow == false && Row(id: "local_a1", group: .running, title: "t", context: "", since: now).startsGlow)
+    let refetched = (try? V8Reader.value(Array(stored(project(read: 900, rows)).dropFirst()))).flatMap(projectThreads)
+    check("a copy saved again without a new fetch is no fresher",
+          refetched?.threads.first.map { projectRow($0, project: "Website", title: "t", now: now).group } == .review)
+    check("nor is a question", refetched?.threads.first { $0.id == "cmsg_ask" }.flatMap { projectRow($0, project: "Website", title: "t", now: now).ask }
+            == "Was waiting for your answer when Claude last read Website")
+    let later = watcher.rows(now: now.addingTimeInterval(1200)).rows.first { $0.id == "project:cmsg_run" }
+    check("seen working longer ago, it's to check: neither running nor done",
+          later?.group == .review && later?.detail == "Was working when Claude last read Website")
+
+    // A session on this Mac that works for a thread.
+    let workerRow = Row(id: "local_w9", group: .running, title: "Local session (from a project)", context: "site", since: now, link: "local_w9")
+    let threads = watcher.rows(now: now)
+    let merged = mergeProjects(claude: [workerRow], threads: threads.rows, sessions: threads.sessions, workers: ["local_w9": "W9"])
+    let worker = merged.first { $0.id == "local_w9" }
+    check("a thread worked on this Mac is listed once, as its live session with the thread's title",
+          merged.count == threads.rows.count && worker?.title == "Which plan?" && worker?.context == "Website" && worker?.group == .running
+              && worker?.link == "local_w9" && !merged.contains { $0.id == "project:cmsg_ask" })
+    let named = mergeProjects(claude: [Row(id: "local_w9", group: .done, title: "Compare plans", context: "site", since: now, link: "local_w9")],
+                              threads: threads.rows, sessions: threads.sessions, workers: ["local_w9": "W9"])
+    check("a title of its own is kept", named.first { $0.id == "local_w9" }?.title == "Compare plans")
+    let deskFile = folder + "/local_w9.json"
+    write(Array("{\"sessionId\":\"local_w9\",\"title\":\"t\",\"remoteControlSpawn\":{\"ccrSessionId\":\"cse_W9\",\"projectThreadChild\":true}}".utf8), deskFile)
+    check("its record says which thread's session it is",
+          fileStamp(deskFile).flatMap { parseDeskRecord(path: deskFile, stamp: $0) }?.threadWorker == "W9")
+
+    // A project kept in a file of its own, compressed, and the list of projects.
+    let big = stored(project(read: 30, [thread("run", "idle", ago: 60)])).dropFirst()
+    let packed: [UInt8] = [0xff, 0x11, 0x02] + varint(big.count) + [UInt8(62 << 2)] + little(UInt64(big.count - 1), 3) + big
+    write(packed, cache + ".blob/1/02/201")
+    func list(_ projects: [[(String, Any)]]) -> [UInt8] {
+        stored([("clientState", [("queries", [[("state", [("data", projects as [Any])] as [(String, Any)]),
+                                               ("queryKey", ["cc-project-channels", "org"] as [Any])] as [(String, Any)]] as [Any])] as [(String, Any)])] as [(String, Any)])
+    }
+    write(log(20, [(key("project:chan_1A"), [7, 0xff, 0x11, 0x01, 0, 0]), (key("project:chan_1A", part: 3), [0] + varint(0x201)),
+                   (key("react-query-cache"), list([[("id", "chan_1A"), ("name", "New website")]]))]),
+          cache + ".leveldb/000004.log")
+    check("no more than every 10 seconds", !watcher.refresh(now: now.addingTimeInterval(5)))
+    check("a change is read", watcher.refresh(now: now.addingTimeInterval(11)))
+    byId = Dictionary(watcher.rows(now: now).rows.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    check("a project kept in a file of its own is read, under the name in your list",
+          byId.count == 1 && byId["project:cmsg_run"]?.group == .done && byId["project:cmsg_run"]?.context == "New website")
+    write(log(30, [(key("react-query-cache"), list([[("id", "chan_1A"), ("name", "New website"), ("archived_at", "2026-01-01T00:00:00Z")]]))]),
+          cache + ".leveldb/000005.log")
+    check("an archived project's threads go", !watcher.refresh(now: now.addingTimeInterval(30)) && watcher.rows(now: now).rows.isEmpty)
+    write(log(40, [(key("project:chan_1A"), nil)]), cache + ".leveldb/000008.log")
+    let dropped = ClaudeProjectsWatcher(storage: folder)
+    dropped.refresh(now: now)
+    check("a project the app dropped goes, though its dates stay", dropped.projects.isEmpty)
+    try? fm.removeItem(atPath: cache + ".leveldb/000008.log")
+    write([1, 2, 3], cache + ".leveldb/000006.log")
+    write([UInt8](repeating: 7, count: 100), cache + ".leveldb/000007.ldb")
+    watcher.refresh(now: now.addingTimeInterval(60))
+    check("files that can't be read are left out", watcher.projects.count == 1)
+    watcher.clear()
+    check("no panel shows: the threads are dropped", watcher.projects.isEmpty)
+}
+
 /// Checks the glow decision, the "needs you" freshness rule, the quiet rule and
 /// the agent-file check. Exits 1 if any fails.
 func runSelfTest() {
@@ -9109,6 +9996,9 @@ func runSelfTest() {
               && herdrRow?.source == .claude && herdrRow?.terminal == true && !SessionTags.taggable(herdrRow!))
     check("one in another terminal still can't be opened",
           classify(desk: [], live: [4343: termLive], now: now).first?.link == nil)
+
+    // Claude project threads.
+    runProjectChecks(check, now: now)
 
     // Links in a reply: only web links stay links.
     func links(_ s: String) -> [String] {
@@ -10145,6 +11035,21 @@ if arguments.contains("--orca-bench") {
 }
 if arguments.contains("--antigravity-bench") {
     runAppBench(AppThreadsWatcher.antigravity(), name: "Antigravity")
+    exit(0)
+}
+if arguments.contains("--project-bench") {
+    for (name, again) in [("everything decoded", true), ("nothing of it changed", false)] {
+        var watcher = ClaudeProjectsWatcher()
+        if !again { watcher.refresh() }
+        for _ in 0..<5 {
+            if again { watcher = ClaudeProjectsWatcher() } else { watcher.clear() }
+            let start = DispatchTime.now().uptimeNanoseconds
+            watcher.refresh()
+            let count = watcher.rows(now: Date()).rows.count
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            print(String(format: "%@: %.1f ms, %d threads", name, ms, count))
+        }
+    }
     exit(0)
 }
 if arguments.contains("--dump") {

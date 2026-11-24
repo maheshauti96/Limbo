@@ -48,6 +48,7 @@ A stable signing identity keeps macOS's Accessibility permission (used by Answer
 | **Cursor threads** | Cursor's agent threads, running, waiting on you, or finished, beside Claude's sessions. |
 | **Antigravity conversations** | Antigravity's agent conversations, running or finished, beside Claude's sessions. |
 | **Orca threads** | The agent threads open in Orca (Claude, Codex, Antigravity…), running or finished, beside Claude's sessions. |
+| **Claude project threads** | The threads of your Claude projects, as of when Claude last read them, beside Claude's sessions. |
 | **Tags** | On hold, Awaiting manual review, or your own; four tag styles. |
 | **Snooze** | Put a session away for an hour, three hours or until tomorrow morning; it comes back by itself. |
 | **Hide** | Put any app's session or thread away until it next updates: it runs again or ends a new turn. |
@@ -158,6 +159,16 @@ The agent threads open in Orca's tabs show, led by their agent's icon (Claude's,
 - A thread waiting for your approval shows as running: Orca's record doesn't say so.
 - They can't be tagged or snoozed, but they can be [hidden](#hide).
 
+#### Claude project threads
+
+The threads of your Claude projects from the last week show beside Claude's sessions, under their project's name: waiting for your answer, to review (an unread reply from the last 3 days), or finished. Threads you resolved are left out, and so are the cards a project posts about a decision. Click one to open its project in Claude: the app's links can't name one thread of a project.
+
+- **Their state is as of the last time the Claude app read the project.** Project threads run on claude.ai, not on this Mac, and the app keeps what it read of a project when you open it. A thread seen working in the last 10 minutes shows as running; seen working longer ago it goes to review, "Was working when Claude last read Website" (its project), since it may have finished. A question seen longer ago says it's as of then too. Open the project in Claude to bring it up to date. A project never opened on this Mac doesn't show.
+- So they start no glow and end none, and the menu bar's counts leave them out.
+- A thread whose work runs in a session on this Mac is listed once, as that session (its state is live), under the project's name, with the thread's title in place of "Local session (from a project)".
+- A thread's title is its own, or its session's; else the one Claude showed when you went to it; else what its first message says.
+- They are read only while the keep-on-top window or the menu bar panel shows. They can't be tagged or snoozed, but they can be [hidden](#hide).
+
 #### Claude sessions in Herdr
 
 A Claude session started in a Herdr terminal is Claude's own terminal session, with the title Claude Code gave it. Click it to switch to Herdr with that session's terminal shown.
@@ -253,6 +264,7 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 - Cursor's agent threads, only while the panel or the window is showing and Cursor is running: a stat every 2 s of Cursor's state database (`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`) and its write-ahead log, and, only when one of them changed (about every 15 s while Cursor works), one indexed query on its small list of threads (`composerHeaders`: name, folder, the line Cursor shows under it, whether a run is going or waits for approval). The database is opened read-only and closed straight after each query, so no read is left open while Cursor writes. Conversations themselves are never read. It looks for Cursor every 10 s while it isn't running, and every 30 s otherwise. On this Mac a tick with nothing new takes about 0.004 ms and a read of the list about 0.2 ms (`--cursor-bench`).
 - Antigravity's agent conversations, only while the panel or the window is showing and Antigravity is running: a stat every 2 s of its list of conversations (`~/.gemini/antigravity/conversation_summaries.db`) and that database's write-ahead log, and, only when one of them changed, one query on it (title, folder, run status, when it last changed and when you last wrote). It's opened read-only and closed straight after; when Antigravity has the database closed, its log is gone and the file itself is current, so it's read then as a snapshot that takes no lock. Conversations themselves are never read. On this Mac a tick with nothing new takes about 0.003 ms and a read about 0.3 ms (`--antigravity-bench`).
 - Orca's threads, only while the panel or the window is showing and Orca is running: a stat every 2 s of Orca's session database (`~/Library/Application Support/orca/agent-session-domain.db`) and its write-ahead log, and, only when one of them changed, one query for the threads open in its tabs (agent, name, folder, the last turn's state and outcome, the last activity, the agent's own id for it), plus its worktree names. It's opened read-only and closed straight after. Conversations themselves are never read. On this Mac a tick with nothing new takes about 0.004 ms and a read about 0.7 ms (`--orca-bench`); while an Orca agent is busy its database changes about every tick, so that's a read every 2 s, under 0.04% of a core.
+- Claude project threads, only while the panel or the window is showing: a stat every 2 s of the few files of the Claude app's web cache (`IndexedDB/https_claude.ai_0.indexeddb.leveldb` in `~/Library/Application Support/Claude`), read when they changed, at most every 10 s, without a lock. Only the records of your projects and the app's list of them are decoded, each only when the app wrote it again, and of a project only its list of threads: the messages are passed over. A thread with no title there gets the one in the app's list of places you've been (`Session Storage`). The list of projects is one entry in the app's saved queries, which also hold your account's details; only the projects' names are kept. It's an undocumented format that an update of the app could change; then project threads just don't show. On this Mac decoding all of it takes about 20 ms, and a read where none of it changed about 1 ms (`--project-bench`); while you use the Claude app it rewrites its saved queries every minute or two.
 - Terminal sessions Herdr runs: each one's parents in the process table, once per session. On a click, Herdr's own command-line tools (`herdr-core ls` and `get`, `Herdr do agent.focus`), each answering in a few milliseconds.
 - It never opens the `*.key` files, and never changes Claude's, ChatGPT's, Cursor's, Antigravity's or Orca's files.
 
@@ -296,12 +308,13 @@ limbo-tasks --snapshot out.png --floating --hover-row local_s8 [--hint]   # a ro
 limbo-tasks --glow-cycle 16                         # Random in an offscreen window: effect each second, then CPU used
 limbo-tasks --gesture-check                         # chips, cards, replies, snooze, the New Tag box, close, pill, layouts (off screen)
 limbo-tasks --resize-check                          # dragging the edges, and never becoming the front app
-limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks, ChatGPT, Cursor, Antigravity and Orca threads
+limbo-tasks --self-test                             # states, tags, snoozes, glow decisions, cards, answers, background tasks, ChatGPT, Cursor, Antigravity, Orca and Claude project threads
 limbo-tasks --bench-panel 20 [--fresh] [--real]     # memory across panel open/close cycles
 limbo-tasks --codex-bench                           # what reading ChatGPT's threads costs, on this Mac's open threads
 limbo-tasks --cursor-bench                          # what reading Cursor's threads costs, on this Mac's Cursor
 limbo-tasks --antigravity-bench                     # what reading Antigravity's conversations costs, on this Mac
 limbo-tasks --orca-bench                            # what reading Orca's threads costs, on this Mac
+limbo-tasks --project-bench                         # what reading Claude's project threads costs, on this Mac
 kill -USR1 $(pgrep -x limbo-tasks)                  # counts only -> ~/Library/Caches/com.maheshauti.limbo-tasks.stats.json,
                                                     # a picture of the menu bar button -> ...limbo-tasks.menubar.png,
                                                     # and the glow's state (effect, active, animating, size) -> ...limbo-tasks.glow.json
