@@ -11,10 +11,15 @@
 //       it needs from you.
 //   ~/.claude/projects/<folder>/<session>.jsonl
 //       Transcripts: only their last 256 KB, and only while the panel or the
-//       keep-on-top window shows. What a running session is doing now, and how a
-//       finished one's latest turn ended (its question, buttons and reply).
+//       keep-on-top window shows. What a running session is doing now, how a
+//       finished one's latest turn ended (its question, buttons and reply), and
+//       the title of one started in a terminal.
 // Never opened: the *.key files beside the live records, and every other file
 // in those folders (waiting-input/, backlog/, deleted_*, ...).
+//
+// For sessions started in a terminal, the process table (parents and their
+// executables) tells whether Herdr runs them; a click on one runs Herdr's own
+// command-line tools to show its terminal (herdr-core ls/get, Herdr do agent.focus).
 //
 // Writes nothing to those files. With "Answer from Cards" on (off by default), a
 // card's button presses the same button in the Claude app through macOS
@@ -156,6 +161,11 @@ struct LiveRecord: Equatable {
     let hostId: String?         // desktop session id; nil for sessions started in a terminal
     let cwd: String
     let cliSessionId: String?   // names the transcript file
+    /// The name is one Claude Code made up from the folder (like "myapp-3f"),
+    /// not one you gave it: the transcript's title is better.
+    var nameIsDerived = false
+    /// Started in a terminal Herdr runs: a click shows it there.
+    var inHerdr = false
     var isBusy: Bool { status == "busy" || status == "shell" }
     var isWaiting: Bool { status == "waiting" }
 }
@@ -347,6 +357,7 @@ func readLiveRecords(exited: Set<String>) -> (records: [Int32: LiveRecord], pres
         if !isSameProcess(pid: pid, recordStartedMs: startedMs) { continue }
         let cwd = o["cwd"] as? String ?? ""
         var title = plainLine(o["name"] as? String, max: 160) ?? ""
+        let derived = title.isEmpty || (o["nameSource"] as? String) == "derived"
         if title.isEmpty { title = (cwd as NSString).lastPathComponent }
         if title.isEmpty { title = "Session \(pid)" }
         let statusMs = (o["statusUpdatedAt"] as? Double) ?? (o["updatedAt"] as? Double) ?? startedMs
@@ -360,7 +371,8 @@ func readLiveRecords(exited: Set<String>) -> (records: [Int32: LiveRecord], pres
             hostId: host, cwd: cwd,
             cliSessionId: (o["sessionId"] as? String).flatMap { id in
                 id.allSatisfy { isASCIIAlnum($0) || $0 == "-" } && !id.isEmpty && id.count <= 64 ? id : nil
-            })
+            },
+            nameIsDerived: derived)
     }
     return (records, present)
 }
@@ -410,6 +422,27 @@ func describeTool(_ name: String, _ input: [String: Any]) -> String? {
         else { label = server.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ") }
         return "\(label): \(tool)"
     }
+}
+
+/// The title Claude Code gave a session (the one terminal tabs show), from the
+/// last 256 KB of its transcript. It writes it again every so often, so the
+/// latest one is near the end.
+func transcriptTitle(path: String) -> String? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+    guard let size = try? handle.seekToEnd() else { return nil }
+    let window: UInt64 = 256 * 1024
+    let start = size > window ? size - window : 0
+    try? handle.seek(toOffset: start)
+    guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
+    let marker = Array(#"{"type":"ai-title""#.utf8)
+    for raw in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true).reversed()
+    where raw.starts(with: marker) {
+        guard let o = (try? JSONSerialization.jsonObject(with: Data(raw))) as? [String: Any],
+              let title = plainLine(o["aiTitle"] as? String, max: 160) else { continue }
+        return title
+    }
+    return nil
 }
 
 /// What a running session is doing, read from the last 256 KB of its transcript.
@@ -825,7 +858,7 @@ let dataWindow: TimeInterval = 8 * 86400
 ///  7. terminal session (no desktop id), idle          -> Terminal
 func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
               activities: [Int32: Activity] = [:], cards: [String: TurnCard] = [:],
-              background: [Int32: Int] = [:]) -> [Row] {
+              background: [Int32: Int] = [:], titles: [Int32: String] = [:]) -> [Row] {
     var bySession: [String: DeskRecord] = [:]
     for d in desk {
         // The same session can sit under several account folders; keep the newest copy.
@@ -930,9 +963,10 @@ func classify(desk: [DeskRecord], live: [Int32: LiveRecord], now: Date,
     for l in terminalLive {
         let tasks = l.isBusy || l.isWaiting ? nil : background[l.pid]
         let group: Group = l.isBusy || tasks != nil ? .running : (l.isWaiting ? .yourTurn : .terminal)
-        rows.append(Row(id: "pid:\(l.pid)", group: group, title: l.name,
+        rows.append(Row(id: "pid:\(l.pid)", group: group, title: titles[l.pid] ?? l.name,
                         ask: l.isWaiting ? (l.waitingFor ?? "Waiting for your input") : nil,
-                        context: folderLabel(l.cwd), since: l.statusSince, terminal: true,
+                        context: folderLabel(l.cwd), since: l.statusSince,
+                        link: l.inHerdr ? herdrLinkPrefix + "\(l.pid)" : nil, terminal: true,
                         activity: l.isBusy ? activities[l.pid]?.text : tasks.map(backgroundPhrase),
                         lastOutput: l.isBusy ? activities[l.pid]?.lastOutput : nil))
     }
@@ -1412,7 +1446,7 @@ func codexRow(id: String, name: String?, cwd: String?, scan: RolloutScan) -> Row
 }
 
 /// The app a row's session or thread is in.
-enum RowSource { case claude, chatGPT, cursor, antigravity, orca }
+enum RowSource { case claude, chatGPT, cursor, antigravity, orca, herdr }
 
 extension Row {
     var source: RowSource {
@@ -1436,6 +1470,7 @@ extension Row {
         if link.hasPrefix(cursorLinkPrefix) { return .cursor }
         if link.hasPrefix(antigravityLinkPrefix) { return .antigravity }
         if link.hasPrefix(orcaLinkPrefix) { return .orca }
+        if link.hasPrefix(herdrLinkPrefix) { return .herdr }
         return nil
     }
 
@@ -1449,7 +1484,8 @@ extension Row {
         switch app {
         case .claude: return URL(string: "claude://claude.ai/epitaxy/\(link)")
         case .chatGPT: return URL(string: link)
-        case .cursor, .antigravity, .orca: return NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleId)
+        case .cursor, .antigravity, .orca, .herdr:
+            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleId)
         }
     }
 
@@ -1460,8 +1496,9 @@ extension Row {
     /// Antigravity's…), else the app's it's in.
     var iconSource: RowSource { agent ?? source }
 
-    /// The app comes forward, not the thread: Cursor, Antigravity and Orca.
-    var opensAppOnly: Bool { [.cursor, .antigravity, .orca].contains(linkApp ?? source) }
+    /// The app comes forward, not the thread: Cursor, Antigravity and Orca
+    /// (and Herdr, with the session's terminal shown).
+    var opensAppOnly: Bool { [.cursor, .antigravity, .orca, .herdr].contains(linkApp ?? source) }
 
     /// What a click does, for menus: "Open in Claude", or "Switch to Orca".
     var openLabel: String {
@@ -1486,6 +1523,7 @@ extension RowSource {
         case .cursor: return "Cursor"
         case .antigravity: return "Antigravity"
         case .orca: return "Orca"
+        case .herdr: return "Herdr"
         }
     }
 
@@ -1497,6 +1535,7 @@ extension RowSource {
         case .cursor: return cursorBundleId
         case .antigravity: return antigravityBundleId
         case .orca: return orcaBundleId
+        case .herdr: return herdrBundleId
         }
     }
 }
@@ -1519,6 +1558,114 @@ func appIcon(_ source: RowSource) -> NSImage? {
 func executablePath(_ pid: pid_t) -> String {
     var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
     return proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 ? String(cString: buffer) : ""
+}
+
+/// A process's parent, or nil for launchd or a process that's gone.
+func parentPid(_ pid: pid_t) -> pid_t? {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+    let parent = info.kp_eproc.e_ppid
+    return parent > 1 ? parent : nil
+}
+
+// MARK: - Herdr
+
+/// Herdr, a terminal app. A Claude session started in one of its terminals is
+/// Claude's own terminal session; a click shows that terminal in Herdr.
+let herdrBundleId = "dev.herdr.app"
+/// A terminal session Herdr runs: "herdr-pid:<pid>". Not openable as is (see Row.openURL).
+let herdrLinkPrefix = "herdr-pid:"
+
+/// The herdr-core process (Herdr's terminal server) a session runs under:
+/// its executable, and the session's process with its ancestors below it,
+/// nearest first. nil if Herdr doesn't run it. Process-table reads only.
+func herdrCore(running pid: pid_t, parent: (pid_t) -> pid_t? = parentPid,
+               path: (pid_t) -> String = executablePath) -> (core: String, chain: [pid_t])? {
+    var chain: [pid_t] = []
+    var next: pid_t? = pid
+    while let current = next, chain.count < 16 {
+        let exe = path(current)
+        if (exe as NSString).lastPathComponent == "herdr-core" { return (exe, chain) }
+        chain.append(current)
+        next = parent(current)
+    }
+    return nil
+}
+
+/// A Herdr terminal's address, like "t7".
+func isHerdrAddress(_ s: String) -> Bool {
+    !s.isEmpty && s.count <= 64 && s.allSatisfy { isASCIIAlnum($0) || "/-_.".contains($0) }
+}
+
+/// Whether a terminal, as `herdr-core get --json` describes it, runs the
+/// session whose process chain this is: its shell or the program in front.
+func herdrTerminalRuns(_ terminal: [String: Any], chain: [pid_t]) -> Bool {
+    let pids = Set(chain.map(Int.init))
+    let front = (terminal["foreground"] as? [String: Any])?["pid"] as? Int
+    return [terminal["pid"] as? Int, front].contains { $0.map(pids.contains) ?? false }
+}
+
+enum Herdr {
+    static var appURL: URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: herdrBundleId) }
+
+    /// Shows a session's terminal in Herdr's window, then brings Herdr
+    /// forward. Runs Herdr's own command-line tools, which answer in a few
+    /// milliseconds and change only what its window shows. If they can't
+    /// find the terminal, Herdr just comes forward.
+    static func show(pid: pid_t) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let found = herdrCore(running: pid), let address = terminal(core: found.core, chain: found.chain),
+               let app = appURL, let cli = Bundle(url: app)?.executableURL {
+                _ = run(cli.path, ["do", "agent.focus", "--terminal", address])
+            }
+            DispatchQueue.main.async { if let app = appURL { NSWorkspace.shared.open(app) } }
+        }
+    }
+
+    /// The address of the terminal running the session, asked of herdr-core.
+    static func terminal(core: String, chain: [pid_t]) -> String? {
+        guard let data = run(core, ["ls", "--json"]),
+              let list = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["terminals"] as? [[String: Any]]
+        else { return nil }
+        for item in list {
+            guard let address = item["address"] as? String, isHerdrAddress(address),
+                  let data = run(core, ["get", address, "--json"]),
+                  let terminal = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  herdrTerminalRuns(terminal, chain: chain)
+            else { continue }
+            return address
+        }
+        return nil
+    }
+
+    /// A command's output, nil if it fails or takes over 3 s.
+    private static func run(_ path: String, _ arguments: [String]) -> Data? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { if process.isRunning { process.terminate() } }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return process.terminationStatus == 0 ? data : nil
+    }
+}
+
+/// Opens a row where it lives: the session in Claude, the thread in ChatGPT,
+/// the app for Cursor, Antigravity and Orca, the terminal in Herdr.
+func openRow(_ row: Row) {
+    if row.linkApp == .herdr, let link = row.link, let pid = pid_t(link.dropFirst(herdrLinkPrefix.count)) {
+        Herdr.show(pid: pid)
+        return
+    }
+    guard let url = row.openURL else { return }
+    NSWorkspace.shared.open(url)
 }
 
 /// Reads the ChatGPT app's Codex threads, on the engine's queue, on the
@@ -2289,6 +2436,9 @@ final class SessionEngine {
     /// Each recent finished session's turn card, by transcript path: read only
     /// while the window or panel shows, and again only when the transcript changes.
     private var cardCache: [String: (stamp: FileStamp, card: TurnCard?)] = [:]
+    private var titleCache: [String: (size: Int64, title: String?, read: Date)] = [:]
+    /// Whether Herdr runs each terminal session, by live record key: a process's ancestors don't change.
+    private var herdrHosted: [String: Bool] = [:]
     private var cardReads = 0
     /// A record is written about 2 s after its transcript ends, which triggers a
     /// look; this also looks every 30 s in case a transcript ends later.
@@ -2336,7 +2486,8 @@ final class SessionEngine {
             engine.antigravity.refresh()
             engine.orca.refresh()
             let claude = classify(desk: engine.desk.values.compactMap(\.record), live: engine.live, now: Date(),
-                                  activities: activities, cards: engine.currentCards(), background: engine.backgroundWork())
+                                  activities: activities, cards: engine.currentCards(), background: engine.backgroundWork(),
+                                  titles: engine.terminalTitles())
             return engine.withOtherApps(claude)
         }
     }
@@ -2345,6 +2496,13 @@ final class SessionEngine {
         let result = readLiveRecords(exited: exited)
         live = result.records
         exited.formIntersection(result.present)
+        for (pid, record) in live where record.hostId == nil {
+            let hosted = herdrHosted[record.key] ?? (herdrCore(running: pid) != nil)
+            herdrHosted[record.key] = hosted
+            live[pid]?.inHerdr = hosted
+        }
+        let keys = Set(live.values.map(\.key))
+        herdrHosted = herdrHosted.filter { keys.contains($0.key) }
         for (pid, source) in exitSources where live[pid] == nil {
             source.cancel()
             exitSources[pid] = nil
@@ -2433,6 +2591,32 @@ final class SessionEngine {
             if tasks > 0 { work[pid] = tasks }
         }
         return work
+    }
+
+    /// Titles of terminal sessions whose name Claude Code made up from the folder,
+    /// by process id. A stat per session; a transcript that grew is read again
+    /// at most every 10 s until it has a title, then every minute.
+    private func terminalTitles() -> [Int32: String] {
+        guard activityWanted else { return [:] }
+        let now = Date()
+        var titles: [Int32: String] = [:]
+        var kept = Set<String>()
+        for (pid, record) in live where record.hostId == nil && record.nameIsDerived {
+            guard let id = record.cliSessionId else { continue }
+            let path = transcriptPath(cwd: record.cwd, cliSessionId: id)
+            kept.insert(path)
+            guard let size = fileStamp(path)?.size else { continue }
+            var entry = titleCache[path]
+            if entry == nil || entry!.size != size
+                && now.timeIntervalSince(entry!.read) >= (entry!.title == nil ? 10 : 60) {
+                let found = autoreleasepool { transcriptTitle(path: path) }
+                entry = (size, found ?? entry?.title, now)
+                titleCache[path] = entry
+            }
+            if let title = entry?.title { titles[pid] = title }
+        }
+        for path in Array(titleCache.keys) where !kept.contains(path) { titleCache[path] = nil }
+        return titles
     }
 
     /// The turn cards of recent sessions that are not running, by session id.
@@ -2542,7 +2726,7 @@ final class SessionEngine {
 
     private func publishIfChanged() {
         let claude = classify(desk: desk.values.compactMap(\.record), live: live, now: Date(), activities: activities,
-                              cards: currentCards(), background: backgroundWork())
+                              cards: currentCards(), background: backgroundWork(), titles: terminalTitles())
         let rows = withOtherApps(claude)
         guard rows != lastRows else { return }
         lastRows = rows
@@ -4091,10 +4275,10 @@ final class PanelController: NSObject, NSPopoverDelegate {
     }
 
     private func open(_ row: Row) {
-        guard let url = row.openURL else { return }
+        guard row.openURL != nil else { return }
         popover?.performClose(nil)
         model.markOpened(row)
-        NSWorkspace.shared.open(url)
+        openRow(row)
     }
 }
 
@@ -7410,9 +7594,9 @@ final class FloatingController {
     private func makePanel() -> KeepOnTopPanel {
         let view = FloatingView(model: model,
                                 open: { [weak self] row in
-                                    guard let url = row.openURL else { return }
+                                    guard row.openURL != nil else { return }
                                     self?.model.markOpened(row)
-                                    NSWorkspace.shared.open(url)
+                                    openRow(row)
                                 },
                                 unpin: { [weak self] in self?.hide() },
                                 refit: { [weak self] in self?.fitToContent() },
@@ -8879,6 +9063,53 @@ func runSelfTest() {
     check("opened only before the turn ended: still ready for review",
           classify(desk: [openedDesk], live: [4242: idleLive], now: now).first?.group == .review)
 
+    // Terminal sessions: Claude Code names them after the folder ("myapp-3f")
+    // and keeps the real title in the transcript.
+    let titleFile = NSTemporaryDirectory() + "limbo-title-\(getpid()).jsonl"
+    let titleLines = [
+        #"{"type":"ai-title","aiTitle":"First topic","sessionId":"s"}"#,
+        #"{"parentUuid":"p","type":"user","message":{"role":"user","content":"mentions {\"type\":\"ai-title\"} inline"}}"#,
+        #"{"type":"ai-title","aiTitle":"GitHub bot user audit","sessionId":"s"}"#,
+        #"{"parentUuid":"p","type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}"#,
+    ]
+    try? (titleLines.joined(separator: "\n") + "\n").write(toFile: titleFile, atomically: true, encoding: .utf8)
+    check("a transcript's latest title is read", transcriptTitle(path: titleFile) == "GitHub bot user audit")
+    try? (titleLines[3] + "\n").write(toFile: titleFile, atomically: true, encoding: .utf8)
+    check("a transcript without a title has none", transcriptTitle(path: titleFile) == nil)
+    try? FileManager.default.removeItem(atPath: titleFile)
+    let termLive = LiveRecord(pid: 4343, key: "4343:1", name: "myapp-3f", status: "busy", waitingFor: nil,
+                              started: now.addingTimeInterval(-600), statusSince: now.addingTimeInterval(-60),
+                              hostId: nil, cwd: "/tmp/documents", cliSessionId: "c2", nameIsDerived: true)
+    check("a terminal session shows its title",
+          classify(desk: [], live: [4343: termLive], now: now, titles: [4343: "GitHub bot user audit"]).first?.title
+              == "GitHub bot user audit")
+    check("without one, its name",
+          classify(desk: [], live: [4343: termLive], now: now).first?.title == "myapp-3f")
+
+    // Herdr: a terminal session under herdr-core opens there.
+    let tree: [pid_t: pid_t] = [100: 90, 90: 80, 80: 1, 200: 190, 190: 1]
+    let exes: [pid_t: String] = [100: "/usr/local/bin/claude", 90: "/bin/zsh",
+                                 80: "/Applications/Example/Herdr Core.app/Contents/MacOS/herdr-core",
+                                 200: "/usr/local/bin/claude", 190: "/bin/zsh"]
+    let hosted = herdrCore(running: 100, parent: { tree[$0] }, path: { exes[$0] ?? "" })
+    check("a session under herdr-core is in Herdr, with its chain below the core",
+          hosted?.core.hasSuffix("/herdr-core") == true && hosted?.chain == [100, 90])
+    check("one under a plain terminal isn't", herdrCore(running: 200, parent: { tree[$0] }, path: { exes[$0] ?? "" }) == nil)
+    check("Herdr's terminal is found by its shell or the program in front",
+          herdrTerminalRuns(["pid": 90, "foreground": ["pid": 100]], chain: [100, 90])
+              && herdrTerminalRuns(["pid": 55, "foreground": ["pid": 100]], chain: [100, 90])
+              && !herdrTerminalRuns(["pid": 70, "foreground": ["pid": 71]], chain: [100, 90]))
+    check("only plain terminal addresses are passed to Herdr",
+          isHerdrAddress("t7") && isHerdrAddress("box/t7") && !isHerdrAddress("t1 --x") && !isHerdrAddress(""))
+    var herdrLive = termLive
+    herdrLive.inHerdr = true
+    let herdrRow = classify(desk: [], live: [4343: herdrLive], now: now).first
+    check("a session Herdr runs switches to Herdr",
+          herdrRow?.link == "herdr-pid:4343" && herdrRow?.linkApp == .herdr && herdrRow?.openLabel == "Switch to Herdr"
+              && herdrRow?.source == .claude && herdrRow?.terminal == true && !SessionTags.taggable(herdrRow!))
+    check("one in another terminal still can't be opened",
+          classify(desk: [], live: [4343: termLive], now: now).first?.link == nil)
+
     // Links in a reply: only web links stay links.
     func links(_ s: String) -> [String] {
         ResponseDrawer.markdown(cleanReply([s]) ?? "").runs.compactMap { $0.link?.absoluteString }
@@ -9919,6 +10150,17 @@ if arguments.contains("--antigravity-bench") {
 if arguments.contains("--dump") {
     runDump()
     exit(0)
+}
+if let id = argument(after: "--open") {
+    // Opens one row the way a click does: pid:<pid> for a terminal session, local_<id> for a desktop one.
+    guard let row = SessionEngine.scanOnce().first(where: { $0.id == id }), row.openURL != nil else {
+        print("no openable row \(id)")
+        exit(1)
+    }
+    print("\(row.openLabel): \(row.id)")
+    openRow(row)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(0) }
+    RunLoop.main.run()
 }
 if let cycles = argument(after: "--bench-panel").flatMap(Int.init) {
     runPanelBench(cycles: cycles, reuse: !arguments.contains("--fresh"), real: arguments.contains("--real"),

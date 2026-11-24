@@ -158,6 +158,13 @@ The agent threads open in Orca's tabs show, led by their agent's icon (Claude's,
 - A thread waiting for your approval shows as running: Orca's record doesn't say so.
 - They can't be tagged or snoozed, but they can be [hidden](#hide).
 
+#### Claude sessions in Herdr
+
+A Claude session started in a Herdr terminal is Claude's own terminal session, with the title Claude Code gave it. Click it to switch to Herdr with that session's terminal shown.
+
+- Limbo tells which sessions Herdr runs from the process table: Herdr's terminal server (`herdr-core`) is a parent.
+- On a click it asks Herdr's own command-line tools which terminal it is (`herdr-core ls` and `get`), shows it (`Herdr do agent.focus`), and brings Herdr forward. If they can't find it, Herdr just comes forward.
+
 #### Snooze
 
 Snooze a Claude session that isn't running (it needs you, is ready for review, or finished) when you don't want to deal with it yet: **For 1 Hour**, **For 3 Hours** or **Until Tomorrow Morning** (9:00). Pick it from the session's right-click menu, anywhere it shows, or from the **Snooze 1h 3h Tomorrow** buttons under a card in the strip, the bar and the dots.
@@ -231,9 +238,9 @@ Panel groups, first rule that matches wins:
 | Snoozed | You snoozed it, and its time hasn't come and it hasn't moved on since (and it is not running). |
 | On hold | You tagged it On hold (and it is not running). |
 | Done | Anything else from the last 7 days, collapsed. |
-| In a terminal | Idle sessions started in a terminal. They have no summary, so they never count as your turn. Collapsed. |
+| In a terminal | Idle sessions started in a terminal (including ones a terminal app like Herdr runs). They have no summary, so they never count as your turn. Collapsed. Each shows the title Claude Code gave it, as a terminal tab does, rather than the folder-based name it starts with. One Herdr runs opens in Herdr; others can't be opened from here. |
 
-Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude://claude.ai/epitaxy/<id>`); terminal sessions can't be opened from here. **Not detectable:** a permission prompt in the middle of a turn. No file on disk records it, so that session shows as Running.
+Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude://claude.ai/epitaxy/<id>`); terminal sessions can't be opened from here, except ones [Herdr](#claude-sessions-in-herdr) runs. **Not detectable:** a permission prompt in the middle of a turn. No file on disk records it, so that session shows as Running.
 
 #### What it reads
 
@@ -246,6 +253,7 @@ Archived sessions are hidden. Clicking a row opens it in the Claude app (`claude
 - Cursor's agent threads, only while the panel or the window is showing and Cursor is running: a stat every 2 s of Cursor's state database (`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`) and its write-ahead log, and, only when one of them changed (about every 15 s while Cursor works), one indexed query on its small list of threads (`composerHeaders`: name, folder, the line Cursor shows under it, whether a run is going or waits for approval). The database is opened read-only and closed straight after each query, so no read is left open while Cursor writes. Conversations themselves are never read. It looks for Cursor every 10 s while it isn't running, and every 30 s otherwise. On this Mac a tick with nothing new takes about 0.004 ms and a read of the list about 0.2 ms (`--cursor-bench`).
 - Antigravity's agent conversations, only while the panel or the window is showing and Antigravity is running: a stat every 2 s of its list of conversations (`~/.gemini/antigravity/conversation_summaries.db`) and that database's write-ahead log, and, only when one of them changed, one query on it (title, folder, run status, when it last changed and when you last wrote). It's opened read-only and closed straight after; when Antigravity has the database closed, its log is gone and the file itself is current, so it's read then as a snapshot that takes no lock. Conversations themselves are never read. On this Mac a tick with nothing new takes about 0.003 ms and a read about 0.3 ms (`--antigravity-bench`).
 - Orca's threads, only while the panel or the window is showing and Orca is running: a stat every 2 s of Orca's session database (`~/Library/Application Support/orca/agent-session-domain.db`) and its write-ahead log, and, only when one of them changed, one query for the threads open in its tabs (agent, name, folder, the last turn's state and outcome, the last activity, the agent's own id for it), plus its worktree names. It's opened read-only and closed straight after. Conversations themselves are never read. On this Mac a tick with nothing new takes about 0.004 ms and a read about 0.7 ms (`--orca-bench`); while an Orca agent is busy its database changes about every tick, so that's a read every 2 s, under 0.04% of a core.
+- Terminal sessions Herdr runs: each one's parents in the process table, once per session. On a click, Herdr's own command-line tools (`herdr-core ls` and `get`, `Herdr do agent.focus`), each answering in a few milliseconds.
 - It never opens the `*.key` files, and never changes Claude's, ChatGPT's, Cursor's, Antigravity's or Orca's files.
 
 Limbo's own settings (tags, glow, tag style, window size and place, time range) are in its defaults domain, `com.maheshauti.limbo-tasks`; tags are kept by session id under `sessionTags`, snoozes under `sessionSnoozes`, hides under `sessionHides`.
@@ -276,6 +284,7 @@ The window is a non-activating panel that can never become the key window, so it
 
 ```bash
 limbo-tasks --dump                                  # group, age and title per row, plus counts
+limbo-tasks --open pid:<pid>                        # open one row as a click does (local_<id> for a desktop session)
 limbo-tasks --snapshot out.png [--dark] [--sample [--sample-apps]] [--expand] [--rows N]   # --sample-apps: made-up sessions from every app
 limbo-tasks --snapshot out.png --floating [--glow calm|aurora|ember|corners|tide|rise|heartbeat] [--tint red|orange|rose|green] [--phase 1.5]
 limbo-tasks --snapshot out.png --floating --attention | --flash | --done [--phase 0.7]   # amber, green flash, all finished
