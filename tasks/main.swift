@@ -1700,6 +1700,24 @@ func openRow(_ row: Row) {
     NSWorkspace.shared.open(url)
 }
 
+/// The files a process holds open, of those `keep` wants.
+func heldFiles(_ pid: pid_t, where keep: (String) -> Bool) -> Set<String> {
+    let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+    guard bytes > 0 else { return [] }
+    var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride)
+    let got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, bytes)
+    guard got > 0 else { return [] }
+    var paths = Set<String>()
+    for fd in fds.prefix(Int(got) / MemoryLayout<proc_fdinfo>.stride) where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
+        var info = vnode_fdinfowithpath()
+        let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+        guard proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size) == size else { continue }
+        let path = withUnsafeBytes(of: &info.pvip.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        if keep(path) { paths.insert(path) }
+    }
+    return paths
+}
+
 /// Reads the ChatGPT app's Codex threads, on the engine's queue, on the
 /// engine's two-second tick while a panel shows. Each tick: is the app's Codex server still
 /// there (one call), which rollout files it holds (one call per open file),
@@ -1800,20 +1818,7 @@ final class CodexWatcher {
 
     /// The rollout files a process holds open.
     static func heldRollouts(_ pid: pid_t) -> Set<String> {
-        let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-        guard bytes > 0 else { return [] }
-        var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(bytes) / MemoryLayout<proc_fdinfo>.stride)
-        let got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, bytes)
-        guard got > 0 else { return [] }
-        var paths = Set<String>()
-        for fd in fds.prefix(Int(got) / MemoryLayout<proc_fdinfo>.stride) where fd.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) {
-            var info = vnode_fdinfowithpath()
-            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
-            guard proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size) == size else { continue }
-            let path = withUnsafeBytes(of: &info.pvip.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
-            if path.contains("/.codex/sessions/"), path.hasSuffix(".jsonl") { paths.insert(path) }
-        }
-        return paths
+        heldFiles(pid) { $0.contains("/.codex/sessions/") && $0.hasSuffix(".jsonl") }
     }
 
     /// Thread names: the last name each id got in session_index.jsonl. Read
@@ -1951,6 +1956,8 @@ final class AppThreadsWatcher {
     private let read: (_ now: Date, _ appStarted: Date) -> [Row]?
     /// More files or folders whose change means read again (Antigravity's notes).
     private let watched: () -> [String]
+    /// Read again though none of them changed (a bot's swarm agents at work).
+    private let again: (_ now: Date) -> Bool
     private var app: (pid: pid_t, started: Date)?
     private var lookedForApp = Date.distantPast
     private var stamp: [FileStamp?]?
@@ -1959,10 +1966,12 @@ final class AppThreadsWatcher {
     private(set) var reads = 0
 
     init(executableSuffix: String, database: String, watched: @escaping () -> [String] = { [] },
+         again: @escaping (_ now: Date) -> Bool = { _ in false },
          read: @escaping (_ now: Date, _ appStarted: Date) -> [Row]?) {
         self.executableSuffix = executableSuffix
         self.database = database
         self.watched = watched
+        self.again = again
         self.read = read
     }
 
@@ -1995,12 +2004,14 @@ final class AppThreadsWatcher {
     /// a bot's chats with the bot's name. `adopted` gets the Orca thread for
     /// each agent's own id, so a Claude session Orca runs is listed once.
     /// The folder workspaces' names are read again only when Orca's profile
-    /// changed.
+    /// changed. An Antigravity thread keeps running while its swarm agents
+    /// work, which Orca's record of it doesn't say.
     static func orca(adopted: AdoptedIds) -> AppThreadsWatcher {
         final class Folders { var stamp: [FileStamp?]?; var names: [String: (name: String, bot: Bool)] = [:] }
         let folders = Folders()
+        let swarm = SwarmAgents()
         return AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Orca", database: orcaDatabase,
-                                 watched: { [orcaWorktrees] }) { _, _ in
+                                 watched: { [orcaWorktrees] + swarm.watched }, again: { swarm.again(now: $0) }) { now, _ in
             guard var threads = readOrcaThreads(database: orcaDatabase) else { return nil }
             let names = orcaWorktreeNames(readFile(orcaWorktrees, limit: 1 << 20))
             let profile = orcaProfile
@@ -2009,11 +2020,16 @@ final class AppThreadsWatcher {
                 folders.names = readOrcaFolderWorkspaces(database: profile)
                 folders.stamp = stamp
             }
+            let work = threads.contains { $0.agent == "antigravity" } ? swarm.work(now: now) : swarm.clear()
             for index in threads.indices {
                 let workspace = threads[index].workspace
                 threads[index].worktree = names[workspace]
                 if workspace.hasPrefix("folder:"), let folder = folders.names[String(workspace.dropFirst(7))] {
                     if folder.bot { threads[index].bot = folder.name } else { threads[index].worktree = folder.name }
+                }
+                if threads[index].agent == "antigravity" {
+                    threads[index].swarm = threads[index].nativeId.flatMap { work[$0] }
+                    threads[index].swarmSince = swarm.began(threads[index], now: now)
                 }
             }
             adopted.threads = Dictionary(threads.compactMap { t in t.nativeId.map { ($0, t.id) } }, uniquingKeysWith: { a, _ in a })
@@ -2026,19 +2042,33 @@ final class AppThreadsWatcher {
     /// Antigravity's: its list of conversations, less the ones you archived,
     /// which it marks only in each conversation's note. The notes of the
     /// conversations listed, and their folder, are watched too, so an
-    /// archive shows within a tick.
+    /// archive shows within a tick. The list says when a conversation last
+    /// changed only now and then (an hour can pass mid-run), so a running
+    /// one's own database is stat'ed, and watched, for when it last wrote.
     static func antigravity() -> AppThreadsWatcher {
-        final class Listed { var ids: [String] = [] }
+        final class Listed { var ids: [String] = []; var running: [String] = [] }
         let listed = Listed()
         return AppThreadsWatcher(executableSuffix: ".app/Contents/MacOS/Antigravity", database: antigravityDatabase,
-                                 watched: { [antigravityNotes] + listed.ids.map { antigravityNotePath($0) } }) { now, started in
-            guard let conversations = readAntigravityConversations(database: antigravityDatabase,
+                                 watched: {
+                                     [antigravityNotes] + listed.ids.map { antigravityNotePath($0) }
+                                         + listed.running.flatMap { [antigravityConversationPath($0), antigravityConversationPath($0) + "-wal"] }
+                                 }) { now, started in
+            guard var conversations = readAntigravityConversations(database: antigravityDatabase,
                                                                    since: now.addingTimeInterval(-Board.window))
             else { return nil }
             listed.ids = conversations.map(\.id)
+            for index in conversations.indices where conversations[index].busy {
+                conversations[index].written = conversationWritten(antigravityConversationPath(conversations[index].id))
+            }
+            listed.running = conversations.filter(\.busy).map(\.id)
             return conversations.filter { !antigravityArchived(note: readFile(antigravityNotePath($0.id), limit: 64 << 10)) }
                 .compactMap { antigravityRow($0, appStarted: started) }
         }
+    }
+
+    /// An Antigravity conversation's own database: its steps.
+    static func antigravityConversationPath(_ id: String) -> String {
+        Paths.home.appendingPathComponent(".gemini/antigravity/conversations/\(id).db").path
     }
 
     /// One tick; true if the rows changed.
@@ -2053,7 +2083,7 @@ final class AppThreadsWatcher {
         }
         guard let app else { return clear() }
         let current = ([database, database + "-wal"] + watched()).map(pathStamp)
-        guard current != stamp else { return false }
+        guard current != stamp || again(now) else { return false }
         guard let read = read(now, app.started) else {
             // Read again on the next tick: a read can fail while the app writes.
             stamp = nil
@@ -2200,6 +2230,8 @@ struct OrcaThread: Equatable {
     var outcome: String = ""   // success, failure, cancellation…
     var lastActivity: Date?    // journal_chat_state.last_activity_at
     var nativeId: String?      // the agent's own id for it
+    var swarm: SwarmWork? = nil // Antigravity's: its own agents at work on it
+    var swarmSince: Date? = nil // when they began working on their own, the turn settled
 }
 
 /// The app whose icon an Orca agent shows: Claude's, ChatGPT's for Codex,
@@ -2225,8 +2257,9 @@ func orcaAgentName(_ agent: String) -> String {
     }
 }
 
-/// An Orca thread as a row: running while its turn is open, else finished
-/// ("Failed" or "Stopped" when it ended so). One never used is left out.
+/// An Orca thread as a row: running while its turn is open, or its swarm
+/// agents work, else finished ("Failed" or "Stopped" when it ended so). One
+/// never used is left out.
 func orcaRow(_ t: OrcaThread) -> Row? {
     guard let turnAt = t.turnAt else { return nil }
     let id = "orca:\(t.id)", link = orcaLinkPrefix + t.id
@@ -2241,11 +2274,12 @@ func orcaRow(_ t: OrcaThread) -> Row? {
     // agent with no icon of its own is named.
     let agent = orcaAgentIcon(t.agent)
     let context = [place, agent == nil ? "\(orcaAgentName(t.agent)) in Orca" : "Orca"].compactMap { $0 }.joined(separator: " · ")
-    if t.turnOpen {
+    if t.turnOpen || t.swarm != nil {
         // Whole minutes, as the others: the quiet check needs no more.
-        let written = t.lastActivity.map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
-        return Row(id: id, group: .running, title: title, context: context, since: turnAt, link: link, lastOutput: written,
-                   agent: agent)
+        let written = [t.lastActivity, t.swarm?.lastWrite].compactMap { $0 }.max()
+            .map { Date(timeIntervalSince1970: ($0.timeIntervalSince1970 / 60).rounded(.down) * 60) }
+        return Row(id: id, group: .running, title: title, context: context, since: t.turnOpen ? turnAt : t.swarmSince ?? turnAt,
+                   link: link, activity: t.swarm.flatMap { swarmActivity($0.agents) }, lastOutput: written, agent: agent)
     }
     let detail = t.outcome == "failure" ? "Failed" : t.outcome == "cancellation" ? "Stopped" : nil
     return Row(id: id, group: .done, title: title, detail: detail, context: context, since: turnAt, link: link, agent: agent)
@@ -2292,6 +2326,218 @@ func readOrcaThreads(database path: String) -> [OrcaThread]? {
     }
 }
 
+// MARK: - Antigravity swarm agents
+
+/// One conversation of Antigravity's command-line agent (`agy`), which Orca
+/// runs its Antigravity threads and bots with: one of yours, or a swarm
+/// agent's, which another conversation started.
+struct AgyRun: Equatable {
+    let id: String
+    var name = ""           // agent_name: what the conversation that started it calls it
+    var parent = ""         // parent_conversation_id: none for yours
+    var turn = false        // its status: running, busy or canceling
+    var background = false  // not_fully_idle: between steps, with a command or a timer still going
+    var killed = false
+
+    /// Works, by its own record: an agent waiting on its command still does.
+    var works: Bool { !killed && (turn || (background && !parent.isEmpty)) }
+}
+
+/// What works under one of your conversations.
+struct SwarmWork: Equatable {
+    var agents: [String] = []  // the swarm agents at work, by name
+    var lastWrite: Date?       // when any of them, or the conversation itself, last wrote
+}
+
+/// What works now, under each of your conversations: its own turn, and the
+/// swarm agents it, or one of them, started. One cut short leaves its record
+/// saying it runs, so a run counts only while an `agy` process holds its
+/// conversation open (`held`: since when that process has run) and only once
+/// that process has written it: a new `agy` opens the old ones too.
+func swarmWork(_ runs: [AgyRun], held: [String: Date], written: (String) -> Date?) -> [String: SwarmWork] {
+    let parents = Dictionary(runs.map { ($0.id, $0.parent) }, uniquingKeysWith: { a, _ in a })
+    var work: [String: SwarmWork] = [:]
+    for run in runs where run.works {
+        guard let started = held[run.id], let write = written(run.id), write >= started else { continue }
+        var root = run.id
+        for _ in 0..<16 {
+            guard let parent = parents[root], !parent.isEmpty else { break }
+            root = parent
+        }
+        var mine = work[root] ?? SwarmWork()
+        if !run.parent.isEmpty { mine.agents.append(run.name) }
+        mine.lastWrite = max(mine.lastWrite ?? write, write)
+        work[root] = mine
+    }
+    for root in work.keys { work[root]?.agents.sort() }
+    return work
+}
+
+/// "lint-check and test-runner working", "a, b, c and 2 more working". One
+/// called "self" is a copy of the conversation that started it: counted, not named.
+func swarmActivity(_ agents: [String]) -> String? {
+    guard !agents.isEmpty else { return nil }
+    let names = agents.map { plainLine($0, max: 40) ?? "" }.filter { !$0.isEmpty && $0 != "self" }.prefix(3)
+    let rest = agents.count - names.count
+    guard let last = names.last else { return rest == 1 ? "1 agent working" : "\(rest) agents working" }
+    if rest > 0 { return names.joined(separator: ", ") + " and \(rest) more working" }
+    return (names.count == 1 ? last : names.dropLast().joined(separator: ", ") + " and " + last) + " working"
+}
+
+/// The swarm agents' conversations, and any of yours that runs, from the
+/// command-line agent's own list of conversations. Opened as Antigravity's
+/// is (readAntigravityConversations). nil on any error.
+func readAgyRuns(database path: String) -> [AgyRun]? {
+    guard FileManager.default.fileExists(atPath: path) else { return [] }
+    let escaped = path.replacingOccurrences(of: "%", with: "%25").replacingOccurrences(of: "?", with: "%3f")
+        .replacingOccurrences(of: "#", with: "%23")
+    return queryAgyRuns("file:\(escaped)") ?? queryAgyRuns("file:\(escaped)?immutable=1")
+}
+
+private func queryAgyRuns(_ uri: String) -> [AgyRun]? {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
+          let db else {
+        sqlite3_close(db)
+        return nil
+    }
+    defer { sqlite3_close(db) }
+    sqlite3_busy_timeout(db, 20)
+    let sql = """
+        SELECT conversation_id, agent_name, parent_conversation_id, not_fully_idle, killed,
+               status IN ('CASCADE_RUN_STATUS_RUNNING', 'CASCADE_RUN_STATUS_BUSY', 'CASCADE_RUN_STATUS_CANCELING') AS turn
+        FROM conversation_summaries
+        WHERE parent_conversation_id != '' OR turn
+        ORDER BY last_modified_time DESC LIMIT 500
+        """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
+    defer { sqlite3_finalize(statement) }
+    func text(_ column: Int32) -> String { sqlite3_column_text(statement, column).map { String(cString: $0) } ?? "" }
+    var runs: [AgyRun] = []
+    while true {
+        let step = sqlite3_step(statement)
+        if step == SQLITE_DONE { return runs }
+        guard step == SQLITE_ROW else { return nil }
+        runs.append(AgyRun(id: text(0), name: text(1), parent: text(2), turn: sqlite3_column_int(statement, 5) != 0,
+                           background: sqlite3_column_int(statement, 3) != 0, killed: sqlite3_column_int(statement, 4) != 0))
+    }
+}
+
+/// Reads what the swarm agents of Orca's Antigravity threads do, with Orca's
+/// list: the command-line agent's list of conversations, and, while that says
+/// one works, which conversations an `agy` process holds open and when those
+/// were last written (stats). It looks for `agy` every 30 s then, or every
+/// 10 s while one that works isn't held by those it knows.
+final class SwarmAgents {
+    private var processes: [(pid: pid_t, started: Date)] = []
+    private var lookedForProcesses = Date.distantPast
+    private var last: [String: SwarmWork] = [:]
+    private var lastRead = Date.distantPast
+    private var failures = 0
+    /// The list, its log, and the conversations at work.
+    private(set) var watched: [String] = []
+    private var starts: [String: Date] = [:]
+    private var resting = Set<String>()
+
+    static let folder = Paths.home.appendingPathComponent(".gemini/antigravity-cli").path
+    static let database = folder + "/conversation_summaries.db"
+
+    static func conversation(_ id: String) -> String { folder + "/conversations/\(id).db" }
+
+    /// What works under each of your conversations. After a failed read, what
+    /// the last one said, for a few tries.
+    func work(now: Date) -> [String: SwarmWork] {
+        lastRead = now
+        watched = [Self.database, Self.database + "-wal"]
+        guard let runs = readAgyRuns(database: Self.database) else {
+            failures += 1
+            if failures > 5 { last = [:] }
+            return last
+        }
+        failures = 0
+        let working = runs.filter(\.works)
+        guard !working.isEmpty else {
+            last = [:]
+            return last
+        }
+        var held = heldConversations()
+        let unheld = working.contains { held[$0.id] == nil }
+        if now.timeIntervalSince(lookedForProcesses) >= (unheld ? 10 : 30) {
+            lookedForProcesses = now
+            processes = Self.findAgy()
+            held = heldConversations()
+        }
+        last = swarmWork(runs, held: held) { conversationWritten(Self.conversation($0)) }
+        watched += working.filter { held[$0.id] != nil }
+            .flatMap { [Self.conversation($0.id), Self.conversation($0.id) + "-wal"] }
+        return last
+    }
+
+    /// No Antigravity thread is open in Orca: nothing to read.
+    func clear() -> [String: SwarmWork] {
+        watched = []
+        last = [:]
+        failures = 0
+        return last
+    }
+
+    /// A read failed, or agents work: one cut short changes no file, so look
+    /// every 10 s.
+    func again(now: Date) -> Bool {
+        (1...5).contains(failures) || (!last.isEmpty && now.timeIntervalSince(lastRead) >= 10)
+    }
+
+    /// When a thread's agents began working on their own: when its turn
+    /// settled, if they were at work by then, else when Limbo saw them start.
+    /// nil while its turn is open, or nothing works.
+    func began(_ thread: OrcaThread, now: Date) -> Date? {
+        guard thread.swarm != nil, !thread.turnOpen else {
+            starts[thread.id] = nil
+            if thread.turnOpen { resting.remove(thread.id) } else { resting.insert(thread.id) }
+            return nil
+        }
+        let start = starts[thread.id] ?? (resting.contains(thread.id) ? now : thread.turnAt ?? now)
+        starts[thread.id] = start
+        return start
+    }
+
+    /// The conversations `agy` processes hold open, each with when the
+    /// (first) process that holds it started.
+    private func heldConversations() -> [String: Date] {
+        var held: [String: Date] = [:]
+        for (pid, started) in processes {
+            for path in heldFiles(pid, where: { $0.contains("/.gemini/antigravity-cli/conversations/") && $0.hasSuffix(".db") }) {
+                let id = String((path as NSString).lastPathComponent.dropLast(3))
+                held[id] = min(held[id] ?? started, started)
+            }
+        }
+        return held
+    }
+
+    /// The `agy` processes, and when each started.
+    static func findAgy() -> [(pid: pid_t, started: Date)] {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
+        guard count > 0 else { return [] }
+        return pids.prefix(min(count, pids.count)).compactMap { pid in
+            guard pid > 0, executablePath(pid).hasSuffix("/agy") else { return nil }
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+            let started = TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1_000_000
+            return (pid, Date(timeIntervalSince1970: started))
+        }
+    }
+}
+
+/// When a conversation's database was last written: the file, or its log once
+/// that holds something (opening it makes an empty one).
+func conversationWritten(_ database: String) -> Date? {
+    let log = pathStamp(database + "-wal").flatMap { $0.size > 0 ? $0.mtime : nil }
+    return [pathStamp(database)?.mtime, log].compactMap { $0 }.max().map { Date(timeIntervalSince1970: $0) }
+}
+
 // MARK: - Antigravity conversations
 
 /// Antigravity's bundle id: a click on one of its conversations brings it forward.
@@ -2311,6 +2557,12 @@ struct AntigravityConversation: Equatable {
     var lastInput: Date?      // last_user_input_time: your last message
     var status: String        // CASCADE_RUN_STATUS_IDLE, _RUNNING, _BUSY, _CANCELING
     var killed = false
+    var written: Date? = nil  // a running one's: when its own database was last written
+
+    /// Running, by the list: busy or canceling.
+    var busy: Bool {
+        ["CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY", "CASCADE_RUN_STATUS_CANCELING"].contains(status)
+    }
 }
 
 /// Antigravity's times: "2026-11-21 07:18:46.384063+00:00".
@@ -2365,17 +2617,18 @@ func antigravityArchived(note: Data?) -> Bool {
 
 /// An Antigravity conversation as a row: running, or finished. A run whose
 /// last change came before this Antigravity started was cut short, so it
-/// counts as finished.
+/// counts as finished. Its last change is the newer of the list's and its own
+/// database's: the list can lag a run by an hour.
 func antigravityRow(_ c: AntigravityConversation, appStarted: Date?) -> Row? {
     let id = "agy:\(c.id)", link = antigravityLinkPrefix + c.id
     let title = [c.title, c.preview].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty }
         ?? "Antigravity conversation"
     let context = antigravityFolder(c.workspaces).map(folderLabel) ?? "Antigravity"
-    let busy = ["CASCADE_RUN_STATUS_RUNNING", "CASCADE_RUN_STATUS_BUSY", "CASCADE_RUN_STATUS_CANCELING"].contains(c.status)
-    let current = appStarted.map { c.modified >= $0.addingTimeInterval(-60) } ?? true
-    if busy && !c.killed && current {
+    let changed = max(c.modified, c.written ?? c.modified)
+    let current = appStarted.map { changed >= $0.addingTimeInterval(-60) } ?? true
+    if c.busy && !c.killed && current {
         // Whole minutes, as the others: the quiet check needs no more.
-        let written = Date(timeIntervalSince1970: (c.modified.timeIntervalSince1970 / 60).rounded(.down) * 60)
+        let written = Date(timeIntervalSince1970: (changed.timeIntervalSince1970 / 60).rounded(.down) * 60)
         return Row(id: id, group: .running, title: title, context: context, since: c.lastInput ?? c.modified, link: link,
                    lastOutput: written)
     }
@@ -2384,7 +2637,7 @@ func antigravityRow(_ c: AntigravityConversation, appStarted: Date?) -> Row? {
 }
 
 /// Antigravity's recent conversations, newest first: not a subagent's, not
-/// run by its command-line agent (`agy`, which Orca runs too: Antigravity
+/// run by its command-line agent (`agy`, which Orca runs too: this list
 /// never marks those running, and Orca's own list has them), changed since
 /// `since`. Read-only, like Cursor's. While Antigravity has
 /// the database open, its write-ahead log is there and is read too; when it
@@ -9471,6 +9724,14 @@ func runAppBench(_ watcher: AppThreadsWatcher, name: String) {
     print(String(format: "reading the list (open, query, close; only when \(name) wrote): %.2f ms", ms(read) / Double(reads)))
     print(String(format: "a tick when \(name) wrote nothing: %.3f ms (%.4f%% of one core at one tick every 2 s)",
                  ms(rest) / Double(ticks), ms(rest) / Double(ticks) / 2000 * 100))
+    if name == "Orca" {
+        let swarm = SwarmAgents()
+        var work: [String: SwarmWork] = [:]
+        let first = clock.measure { work = swarm.work(now: Date()) }
+        let next = clock.measure { for _ in 0..<reads { work = swarm.work(now: Date()) } }
+        print("Antigravity conversations with agents at work: \(work.values.filter { !$0.agents.isEmpty }.count)")
+        print(String(format: "reading the swarm agents: %.2f ms the first time, then %.2f ms", ms(first), ms(next) / Double(reads)))
+    }
     print("reads during \(ticks) ticks: \(max(0, watcher.reads - 1))")
 }
 
@@ -10322,6 +10583,17 @@ func runSelfTest() {
           agyRunning?.group == .running && agyRunning?.context == "web-app"
               && agyRunning.map { abs($0.since.timeIntervalSince(now.addingTimeInterval(-200))) < 0.01 } == true
               && agyRunning?.lastOutput.map { $0.timeIntervalSince1970.truncatingRemainder(dividingBy: 60) == 0 } == true)
+    var agyLagging = agyConversations.first { $0.id == "a-run" }
+    agyLagging?.modified = now.addingTimeInterval(-4000)
+    agyLagging?.written = now.addingTimeInterval(-20)
+    let agyLagRow = agyLagging.flatMap { antigravityRow($0, appStarted: now.addingTimeInterval(-3600)) }
+    check("a run the list last noted an hour ago, whose own database was written just now, isn't quiet",
+          agyLagRow?.group == .running && agyLagRow?.quiet(now: now) == nil
+              && agyLagRow?.lastOutput.map { now.timeIntervalSince($0) < 90 } == true)
+    agyLagging?.written = nil
+    check("with nothing newer, the list's time stands: quiet, or cut short before Antigravity started",
+          agyLagging.flatMap { antigravityRow($0, appStarted: now.addingTimeInterval(-5000)) }?.quiet(now: now) != nil
+              && agyLagging.flatMap { antigravityRow($0, appStarted: now.addingTimeInterval(-3600)) }?.group == .done)
     check("it's Antigravity's, switches to it, and can't be tagged or snoozed",
           agyRunning?.source == .antigravity && agyRunning?.openLabel == "Switch to Antigravity"
               && agyRunning.map { !SessionTags.taggable($0) && !SessionSnoozes.snoozable($0) } == true)
@@ -10419,6 +10691,98 @@ func runSelfTest() {
           mergeOrca(claude: [waitingClaude], orca: [orcaClaude], sessions: [42: "other"], orcaThreads: ["n-claude": "o-done"])
               .first?.link == nil)
     for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: orcaDb + suffix) }
+
+    // Swarm agents: under Orca's Antigravity threads, from the command-line agent's own list.
+    let swarmDb = NSTemporaryDirectory() + "limbo-swarm-\(getpid()).db"
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: swarmDb + suffix) }
+    func swarmRow(_ id: String, name: String = "", parent: String = "", status: String, background: Int = 0, killed: Int = 0) -> String {
+        "INSERT INTO conversation_summaries VALUES ('\(id)', '2026-01-02 03:04:05.000006+00:00', 'CASCADE_RUN_STATUS_\(status)', '\(name)', '\(parent)', \(background), \(killed));"
+    }
+    var swarmSetup: OpaquePointer?
+    _ = sqlite3_open(swarmDb, &swarmSetup)
+    let swarmSQL = [
+        "PRAGMA journal_mode = WAL;",
+        "CREATE TABLE conversation_summaries (conversation_id text, last_modified_time datetime NOT NULL, status text NOT NULL DEFAULT '', agent_name text NOT NULL DEFAULT '', parent_conversation_id text NOT NULL DEFAULT '', not_fully_idle numeric NOT NULL DEFAULT false, killed numeric NOT NULL DEFAULT false, PRIMARY KEY (conversation_id));",
+        swarmRow("bot", status: "IDLE"),
+        swarmRow("s-run", name: "test-runner", parent: "bot", status: "RUNNING"),
+        swarmRow("s-wait", name: "lint-check", parent: "bot", status: "IDLE", background: 1),
+        swarmRow("s-idle", name: "docs", parent: "bot", status: "IDLE"),
+        swarmRow("s-deep", name: "log-reader", parent: "s-run", status: "BUSY"),
+        swarmRow("s-killed", name: "stopped", parent: "bot", status: "RUNNING", killed: 1),
+        swarmRow("s-cut", name: "cut-short", parent: "bot", status: "RUNNING"),
+        swarmRow("solo", status: "RUNNING"),
+        swarmRow("server", status: "IDLE", background: 1),
+    ]
+    for sql in swarmSQL { _ = sqlite3_exec(swarmSetup, sql, nil, nil, nil) }
+    sqlite3_close(swarmSetup)
+    let swarmRuns = readAgyRuns(database: swarmDb) ?? []
+    check("the command-line agent's list: swarm agents, and conversations that run, even with its log gone",
+          Set(swarmRuns.map(\.id)) == ["s-run", "s-wait", "s-idle", "s-deep", "s-killed", "s-cut", "solo"])
+    check("no list at all is no agents; one that can't be read is an error",
+          readAgyRuns(database: swarmDb + "-none") == [] && readAgyRuns(database: NSTemporaryDirectory()) == nil)
+    let swarmOpen = open(swarmDb, O_RDONLY)
+    let openSuffix = "/" + (swarmDb as NSString).lastPathComponent
+    let heldOpen = heldFiles(getpid()) { $0.hasSuffix(openSuffix) }
+    close(swarmOpen)
+    check("a file a process holds open is found, and only while it does",
+          heldOpen.count == 1 && heldFiles(getpid()) { $0.hasSuffix(openSuffix) }.isEmpty)
+    let agyStart = now.addingTimeInterval(-3600)
+    let swarmHeld = Dictionary(uniqueKeysWithValues: ["bot", "s-run", "s-wait", "s-idle", "s-deep", "s-killed", "solo", "server"]
+        .map { ($0, agyStart) })
+    let swarmAt = swarmWork(swarmRuns, held: swarmHeld) { $0 == "s-wait" ? now.addingTimeInterval(-30) : now.addingTimeInterval(-400) }
+    check("an agent that runs, or waits on its command, works for the conversation that started it, and one it started too",
+          swarmAt["bot"]?.agents == ["lint-check", "log-reader", "test-runner"])
+    check("one that's idle or stopped doesn't work",
+          swarmWork(swarmRuns, held: ["s-idle": agyStart, "s-killed": agyStart]) { _ in now }.isEmpty)
+    check("nor one cut short, though a newer process has opened its conversation",
+          swarmWork(swarmRuns, held: ["s-cut": agyStart]) { _ in agyStart.addingTimeInterval(-5) }.isEmpty
+              && swarmWork(swarmRuns, held: ["s-cut": agyStart]) { _ in nil }.isEmpty
+              && swarmWork(swarmRuns, held: ["s-cut": agyStart]) { _ in agyStart.addingTimeInterval(5) }["bot"]?.agents == ["cut-short"])
+    let emptyLog = swarmDb + "-log", oldWrite = now.addingTimeInterval(-900)
+    FileManager.default.createFile(atPath: emptyLog, contents: Data("x".utf8), attributes: [.modificationDate: oldWrite])
+    try? FileManager.default.setAttributes([.modificationDate: oldWrite], ofItemAtPath: emptyLog)
+    FileManager.default.createFile(atPath: emptyLog + "-wal", contents: Data())
+    let justOpened = conversationWritten(emptyLog)
+    try? Data("y".utf8).write(to: URL(fileURLWithPath: emptyLog + "-wal"))
+    let writtenSince = conversationWritten(emptyLog)
+    check("opening a conversation isn't writing it; its log with something in it is",
+          justOpened.map { abs($0.timeIntervalSince(oldWrite)) < 2 } == true && writtenSince.map { $0 > oldWrite.addingTimeInterval(600) } == true
+              && conversationWritten(emptyLog + "-none") == nil)
+    for suffix in ["", "-wal"] { try? FileManager.default.removeItem(atPath: emptyLog + suffix) }
+    check("a conversation's own turn counts with no agent named; a command it left running doesn't",
+          swarmAt["solo"]?.agents == [] && swarmAt["server"] == nil && swarmAt.count == 2)
+    check("the newest write of those at work is when they last wrote",
+          swarmAt["bot"]?.lastWrite == now.addingTimeInterval(-30))
+    check("agents that start each other in a circle still end somewhere",
+          swarmWork([AgyRun(id: "x", parent: "y", turn: true), AgyRun(id: "y", parent: "x", turn: true)], held: ["x": agyStart, "y": agyStart]) { _ in now }
+              .values.reduce(0) { $0 + $1.agents.count } == 2)
+    check("the line names up to three, and counts the rest and copies of the conversation itself",
+          swarmActivity(["docs"]) == "docs working" && swarmActivity(["docs", "lint"]) == "docs and lint working"
+              && swarmActivity(["a", "b", "c"]) == "a, b and c working" && swarmActivity(["a", "b", "c", "d", "e"]) == "a, b, c and 2 more working"
+              && swarmActivity(["self", "self"]) == "2 agents working" && swarmActivity(["self"]) == "1 agent working"
+              && swarmActivity(["docs", "self"]) == "docs and 1 more working" && swarmActivity([]) == nil)
+    var botThread = OrcaThread(id: "o-bot", agent: "antigravity", name: "Home", prompt: "", workspace: "folder:b1", bot: "Ada",
+                               turnAt: now.addingTimeInterval(-300), outcome: "success", lastActivity: now.addingTimeInterval(-300))
+    check("a bot whose turn settled, with no agent at work, is finished", orcaRow(botThread)?.group == .done)
+    botThread.swarm = swarmAt["bot"]
+    let botRow = orcaRow(botThread)
+    check("one whose agents work runs, named, since its turn settled, and wrote when they last did",
+          botRow?.group == .running && botRow?.title == "Home · Ada" && botRow?.detail == nil
+              && botRow?.activity == "lint-check, log-reader and test-runner working" && botRow?.since == botThread.turnAt
+              && botRow?.lastOutput.map { now.timeIntervalSince($0) < 120 } == true)
+    let swarmTimes = SwarmAgents()
+    var timed = botThread
+    let settledWithAgents = swarmTimes.began(timed, now: now)
+    timed.swarm = nil
+    _ = swarmTimes.began(timed, now: now.addingTimeInterval(10))
+    timed.swarm = swarmAt["bot"]
+    let woke = swarmTimes.began(timed, now: now.addingTimeInterval(60))
+    let stillAwake = swarmTimes.began(timed, now: now.addingTimeInterval(90))
+    timed.turnOpen = true
+    check("agents at work as a turn settles count from then; ones that wake later, from when they were seen to",
+          settledWithAgents == botThread.turnAt && woke == now.addingTimeInterval(60) && stillAwake == woke
+              && swarmTimes.began(timed, now: now.addingTimeInterval(120)) == nil)
+    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: swarmDb + suffix) }
 
     // Snooze: held until a time you pick, or until the session moves on.
     let snoozeSuite = "limbo-tasks-selftest-snooze"
